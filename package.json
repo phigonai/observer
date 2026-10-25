@@ -1,6 +1,6 @@
 {
   "name": "@phigon/observer",
-  "version": "8.0.2",
+  "version": "8.1.0",
   "description": "Open-source observer that connects computers and their AI coding agents to Phigon: agent discovery, consented activity and history, local redaction, and Guardian checks.",
   "type": "module",
   "private": false,
