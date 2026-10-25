@@ -1,0 +1,5 @@
+{"type":"step_start","timestamp":1785574785000,"sessionID":"ses_fixture","part":{"type":"step-start"}}
+{"type":"tool_use","timestamp":1785574785200,"sessionID":"ses_fixture","part":{"type":"tool","tool":"glob","callID":"call_glob","state":{"status":"completed","input":{"pattern":"**/input.json"},"output":"/private/project/input.json","metadata":{"count":1,"truncated":false}}}}
+{"type":"tool_use","timestamp":1785574787300,"sessionID":"ses_fixture","part":{"type":"tool","tool":"read","callID":"call_read","state":{"status":"completed","input":{"filePath":"/private/project/input.json"},"output":"secret=fixturesecret","metadata":{"truncated":false}}}}
+{"type":"text","timestamp":1785574789100,"sessionID":"ses_fixture","part":{"type":"text","text":"The calculated result is 135."}}
+{"type":"step_finish","timestamp":1785574789200,"sessionID":"ses_fixture","part":{"type":"step-finish","reason":"stop"}}

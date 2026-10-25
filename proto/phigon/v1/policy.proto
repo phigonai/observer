@@ -1,0 +1,141 @@
+syntax = "proto3";
+
+package phigon.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/phigonai/observer/go/gen/phigon/v1;phigonv1";
+
+// CollectionPolicy is fail-closed: every protobuf default is false.
+message CollectionPolicy {
+  bool prompt_content = 1;
+  bool response_content = 2;
+  bool reasoning_content = 3;
+  bool command_arguments = 4;
+  bool terminal_output = 5;
+  bool file_paths = 6;
+  bool file_content = 7;
+  bool browser_urls = 8;
+  bool browser_content = 9;
+  bool network_endpoints = 10;
+  bool git_patch_content = 11;
+  bool environment_values = 12;
+  bool tool_output = 13;
+  bool vendor_payload = 14;
+  bool process_metadata = 15;
+  bool process_arguments = 16;
+  bool file_metadata = 17;
+  bool file_diffs = 18;
+  bool network_metadata = 19;
+  bool network_content = 20;
+  bool browser_metadata = 21;
+  bool mcp_arguments = 22;
+  bool mcp_output = 23;
+  bool model_prompts = 24;
+  bool model_responses = 25;
+}
+
+message RedactionRule {
+  // Stable rule identifier, at most 64 bytes.
+  string rule_id = 1;
+  // RE2-compatible expression, at most 2 KiB.
+  string expression = 2;
+  // Replacement text, at most 128 bytes.
+  string replacement = 3;
+  bool enabled = 4;
+}
+
+message ContentLimits {
+  // Hard per-event bounds. Zero instructs the observer to use safe defaults.
+  uint32 max_summary_bytes = 1;
+  uint32 max_content_bytes = 2;
+  uint32 max_tool_arguments_bytes = 3;
+  uint32 max_tool_output_bytes = 4;
+  uint32 max_terminal_output_bytes = 5;
+  uint32 max_vendor_payload_bytes = 6;
+}
+
+// ManagedAction identifies actions that can be mediated by a Phigon gateway.
+// It does not claim OS-wide interception of actions performed outside that
+// managed boundary.
+enum ManagedAction {
+  MANAGED_ACTION_UNSPECIFIED = 0;
+  MANAGED_ACTION_FILE_READ = 1;
+  MANAGED_ACTION_FILE_WRITE = 2;
+  MANAGED_ACTION_FILE_DELETE = 3;
+  MANAGED_ACTION_COMMAND_EXECUTE = 4;
+  MANAGED_ACTION_PROCESS_LAUNCH = 5;
+  MANAGED_ACTION_NETWORK_CONNECT = 6;
+  MANAGED_ACTION_BROWSER_NAVIGATE = 7;
+  MANAGED_ACTION_CREDENTIAL_ACCESS = 8;
+  // Starting an AI-agent runtime. The normalized resource is the stable agent
+  // product or runtime identifier supplied by the managed launcher.
+  MANAGED_ACTION_AGENT_START = 9;
+  // Selecting or invoking an AI model. The normalized resource is
+  // "provider:model" (for example "anthropic:claude-sonnet-4").
+  MANAGED_ACTION_MODEL_USE = 10;
+}
+
+enum GuardrailEffect {
+  GUARDRAIL_EFFECT_UNSPECIFIED = 0;
+  GUARDRAIL_EFFECT_DENY = 1;
+  GUARDRAIL_EFFECT_REQUIRE_APPROVAL = 2;
+}
+
+// GuardrailIntervention is the maximum containment action an administrator
+// authorizes when this rule denies an operation. Containment is still subject
+// to an independent machine-owner opt-in and exact process-instance checks.
+enum GuardrailIntervention {
+  GUARDRAIL_INTERVENTION_UNSPECIFIED = 0;
+  GUARDRAIL_INTERVENTION_BLOCK_ACTION = 1;
+  GUARDRAIL_INTERVENTION_STOP_AGENT = 2;
+  GUARDRAIL_INTERVENTION_KILL_AGENT = 3;
+}
+
+message ActionGuardrailRule {
+  string rule_id = 1;
+  ManagedAction action = 2;
+  GuardrailEffect effect = 3;
+  // Platform-neutral glob matched against the gateway's normalized resource.
+  string resource_pattern = 4;
+  // Operator-authored explanation, at most 256 UTF-8 bytes.
+  string reason = 5;
+  // Optional stable agent-ID glob. Empty applies the rule to every agent on
+  // the machine. The managed gateway supplies an agent ID when evaluating a
+  // targeted rule.
+  string agent_pattern = 6;
+  // The administrator's original plain-language contract. This is delivered
+  // to the local Guardian and shown verbatim when the contract blocks an
+  // agent action.
+  string source_text = 7;
+  // The maximum response permitted after a deny. Approval rules always use
+  // BLOCK_ACTION. Older observers treat UNSPECIFIED as BLOCK_ACTION.
+  GuardrailIntervention intervention = 8;
+}
+
+message ActionPolicySourceRevision {
+  string policy_id = 1;
+  string scope = 2;
+  string machine_id = 3;
+  uint64 revision = 4;
+}
+
+message ActionGuardrailPolicy {
+  // SHA-256 of the canonical effective policy.
+  string policy_digest = 1;
+  repeated ActionGuardrailRule rules = 2;
+  repeated ActionPolicySourceRevision sources = 3;
+  // Currently "allow". Rules can only narrow the managed gateway boundary.
+  string default_effect = 4;
+}
+
+message PolicySnapshot {
+  string tenant_id = 1;
+  string machine_id = 2;
+  uint64 revision = 3;
+  google.protobuf.Timestamp effective_at = 4;
+  CollectionPolicy collection = 5;
+  repeated RedactionRule redaction_rules = 6;
+  ContentLimits limits = 7;
+  ActionGuardrailPolicy action_guardrails = 8;
+}

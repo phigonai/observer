@@ -1,0 +1,31 @@
+{
+  "claude": {
+    "activity": 3,
+    "git": 1,
+    "lifecycle": 2,
+    "terminal": 1,
+    "tool": 2
+  },
+  "codex": {
+    "activity": 2,
+    "browser": 1,
+    "filesystem": 1,
+    "git": 1,
+    "lifecycle": 2,
+    "terminal": 1,
+    "tool": 3
+  },
+  "hermes": {
+    "activity": 2,
+    "git": 1,
+    "lifecycle": 2,
+    "terminal": 2,
+    "tool": 2
+  },
+  "openclaw": {
+    "activity": 3,
+    "browser": 2,
+    "lifecycle": 2,
+    "tool": 2
+  }
+}

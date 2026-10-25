@@ -1,0 +1,80 @@
+name: Sync from Phigon
+
+# Publishes new changes to observer/ in Phigon's main repository. Pushes use a
+# deploy key so that CI and releases run for the mirrored commits and tags.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'phigonai/observer'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: main
+          fetch-depth: 0
+          ssh-key: ${{ secrets.MIRROR_DEPLOY_KEY }}
+      - name: Check out Phigon's main repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ vars.UPSTREAM_REPOSITORY }}
+          ref: ${{ vars.UPSTREAM_BRANCH || 'imp' }}
+          ssh-key: ${{ secrets.UPSTREAM_DEPLOY_KEY }}
+          fetch-depth: 0
+          path: .upstream
+          persist-credentials: false
+      - name: Mirror new commits and release tags
+        id: mirror
+        env:
+          AUTHOR_EMAIL_MAP: ${{ secrets.AUTHOR_EMAIL_MAP }}
+          UPSTREAM_BRANCH: ${{ vars.UPSTREAM_BRANCH || 'imp' }}
+        run: |
+          git config user.name "Phigon Sync"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Run a copy: the mirror replaces this script while it runs.
+          cp scripts/sync-from-upstream.sh "$RUNNER_TEMP/sync.sh"
+          bash "$RUNNER_TEMP/sync.sh"
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        if: steps.mirror.outputs.mirrored != '0'
+        with:
+          node-version: 24
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        if: steps.mirror.outputs.mirrored != '0'
+        with:
+          go-version: "1.26.x"
+          cache-dependency-path: go/go.sum
+      - name: The mirrored tree builds and passes its tests on its own
+        if: steps.mirror.outputs.mirrored != '0'
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run check
+          (cd go && go vet ./... && go test ./...)
+          sh scripts/check-generated.sh
+      - name: No secrets in the mirrored tree
+        if: steps.mirror.outputs.mirrored != '0'
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/gitleaks.tar.gz" \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP" gitleaks
+          mkdir -p "$RUNNER_TEMP/tree"
+          git archive --format=tar HEAD | tar -x -C "$RUNNER_TEMP/tree"
+          "$RUNNER_TEMP/gitleaks" dir "$RUNNER_TEMP/tree" --redact=100 --no-banner
+      - name: Publish
+        if: steps.mirror.outputs.mirrored != '0' || steps.mirror.outputs.tagged != '0'
+        run: |
+          git push origin HEAD:main
+          git push origin --tags

@@ -1,0 +1,5 @@
+{"timestamp":"2026-07-24T10:01:00.000Z","type":"system","sessionId":"claude-session-fixture"}
+{"timestamp":"2026-07-24T10:01:01.000Z","type":"user","message":{"role":"user","content":[{"type":"text","text":"Review /private/project using ghp_012345678901234567890123456789"}]}}
+{"timestamp":"2026-07-24T10:01:02.000Z","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I found one issue."},{"type":"thinking","thinking":"Private reasoning fixture."},{"type":"tool_use","id":"tool-bash","name":"Bash","input":{"command":"git diff","cwd":"/private/project"}}]}}
+{"timestamp":"2026-07-24T10:01:03.000Z","type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-bash","content":"password=hunter2fixture"}]}}
+{"timestamp":"2026-07-24T10:01:04.000Z","type":"result","is_error":false}
