@@ -1,0 +1,4 @@
+# Generated protocol code is verified by checksum, so every checkout keeps LF.
+* text=auto eol=lf
+go/gen/**/*.go linguist-generated=true
+src/generated/**/*.ts linguist-generated=true whitespace=-blank-at-eof

@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package phigon.v1;
+
+import "google/protobuf/timestamp.proto";
+import "phigon/v1/common.proto";
+
+option go_package = "github.com/phigonai/observer/go/gen/phigon/v1;phigonv1";
+
+message MachineIdentity {
+  // Server-issued UUID. Empty during the first authenticated registration.
+  string machine_id = 1;
+  // Observer-generated UUID persisted across restarts, at most 64 bytes.
+  string installation_id = 2;
+  // User-visible name, at most 128 UTF-8 bytes.
+  string display_name = 3;
+  // Host name, at most 255 UTF-8 bytes. Classified as system metadata.
+  string hostname = 4;
+  OperatingSystem operating_system = 5;
+  // Normalized CPU architecture, at most 32 bytes.
+  string architecture = 6;
+  // OS release, at most 128 bytes.
+  string operating_system_version = 7;
+  BuildInfo observer_build = 8;
+  // Administrative labels. At most 32 entries, 64-byte keys and 256-byte values.
+  map<string, string> labels = 9;
+}
+
+message AgentIdentity {
+  // Stable observer-derived ID, at most 128 bytes.
+  string agent_id = 1;
+  AgentKind kind = 2;
+  // Vendor/product display name, at most 128 UTF-8 bytes.
+  string display_name = 3;
+  // Detected version, at most 64 bytes.
+  string version = 4;
+  // Runtime or model identifier, at most 128 bytes.
+  string runtime = 5;
+  AgentState state = 6;
+  // Process identifier when running. Zero means unavailable.
+  uint64 process_id = 7;
+  google.protobuf.Timestamp started_at = 8;
+  google.protobuf.Timestamp last_observed_at = 9;
+  // Capability identifiers, at most 64 entries of 64 bytes each.
+  repeated string capabilities = 10;
+  // Digest of the executable path; raw paths require explicit content policy.
+  string executable_path_digest = 11;
+}
+
+message AgentInventory {
+  string machine_id = 1;
+  google.protobuf.Timestamp observed_at = 2;
+  repeated AgentIdentity agents = 3;
+  // True when one or more probes were denied and the inventory is incomplete.
+  bool partial = 4;
+  // Non-sensitive probe notices, at most 32 entries of 256 bytes each.
+  repeated string notices = 5;
+}
+
+message Heartbeat {
+  string machine_id = 1;
+  google.protobuf.Timestamp observed_at = 2;
+  uint64 uptime_seconds = 3;
+  // Current observer queue depth, used for backpressure diagnosis.
+  uint32 buffered_events = 4;
+  uint64 last_sequence = 5;
+  // Observer-reported clock offset from the control plane.
+  sint64 clock_offset_ms = 6;
+  // Configured observer delivery queue capacity.
+  uint32 queue_capacity = 7;
+  // Events discarded by the current observer process.
+  uint64 dropped_events = 8;
+  // Replaceable snapshots coalesced by the current observer process.
+  uint64 coalesced_events = 9;
+  // Highest sequence durably acknowledged by the control plane.
+  uint64 acknowledged_sequence = 10;
+}

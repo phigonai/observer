@@ -1,0 +1,222 @@
+syntax = "proto3";
+
+package phigon.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+import "phigon/v1/common.proto";
+import "phigon/v1/supervision.proto";
+
+option go_package = "github.com/phigonai/observer/go/gen/phigon/v1;phigonv1";
+
+message ResourceReference {
+  // Normalized resource kind, at most 32 bytes (file, URL, repository, process).
+  string kind = 1;
+  // Safe display label, at most 256 UTF-8 bytes.
+  string display_name = 2;
+  // Stable digest of the raw identifier.
+  string identifier_digest = 3;
+  // Raw identifier. Omitted unless the relevant collection policy is enabled.
+  optional string identifier = 4;
+}
+
+message ActivityEvent {
+  ActivityKind kind = 1;
+  Severity severity = 2;
+  // Safe normalized description, at most 512 UTF-8 bytes.
+  string summary = 3;
+  // Prompt, reply, or reasoning text; at most 64 KiB and policy-gated.
+  optional string content = 4;
+  bool content_redacted = 5;
+  repeated ResourceReference resources = 6;
+  // Vendor event type, at most 128 bytes.
+  string vendor_type = 7;
+}
+
+enum ToolPhase {
+  TOOL_PHASE_UNSPECIFIED = 0;
+  TOOL_PHASE_REQUESTED = 1;
+  TOOL_PHASE_RUNNING = 2;
+  TOOL_PHASE_SUCCEEDED = 3;
+  TOOL_PHASE_FAILED = 4;
+  TOOL_PHASE_CANCELLED = 5;
+}
+
+message ToolEvent {
+  // Correlates request and result, at most 128 bytes.
+  string invocation_id = 1;
+  // Normalized tool name, at most 128 bytes.
+  string tool_name = 2;
+  ToolPhase phase = 3;
+  // JSON arguments, at most 128 KiB and policy-gated.
+  optional string arguments_json = 4;
+  // Text or JSON result, at most 256 KiB and policy-gated.
+  optional string output = 5;
+  bool arguments_redacted = 6;
+  bool output_redacted = 7;
+  optional int32 exit_code = 8;
+  google.protobuf.Duration duration = 9;
+  repeated ResourceReference resources = 10;
+}
+
+enum TerminalPhase {
+  TERMINAL_PHASE_UNSPECIFIED = 0;
+  TERMINAL_PHASE_STARTED = 1;
+  TERMINAL_PHASE_OUTPUT = 2;
+  TERMINAL_PHASE_EXITED = 3;
+}
+
+message TerminalEvent {
+  string command_id = 1;
+  TerminalPhase phase = 2;
+  // Executable name without arguments, at most 128 bytes.
+  string executable = 3;
+  // Command arguments, at most 128 KiB and policy-gated.
+  optional string arguments = 4;
+  // Output chunk, at most 64 KiB and policy-gated.
+  optional bytes output = 5;
+  bool output_redacted = 6;
+  optional int32 exit_code = 7;
+}
+
+enum FilesystemOperation {
+  FILESYSTEM_OPERATION_UNSPECIFIED = 0;
+  FILESYSTEM_OPERATION_READ = 1;
+  FILESYSTEM_OPERATION_WRITE = 2;
+  FILESYSTEM_OPERATION_CREATE = 3;
+  FILESYSTEM_OPERATION_DELETE = 4;
+  FILESYSTEM_OPERATION_RENAME = 5;
+  FILESYSTEM_OPERATION_SEARCH = 6;
+}
+
+message FilesystemEvent {
+  FilesystemOperation operation = 1;
+  ResourceReference resource = 2;
+  uint64 byte_count = 3;
+  // Content excerpt, at most 64 KiB and policy-gated.
+  optional bytes content = 4;
+  bool content_redacted = 5;
+}
+
+enum BrowserOperation {
+  BROWSER_OPERATION_UNSPECIFIED = 0;
+  BROWSER_OPERATION_NAVIGATE = 1;
+  BROWSER_OPERATION_CLICK = 2;
+  BROWSER_OPERATION_TYPE = 3;
+  BROWSER_OPERATION_READ = 4;
+  BROWSER_OPERATION_DOWNLOAD = 5;
+}
+
+message BrowserEvent {
+  BrowserOperation operation = 1;
+  // Origin or URL; full URL is policy-gated and at most 8 KiB.
+  optional string url = 2;
+  string url_digest = 3;
+  // Accessible-name summary, at most 512 bytes and policy-gated.
+  optional string target = 4;
+  bool content_redacted = 5;
+}
+
+enum GitOperation {
+  GIT_OPERATION_UNSPECIFIED = 0;
+  GIT_OPERATION_STATUS = 1;
+  GIT_OPERATION_DIFF = 2;
+  GIT_OPERATION_COMMIT = 3;
+  GIT_OPERATION_BRANCH = 4;
+  GIT_OPERATION_PUSH = 5;
+  GIT_OPERATION_PULL_REQUEST = 6;
+}
+
+message GitEvent {
+  GitOperation operation = 1;
+  string repository_digest = 2;
+  // Branch and revision are resource metadata, each at most 256 bytes.
+  string branch = 3;
+  string revision = 4;
+  // Patch excerpt, at most 256 KiB and policy-gated.
+  optional string patch = 5;
+  bool patch_redacted = 6;
+}
+
+enum LifecyclePhase {
+  LIFECYCLE_PHASE_UNSPECIFIED = 0;
+  LIFECYCLE_PHASE_DISCOVERED = 1;
+  LIFECYCLE_PHASE_STARTED = 2;
+  LIFECYCLE_PHASE_IDLE = 3;
+  LIFECYCLE_PHASE_STOPPED = 4;
+  LIFECYCLE_PHASE_CRASHED = 5;
+}
+
+message LifecycleEvent {
+  LifecyclePhase phase = 1;
+  // Safe reason, at most 512 UTF-8 bytes.
+  string reason = 2;
+}
+
+enum ProcessOperation {
+  PROCESS_OPERATION_UNSPECIFIED = 0;
+  PROCESS_OPERATION_EXEC = 1;
+  PROCESS_OPERATION_FORK = 2;
+  PROCESS_OPERATION_EXIT = 3;
+  PROCESS_OPERATION_CREDENTIAL_CHANGE = 4;
+  PROCESS_OPERATION_NAMESPACE_CHANGE = 5;
+  PROCESS_OPERATION_BOUNDARY_MOVE = 6;
+}
+
+message ProcessEvent {
+  ProcessOperation operation = 1;
+  ProcessIdentity process = 2;
+  ProcessRelationship relationship = 3;
+  optional int32 exit_code = 4;
+  // Arguments are policy-gated and omitted by default.
+  optional string arguments = 5;
+  bool arguments_redacted = 6;
+}
+
+message VendorEvent {
+  // Adapter/source family (for example codex, claude, copilot, cursor, or generic).
+  string source = 1;
+  // Exact event type reported by the source, at most 128 bytes.
+  string vendor_type = 2;
+  // Stable digest of the source record before local redaction.
+  string source_record_digest = 3;
+  // The vendor's own JSON record after bounded local secret redaction.
+  optional string payload_json = 4;
+  bool payload_redacted = 5;
+  bool payload_truncated = 6;
+  bool payload_omitted = 7;
+  // JSON paths whose values were removed locally.
+  repeated string redacted_fields = 8;
+}
+
+message EventEnvelope {
+  // Tenant and machine are server-issued UUIDs.
+  string tenant_id = 1;
+  string machine_id = 2;
+  // Observer-derived IDs, at most 128 bytes each.
+  string agent_id = 3;
+  string session_id = 4;
+  // Strictly increasing within a machine stream.
+  uint64 sequence = 5;
+  google.protobuf.Timestamp observed_at = 6;
+  // Starts at 1 and changes only for wire-incompatible semantic revisions.
+  uint32 schema_version = 7;
+  PrivacyClass privacy_class = 8;
+  // Independent attribution result. Source IDs above remain unmodified.
+  AttributionContext attribution = 9;
+  // Stable observer-derived ID for idempotent historical upload. It contains
+  // no source path or content and remains unchanged across delivery retries.
+  string source_event_id = 10;
+
+  oneof payload {
+    ActivityEvent activity = 20;
+    ToolEvent tool = 21;
+    TerminalEvent terminal = 22;
+    FilesystemEvent filesystem = 23;
+    BrowserEvent browser = 24;
+    GitEvent git = 25;
+    LifecycleEvent lifecycle = 26;
+    VendorEvent vendor = 27;
+    ProcessEvent process = 28;
+  }
+}

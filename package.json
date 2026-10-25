@@ -1,0 +1,83 @@
+{
+  "name": "@phigon/observer",
+  "version": "8.0.2",
+  "description": "Open-source observer that connects computers and their AI coding agents to Phigon: agent discovery, consented activity and history, local redaction, and Guardian checks.",
+  "type": "module",
+  "private": false,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/phigonai/observer.git"
+  },
+  "bin": {
+    "phigon-observer": "dist/src/cli.js"
+  },
+  "files": [
+    "dist/src",
+    "dist/bin",
+    "README.md",
+    "scripts/install.mjs",
+    "scripts/managed-service.mjs",
+    "scripts/windows-app-control.mjs",
+    "scripts/verify-guardian-release.mjs",
+    "NOTICE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:platforms": "node scripts/build-guardian-runner.mjs --all",
+    "verify:release": "node scripts/verify-guardian-release.mjs",
+    "prepublishOnly": "npm run verify:release",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src test",
+    "test": "npm run build --silent && node --test dist/test/**/*.test.js",
+    "test:coverage": "npm run build --silent && node --experimental-test-coverage --test-coverage-include=\"dist/src/**/*.js\" --test-coverage-lines=80 --test-coverage-branches=75 --test-coverage-functions=80 --test dist/test/**/*.test.js",
+    "doctor": "npm run build --silent && node --env-file-if-exists=../.env dist/src/cli.js doctor --json",
+    "discover": "npm run build --silent && node --env-file-if-exists=../.env dist/src/cli.js discover --json",
+    "pair": "npm run build --silent && node --env-file-if-exists=../.env dist/src/cli.js pair",
+    "start": "npm run build --silent && node --env-file-if-exists=../.env dist/src/cli.js run",
+    "verify:installer": "node scripts/verify-installer.mjs",
+    "check": "npm run lint && npm run typecheck && npm run test"
+  },
+  "devDependencies": {
+    "@bufbuild/protoc-gen-es": "2.13.0",
+    "@types/node": "24.13.3",
+    "eslint": "10.8.0",
+    "tsx": "4.23.1",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.65.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "2.13.0",
+    "@grpc/grpc-js": "1.14.6"
+  },
+  "overrides": {
+    "minimatch@10.2.5": {
+      "brace-expansion": "5.0.12"
+    }
+  },
+  "homepage": "https://github.com/phigonai/observer#readme",
+  "bugs": {
+    "url": "https://github.com/phigonai/observer/issues"
+  },
+  "keywords": [
+    "phigon",
+    "ai-agents",
+    "agent-observability",
+    "codex",
+    "claude-code",
+    "opencode",
+    "guardian",
+    "open-source",
+    "gemini-cli",
+    "cursor",
+    "github-copilot"
+  ]
+}

@@ -1,0 +1,76 @@
+syntax = "proto3";
+
+package phigon.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/phigonai/observer/go/gen/phigon/v1;phigonv1";
+
+// PrivacyClass describes the most sensitive field contained by a message.
+// Receivers must enforce the policy for this class before persistence or fan-out.
+enum PrivacyClass {
+  PRIVACY_CLASS_UNSPECIFIED = 0;
+  PRIVACY_CLASS_SYSTEM_METADATA = 1;
+  PRIVACY_CLASS_RESOURCE_METADATA = 2;
+  PRIVACY_CLASS_USER_CONTENT = 3;
+  PRIVACY_CLASS_SENSITIVE_CONTENT = 4;
+  PRIVACY_CLASS_SECRET = 5;
+}
+
+enum OperatingSystem {
+  OPERATING_SYSTEM_UNSPECIFIED = 0;
+  OPERATING_SYSTEM_MACOS = 1;
+  OPERATING_SYSTEM_LINUX = 2;
+  OPERATING_SYSTEM_WINDOWS = 3;
+}
+
+enum AgentKind {
+  AGENT_KIND_UNSPECIFIED = 0;
+  AGENT_KIND_CLAUDE = 1;
+  AGENT_KIND_CODEX = 2;
+  AGENT_KIND_HERMES = 3;
+  AGENT_KIND_OPENCLAW = 4;
+  AGENT_KIND_GENERIC = 5;
+}
+
+enum AgentState {
+  AGENT_STATE_UNSPECIFIED = 0;
+  AGENT_STATE_INSTALLED = 1;
+  AGENT_STATE_RUNNING = 2;
+  AGENT_STATE_STOPPED = 3;
+  AGENT_STATE_PERMISSION_DENIED = 4;
+  AGENT_STATE_UNKNOWN = 5;
+}
+
+enum ActivityKind {
+  ACTIVITY_KIND_UNSPECIFIED = 0;
+  ACTIVITY_KIND_PROMPT = 1;
+  ACTIVITY_KIND_RESPONSE = 2;
+  ACTIVITY_KIND_REASONING = 3;
+  ACTIVITY_KIND_TOOL = 4;
+  ACTIVITY_KIND_TERMINAL = 5;
+  ACTIVITY_KIND_FILESYSTEM = 6;
+  ACTIVITY_KIND_BROWSER = 7;
+  ACTIVITY_KIND_NETWORK = 8;
+  ACTIVITY_KIND_GIT = 9;
+  ACTIVITY_KIND_LIFECYCLE = 10;
+  ACTIVITY_KIND_ERROR = 11;
+}
+
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  SEVERITY_DEBUG = 1;
+  SEVERITY_INFO = 2;
+  SEVERITY_NOTICE = 3;
+  SEVERITY_WARNING = 4;
+  SEVERITY_ERROR = 5;
+  SEVERITY_CRITICAL = 6;
+}
+
+message BuildInfo {
+  // Semantic version, at most 64 UTF-8 bytes.
+  string version = 1;
+  // Source revision, at most 128 UTF-8 bytes.
+  string commit = 2;
+  google.protobuf.Timestamp built_at = 3;
+}

@@ -1,0 +1,8 @@
+node_modules/
+dist/
+coverage/
+*.log
+.env*
+.DS_Store
+# Upstream checkout used by the sync workflow.
+.upstream/

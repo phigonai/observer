@@ -1,0 +1,231 @@
+syntax = "proto3";
+
+package phigon.v1;
+
+import "google/protobuf/timestamp.proto";
+import "phigon/v1/common.proto";
+
+option go_package = "github.com/phigonai/observer/go/gen/phigon/v1;phigonv1";
+
+// SessionMode states how much control Phigon had over an agent's lifetime.
+enum SessionMode {
+  SESSION_MODE_UNSPECIFIED = 0;
+  SESSION_MODE_MANAGED = 1;
+  SESSION_MODE_ATTACHED = 2;
+  SESSION_MODE_OBSERVED = 3;
+  SESSION_MODE_UNMANAGED = 4;
+}
+
+enum SessionState {
+  SESSION_STATE_UNSPECIFIED = 0;
+  SESSION_STATE_CREATING = 1;
+  SESSION_STATE_BOUNDARY_READY = 2;
+  SESSION_STATE_IDENTITY_READY = 3;
+  SESSION_STATE_PROCESS_STARTING = 4;
+  SESSION_STATE_ACTIVE = 5;
+  SESSION_STATE_DRAINING = 6;
+  SESSION_STATE_CLOSED = 7;
+  SESSION_STATE_BOUNDARY_FAILED = 8;
+  SESSION_STATE_IDENTITY_FAILED = 9;
+  SESSION_STATE_PROCESS_FAILED = 10;
+  SESSION_STATE_SENSOR_UNAVAILABLE = 11;
+  SESSION_STATE_ESCAPED = 12;
+  SESSION_STATE_ORPHANED = 13;
+  SESSION_STATE_INCOMPLETE = 14;
+}
+
+enum BoundaryKind {
+  BOUNDARY_KIND_UNSPECIFIED = 0;
+  BOUNDARY_KIND_LINUX_CGROUP_V2 = 1;
+  BOUNDARY_KIND_WINDOWS_JOB_OBJECT = 2;
+  BOUNDARY_KIND_MACOS_SANDBOX = 3;
+  BOUNDARY_KIND_PROCESS_GROUP = 4;
+}
+
+enum ClaimType {
+  CLAIM_TYPE_UNSPECIFIED = 0;
+  CLAIM_TYPE_SOURCE_REPORTED = 1;
+  CLAIM_TYPE_OBSERVED = 2;
+  CLAIM_TYPE_AUTHENTICATED = 3;
+  CLAIM_TYPE_DERIVED = 4;
+}
+
+enum EvidenceSource {
+  EVIDENCE_SOURCE_UNSPECIFIED = 0;
+  EVIDENCE_SOURCE_AGENT_NATIVE = 1;
+  EVIDENCE_SOURCE_PHIGON_SUPERVISOR = 2;
+  EVIDENCE_SOURCE_LINUX_EBPF = 3;
+  EVIDENCE_SOURCE_WINDOWS_ETW = 4;
+  EVIDENCE_SOURCE_MACOS_ENDPOINT_SECURITY = 5;
+  EVIDENCE_SOURCE_COMMAND_GATEWAY = 6;
+  EVIDENCE_SOURCE_MCP_GATEWAY = 7;
+  EVIDENCE_SOURCE_BROWSER_GATEWAY = 8;
+  EVIDENCE_SOURCE_MODEL_GATEWAY = 9;
+}
+
+enum AttributionConfidence {
+  ATTRIBUTION_CONFIDENCE_UNSPECIFIED = 0;
+  ATTRIBUTION_CONFIDENCE_VERIFIED = 1;
+  ATTRIBUTION_CONFIDENCE_STRONGLY_CORRELATED = 2;
+  ATTRIBUTION_CONFIDENCE_SOURCE_REPORTED = 3;
+  ATTRIBUTION_CONFIDENCE_PROBABLE = 4;
+  ATTRIBUTION_CONFIDENCE_UNATTRIBUTED = 5;
+  ATTRIBUTION_CONFIDENCE_CONFLICTING = 6;
+  ATTRIBUTION_CONFIDENCE_INCOMPLETE = 7;
+}
+
+enum CoverageSupport {
+  COVERAGE_SUPPORT_UNSPECIFIED = 0;
+  COVERAGE_SUPPORT_SUPPORTED = 1;
+  COVERAGE_SUPPORT_METADATA_ONLY = 2;
+  COVERAGE_SUPPORT_REQUIRES_GATEWAY = 3;
+  COVERAGE_SUPPORT_UNAVAILABLE = 4;
+}
+
+message AgentSession {
+  string tenant_id = 1;
+  string machine_id = 2;
+  string agent_session_id = 3;
+  string agent_id = 4;
+  AgentKind agent_kind = 5;
+  SessionMode mode = 6;
+  SessionState state = 7;
+  string execution_boundary_id = 8;
+  string root_process_key = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp active_at = 11;
+  google.protobuf.Timestamp closed_at = 12;
+}
+
+message ExecutionBoundary {
+  string machine_id = 1;
+  string agent_session_id = 2;
+  string execution_boundary_id = 3;
+  BoundaryKind kind = 4;
+  // Native cgroup, Job Object, or sandbox identity. Never a raw path.
+  string native_identity = 5;
+  string path_digest = 6;
+  string policy_digest = 7;
+  google.protobuf.Timestamp created_at = 8;
+  bool membership_verified = 9;
+}
+
+message ProcessIdentity {
+  string machine_id = 1;
+  string process_key = 2;
+  // PID is display information only and must not be used as a durable key.
+  uint64 process_id = 3;
+  string boot_id = 4;
+  google.protobuf.Timestamp started_at = 5;
+  string execution_boundary_id = 6;
+  string agent_session_id = 7;
+  string executable_digest = 8;
+  string signing_identity_digest = 9;
+}
+
+message ProcessRelationship {
+  string machine_id = 1;
+  string parent_process_key = 2;
+  string child_process_key = 3;
+  google.protobuf.Timestamp observed_at = 4;
+}
+
+enum GatewayPhase {
+  GATEWAY_PHASE_UNSPECIFIED = 0;
+  GATEWAY_PHASE_REQUESTED = 1;
+  GATEWAY_PHASE_AUTHORIZED = 2;
+  GATEWAY_PHASE_STARTED = 3;
+  GATEWAY_PHASE_COMPLETED = 4;
+  GATEWAY_PHASE_FAILED = 5;
+}
+
+message GatewayInvocation {
+  string machine_id = 1;
+  string agent_session_id = 2;
+  string invocation_id = 3;
+  EvidenceSource gateway = 4;
+  GatewayPhase phase = 5;
+  string executable_digest = 6;
+  string working_directory_digest = 7;
+  string root_process_key = 8;
+  string trace_id = 9;
+  google.protobuf.Timestamp observed_at = 10;
+  optional int32 exit_code = 11;
+}
+
+message EvidenceReference {
+  string evidence_id = 1;
+  EvidenceSource source = 2;
+  ClaimType claim_type = 3;
+  string event_digest = 4;
+  google.protobuf.Timestamp observed_at = 5;
+  string claimed_agent_session_id = 6;
+  string execution_boundary_id = 7;
+  string process_key = 8;
+  string invocation_id = 9;
+}
+
+message AttributionResult {
+  string attribution_id = 1;
+  string recommended_agent_session_id = 2;
+  AttributionConfidence confidence = 3;
+  bool conflict = 4;
+  bool coverage_complete = 5;
+  string reason = 6;
+  repeated EvidenceReference evidence = 7;
+  google.protobuf.Timestamp evaluated_at = 8;
+}
+
+message AttributionContext {
+  string agent_session_id = 1;
+  string execution_boundary_id = 2;
+  string process_key = 3;
+  string root_process_key = 4;
+  string trace_id = 5;
+  string invocation_id = 6;
+  ClaimType claim_type = 7;
+  EvidenceSource evidence_source = 8;
+  AttributionConfidence attribution_confidence = 9;
+  bool conflict = 10;
+  bool coverage_complete = 11;
+  repeated EvidenceReference evidence = 12;
+  // Weak fallback asserted only by the trusted control-plane correlator.
+  bool parent_and_timing_match = 13;
+}
+
+message CoverageManifest {
+  string machine_id = 1;
+  string sensor_id = 2;
+  string platform = 3;
+  string sensor_version = 4;
+  map<string, CoverageSupport> capabilities = 5;
+  google.protobuf.Timestamp observed_at = 6;
+}
+
+message SensorHealth {
+  string machine_id = 1;
+  string sensor_id = 2;
+  bool alive = 3;
+  bool permission_valid = 4;
+  google.protobuf.Timestamp observed_at = 5;
+  google.protobuf.Timestamp last_event_at = 6;
+  uint64 dropped_events = 7;
+  uint32 queue_depth = 8;
+  uint32 boundary_count = 9;
+  uint64 policy_version = 10;
+  string binary_digest = 11;
+  string os_version = 12;
+  sint64 clock_offset_ms = 13;
+  uint64 acknowledged_sequence = 14;
+}
+
+message IntegrityCheckpoint {
+  string machine_id = 1;
+  string sensor_id = 2;
+  uint64 batch_sequence = 3;
+  string batch_digest = 4;
+  string previous_batch_digest = 5;
+  bytes machine_signature = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp acknowledged_at = 8;
+}

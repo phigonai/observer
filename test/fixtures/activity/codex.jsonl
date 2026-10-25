@@ -1,0 +1,8 @@
+{"timestamp":"2026-07-24T10:00:00.000Z","type":"session_meta","payload":{"id":"codex-session-fixture"}}
+{"timestamp":"2026-07-24T10:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"Inspect /private/project with token sk-fixturesecret0123456789"}}
+{"timestamp":"2026-07-24T10:00:02.000Z","type":"event_msg","payload":{"type":"agent_message","message":"I will inspect the repository."}}
+{"timestamp":"2026-07-24T10:00:03.000Z","type":"response_item","payload":{"type":"function_call","call_id":"call-git","name":"functions.exec_command","arguments":"{\"cmd\":\"git status\",\"workdir\":\"/private/project\"}"}}
+{"timestamp":"2026-07-24T10:00:04.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-git","output":"On branch main"}}
+{"timestamp":"2026-07-24T10:00:05.000Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call-patch","name":"functions.apply_patch","input":"*** Update File: /private/project/app.ts\n@@\n-old\n+new"}}
+{"timestamp":"2026-07-24T10:00:06.000Z","type":"response_item","payload":{"type":"function_call","call_id":"call-browser","name":"browser.navigate","arguments":"{\"url\":\"https://example.test/private?q=1\"}"}}
+{"timestamp":"2026-07-24T10:00:07.000Z","type":"event_msg","payload":{"type":"task_complete"}}

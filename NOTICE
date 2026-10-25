@@ -1,0 +1,8 @@
+Phigon Observer
+Copyright 2026 Phigon
+
+This product includes software developed at Phigon (https://phigon.online).
+
+The Guardian runner binaries distributed in the npm package statically link
+third-party Go modules. Their licenses and notices, including the notice of
+the gRPC-Go project, are reproduced in THIRD_PARTY_NOTICES.md.

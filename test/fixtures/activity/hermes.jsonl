@@ -1,0 +1,5 @@
+{"timestamp":"2026-07-24T10:02:00.000Z","type":"session_start"}
+{"timestamp":"2026-07-24T10:02:01.000Z","role":"user","content":"Open the project."}
+{"timestamp":"2026-07-24T10:02:02.000Z","role":"assistant","content":"Opening it.","tool_calls":[{"id":"hermes-shell","function":{"name":"shell","arguments":"{\"command\":\"git status\",\"cwd\":\"/private/project\"}"}}]}
+{"timestamp":"2026-07-24T10:02:03.000Z","role":"tool","tool_call_id":"hermes-shell","content":"clean"}
+{"timestamp":"2026-07-24T10:02:04.000Z","type":"session_completed"}

@@ -1,0 +1,101 @@
+syntax = "proto3";
+
+package phigon.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+import "phigon/v1/action.proto";
+import "phigon/v1/history_sync.proto";
+import "phigon/v1/identity.proto";
+import "phigon/v1/policy.proto";
+import "phigon/v1/telemetry.proto";
+
+option go_package = "github.com/phigonai/observer/go/gen/phigon/v1;phigonv1";
+
+message ResumeCursor {
+  string machine_id = 1;
+  uint64 acknowledged_sequence = 2;
+  google.protobuf.Timestamp acknowledged_at = 3;
+}
+
+message Acknowledgement {
+  string machine_id = 1;
+  uint64 through_sequence = 2;
+  google.protobuf.Timestamp received_at = 3;
+}
+
+enum StreamErrorCode {
+  STREAM_ERROR_CODE_UNSPECIFIED = 0;
+  STREAM_ERROR_CODE_UNAUTHENTICATED = 1;
+  STREAM_ERROR_CODE_UNAUTHORIZED = 2;
+  STREAM_ERROR_CODE_INVALID_EVENT = 3;
+  STREAM_ERROR_CODE_POLICY_VIOLATION = 4;
+  STREAM_ERROR_CODE_RATE_LIMITED = 5;
+  STREAM_ERROR_CODE_INTERNAL = 6;
+}
+
+message StreamError {
+  StreamErrorCode code = 1;
+  // Operator-safe message, at most 512 UTF-8 bytes.
+  string message = 2;
+  bool retryable = 3;
+  google.protobuf.Duration retry_after = 4;
+  uint64 rejected_sequence = 5;
+}
+
+message SnapshotRequest {
+  bool identity = 1;
+  bool inventory = 2;
+  bool policy_receipt = 3;
+}
+
+enum PolicyReceiptState {
+  POLICY_RECEIPT_STATE_UNSPECIFIED = 0;
+  POLICY_RECEIPT_STATE_APPLIED = 1;
+  POLICY_RECEIPT_STATE_REJECTED = 2;
+  // The machine owner explicitly disabled Guardian from the local CLI.
+  POLICY_RECEIPT_STATE_DISABLED = 3;
+}
+
+message PolicyReceipt {
+  string machine_id = 1;
+  string policy_digest = 2;
+  PolicyReceiptState state = 3;
+  string gateway_version = 4;
+  repeated ManagedAction capabilities = 5;
+  // Operator-safe validation detail. Never include resource paths or content.
+  string detail = 6;
+  google.protobuf.Timestamp received_at = 7;
+  // Independent machine-owner opt-in for automatic exact-process containment.
+  bool containment_enabled = 8;
+  repeated GuardrailIntervention containment_capabilities = 9;
+}
+
+message StreamTelemetryRequest {
+  oneof payload {
+    MachineIdentity identity = 1;
+    Heartbeat heartbeat = 2;
+    AgentInventory inventory = 3;
+    EventEnvelope event = 4;
+    ResumeCursor resume = 5;
+    PolicyReceipt policy_receipt = 6;
+    ActionCapabilityManifest action_capabilities = 7;
+    AgentActionResult action_result = 8;
+    HistorySyncResult history_sync_result = 9;
+  }
+}
+
+message StreamTelemetryResponse {
+  oneof payload {
+    Acknowledgement acknowledgement = 1;
+    PolicySnapshot policy = 2;
+    StreamError error = 3;
+    SnapshotRequest snapshot_request = 4;
+    AgentActionCommand action_command = 5;
+    HistorySyncCommand history_sync_command = 6;
+  }
+}
+
+service ObserverService {
+  rpc StreamTelemetry(stream StreamTelemetryRequest) returns (stream StreamTelemetryResponse);
+}

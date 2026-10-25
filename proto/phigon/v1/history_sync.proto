@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package phigon.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/phigonai/observer/go/gen/phigon/v1;phigonv1";
+
+// HistorySyncCommand asks one connected observer to upload every supported
+// source record it has not previously delivered. The machine-owner's local
+// consent and the server collection policy still bound the readable fields.
+message HistorySyncCommand {
+  string job_id = 1;
+  string machine_id = 2;
+  string idempotency_key = 3;
+  google.protobuf.Timestamp requested_at = 4;
+  google.protobuf.Timestamp expires_at = 5;
+}
+
+enum HistorySyncResultState {
+  HISTORY_SYNC_RESULT_STATE_UNSPECIFIED = 0;
+  HISTORY_SYNC_RESULT_STATE_SUCCEEDED = 1;
+  HISTORY_SYNC_RESULT_STATE_FAILED = 2;
+  HISTORY_SYNC_RESULT_STATE_REJECTED = 3;
+}
+
+message HistorySyncResult {
+  string job_id = 1;
+  string machine_id = 2;
+  string idempotency_key = 3;
+  HistorySyncResultState state = 4;
+  uint32 files_discovered = 5;
+  uint64 records_scanned = 6;
+  uint64 events_uploaded = 7;
+  uint64 through_sequence = 8;
+  // Operator-safe status only. Source paths and activity content are excluded.
+  string detail = 9;
+  google.protobuf.Timestamp observed_at = 10;
+}

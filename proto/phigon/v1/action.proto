@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package phigon.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/phigonai/observer/go/gen/phigon/v1;phigonv1";
+
+// Machine operations require a separately enabled owner capability. Every
+// request is approved, expires, and produces an idempotent execution receipt.
+enum RemoteActionType {
+  REMOTE_ACTION_TYPE_UNSPECIFIED = 0;
+  REMOTE_ACTION_TYPE_STOP_AGENT = 1;
+  REMOTE_ACTION_TYPE_KILL_AGENT = 2;
+  REMOTE_ACTION_TYPE_RUN_COMMAND = 3;
+  REMOTE_ACTION_TYPE_INSPECT_SYSTEM = 4;
+  REMOTE_ACTION_TYPE_SHUTDOWN_MACHINE = 5;
+  REMOTE_ACTION_TYPE_RESTART_MACHINE = 6;
+}
+
+enum RemoteActionResultState {
+  REMOTE_ACTION_RESULT_STATE_UNSPECIFIED = 0;
+  REMOTE_ACTION_RESULT_STATE_SUCCEEDED = 1;
+  REMOTE_ACTION_RESULT_STATE_FAILED = 2;
+  REMOTE_ACTION_RESULT_STATE_REJECTED = 3;
+  REMOTE_ACTION_RESULT_STATE_EXPIRED = 4;
+}
+
+// ActionCapabilityManifest is machine-owner controlled. enabled=false means
+// the observer will reject every remote action even when it is connected.
+message ActionCapabilityManifest {
+  string machine_id = 1;
+  bool enabled = 2;
+  string executor_version = 3;
+  repeated RemoteActionType actions = 4;
+  google.protobuf.Timestamp observed_at = 5;
+}
+
+// AgentActionCommand targets one observed process lifetime. process_id is
+// display/OS dispatch metadata; agent_id plus expected_started_at are the
+// identity preconditions that protect against PID reuse.
+message AgentActionCommand {
+  string action_id = 1;
+  string idempotency_key = 2;
+  string machine_id = 3;
+  string agent_id = 4;
+  uint64 process_id = 5;
+  google.protobuf.Timestamp expected_started_at = 6;
+  RemoteActionType action = 7;
+  google.protobuf.Timestamp expires_at = 8;
+  string reason = 9;
+  // Validated executable/argv request, bound to this immutable operation.
+  string command_json = 10;
+}
+
+// AgentActionResult contains bounded, locally redacted output for approved
+// machine commands. Normal process-signal receipts carry no command output.
+message AgentActionResult {
+  string action_id = 1;
+  string idempotency_key = 2;
+  string machine_id = 3;
+  RemoteActionResultState state = 4;
+  string result_code = 5;
+  string detail = 6;
+  google.protobuf.Timestamp observed_at = 7;
+  bool target_still_running = 8;
+  string output = 9;
+  optional int32 exit_code = 10;
+  bool output_truncated = 11;
+}
