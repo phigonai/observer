@@ -88,3 +88,18 @@ test("action policy invalidation fails closed and rejects superseded writes", as
   store.invalidate(machineId);
   assert.equal(await store.load(machineId), null);
 });
+
+test("a pattern with a closing bracket is accepted like the server accepts it", () => {
+  const stored = policyForStorage(machineId, create(ActionGuardrailPolicySchema, {
+    policyDigest,
+    defaultEffect: "allow",
+    rules: [create(ActionGuardrailRuleSchema, {
+      ruleId: "72b1f93f-6317-46c7-bbba-6174d19c4119",
+      action: ManagedAction.FILE_READ,
+      effect: GuardrailEffect.DENY,
+      resourcePattern: "**/report].txt",
+      reason: "Bracketed file names are restricted.",
+    })],
+  }));
+  assert.equal(stored.rules[0]?.resourcePattern, "**/report].txt");
+});

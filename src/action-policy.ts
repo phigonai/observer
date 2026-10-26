@@ -314,7 +314,8 @@ function compileGlob(pattern: string): RegExp {
     } else if (character === "[") {
       throw new Error("Character classes are not supported in action policy globs.");
     } else {
-      expression += character.replace(/[\\^$+?.()|{}]/gu, "\\$&");
+      // "]" must be escaped too: a lone one is a syntax error in unicode mode.
+      expression += character.replace(/[\\^$+?.()|{}\]]/gu, "\\$&");
     }
   }
   return new RegExp(`${expression}$`, "u");
