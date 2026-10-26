@@ -521,8 +521,9 @@ function parseInitialReplayMode(value: string): InitialReplayMode {
 }
 
 function parseBoolean(value: string, name: string): boolean {
-  if (value === "true" || value === "1") return true;
-  if (value === "false" || value === "0") return false;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "true" || normalized === "1") return true;
+  if (normalized === "false" || normalized === "0") return false;
   throw new Error(`${name} must be true or false.`);
 }
 

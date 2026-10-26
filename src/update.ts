@@ -3,6 +3,8 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 const versionPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u;
+const cacheTTLms = 24 * 60 * 60 * 1000;
+const failureRetryMs = 15 * 60 * 1000;
 const registryURL = "https://registry.npmjs.org/@phigon%2fobserver/latest";
 export function newerVersion(current: string, latest: string): boolean {
   if (!versionPattern.test(current) || !versionPattern.test(latest)) return false;
@@ -22,11 +24,12 @@ export async function latestObserverVersion(directory: string, options: {
   if (!options.force) {
     try {
       const cache = JSON.parse(await readFile(cachePath, "utf8")) as { checkedAt?: number; version?: string | null };
-      if (typeof cache.checkedAt === "number" && now >= cache.checkedAt && now - cache.checkedAt < 24 * 60 * 60 * 1000 &&
+      if (typeof cache.checkedAt === "number" && now >= cache.checkedAt && now - cache.checkedAt < cacheTTLms &&
           (cache.version === null || (typeof cache.version === "string" && versionPattern.test(cache.version)))) return cache.version;
     } catch { /* Missing or malformed cache is safe to replace. */ }
   }
   let version: string | null = null;
+  let checked = false;
   try {
     const response = await (options.fetcher ?? fetch)(registryURL, { signal: AbortSignal.timeout(1500), redirect: "error", headers: { Accept: "application/json" } });
     if (!response.ok || !response.body) throw new Error("Registry unavailable.");
@@ -42,12 +45,13 @@ export async function latestObserverVersion(directory: string, options: {
         chunks.push(next.value);
       }
       const value = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { name?: unknown; version?: unknown };
-      if (value.name === "@phigon/observer" && typeof value.version === "string" && versionPattern.test(value.version)) version = value.version;
+      if (value.name === "@phigon/observer" && typeof value.version === "string" && versionPattern.test(value.version)) { version = value.version; checked = true; }
     } finally { await reader.cancel().catch(() => undefined); }
   } catch { /* Offline update checks must not block monitoring or pairing. */ }
   try {
     await mkdir(directory, { recursive: true, mode: 0o700 });
-    await writeFile(cachePath, JSON.stringify({ checkedAt: now, version }), { mode: 0o600 });
+    // A failed lookup is retried soon; only a real answer is cached for a day.
+    await writeFile(cachePath, JSON.stringify({ checkedAt: checked ? now : now - cacheTTLms + failureRetryMs, version }), { mode: 0o600 });
   } catch { /* A cache is optional. */ }
   return version;
 }

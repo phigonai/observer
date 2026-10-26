@@ -36,3 +36,17 @@ test("update installs only after yes and asks for a restart", async () => {
   assert.deepEqual(installed, ["8.0.3"]);
   assert.match(text, /queued activity are preserved/u);
 });
+
+test("a failed update check is retried soon instead of hiding updates for a day", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-updates-retry-"));
+  let requests = 0;
+  const online: typeof fetch = async () => { requests++; return Response.json({ name: "@phigon/observer", version: "9.0.0" }); };
+  const hour = 60 * 60 * 1000;
+  try {
+    assert.equal(await latestObserverVersion(directory, { fetcher: async () => { throw new Error("offline"); }, now: 1_000 }), null);
+    assert.equal(await latestObserverVersion(directory, { fetcher: online, now: 1_000 + 60_000 }), null, "recent failure is not retried immediately");
+    assert.equal(requests, 0);
+    assert.equal(await latestObserverVersion(directory, { fetcher: online, now: 1_000 + hour }), "9.0.0");
+    assert.equal(requests, 1);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});

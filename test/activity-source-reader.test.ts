@@ -736,3 +736,18 @@ function insertOpenCodeConversation(
     }),
   );
 }
+
+test("first replay keeps a record that starts exactly at the replay offset", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-source-boundary-"));
+  const root = join(directory, "sessions");
+  await mkdir(root, { recursive: true });
+  try {
+    // Two 8-byte records; replaying the last 8 bytes lands on a line boundary.
+    await writeFile(join(root, "session.jsonl"), '{"a":1}\n{"b":2}\n', "utf8");
+    const reader = new JSONLSourceReader(join(directory, "data"), true, 8);
+    const scan = await reader.scan([{ adapterId: "codex", roots: [root] }]);
+    assert.deepEqual(scan.records.map((record) => record.value), [{ b: 2 }]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

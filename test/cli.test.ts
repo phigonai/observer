@@ -1012,6 +1012,22 @@ test("observer task coordination propagates acknowledgement persistence failures
   assert.equal(controller.signal.aborted, true);
 });
 
+test("a flag followed by another flag has no value instead of consuming it", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-cli-flag-"));
+  let stderr = "";
+  try {
+    const exitCode = await run(
+      ["pair", "--code", "--accept-consent", "--consent-profile", "metadata"],
+      { PHIGON_DATA_DIR: directory },
+      { stdout: () => undefined, stderr: (value) => { stderr += value; } },
+    );
+    assert.notEqual(exitCode, 0);
+    assert.match(stderr, /pair requires --code/u);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("guardian launch rejects an agent ID the control plane would refuse, before contacting it", async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-cli-agent-id-"));
   try {
@@ -1025,6 +1041,7 @@ test("guardian launch rejects an agent ID the control plane would refuse, before
       assert.notEqual(exitCode, 0, agent);
       assert.match(stderr, /--agent must be 1-128 letters, numbers/u, agent);
     }
+
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

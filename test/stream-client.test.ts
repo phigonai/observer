@@ -24,6 +24,7 @@ import type {
   StoredMachineCredential,
 } from "../src/credential-store.js";
 import { BoundedEventQueue } from "../src/event-queue.js";
+import { FileBackedEventQueue } from "../src/event-spool.js";
 import { PrivacyClass } from "../src/generated/phigon/v1/common_pb.js";
 import {
   AgentInventorySchema,
@@ -1319,4 +1320,22 @@ test("legacy private pairings cannot fall back to hosted telemetry", async () =>
   });
   await assert.rejects(client.run(controller.signal), /saved telemetry endpoint.*--grpc-url/);
   assert.equal(checkpointReads, 0);
+});
+
+test("an unusable local spool stops the observer instead of retrying forever", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-stream-spool-"));
+  const controller = new AbortController();
+  const statuses: string[] = [];
+  const client = new ObserverStreamClient({
+    config: streamConfig(directory, 1),
+    credentialStore: testCredentialStore("machine"),
+    queue: new FileBackedEventQueue(directory, 8),
+    // A transient-retry regression would report a disconnect; stop it there.
+    onStatus: (message) => { statuses.push(message); if (/disconnected/u.test(message)) controller.abort(); },
+  });
+  try {
+    await writeFile(join(directory, "telemetry-spool.jsonl"), "this is not a spool record\n", "utf8");
+    await assert.rejects(client.run(controller.signal), /spool/iu);
+    assert.deepEqual(statuses.filter((message) => /disconnected/u.test(message)), []);
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });

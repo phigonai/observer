@@ -228,3 +228,10 @@ test("loadConfig requires paired mutual-TLS client files", () => {
   assert.equal(config.tlsCaFile, "/secure/root-ca.pem");
   assert.equal(config.tlsClientKeyFile, "/secure/client.key");
 });
+
+test("loadConfig accepts case-insensitive, padded boolean overrides", () => {
+  const config = loadConfig({ PHIGON_COLLECT_PROMPT_CONTENT: " True ", PHIGON_COLLECT_TOOL_OUTPUT: "FALSE" });
+  assert.equal(config.policy.promptContent, true);
+  assert.equal(config.policy.toolOutput, false);
+  assert.throws(() => loadConfig({ PHIGON_COLLECT_PROMPT_CONTENT: "maybe" }), /must be true or false/u);
+});

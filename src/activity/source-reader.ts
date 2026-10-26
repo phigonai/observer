@@ -401,7 +401,7 @@ export class JSONLSourceReader {
             (initialReplay ? this.#initialReplayBytes : maxReadBytesPerFile),
         ));
     if (metadata.size < offset) offset = 0;
-    const length = Math.min(
+    let length = Math.min(
       metadata.size - offset,
       maxReadBytesPerFile,
       Math.max(maxLineBytes + 1, Math.min(1_024, maxRecords) * 16_384),
@@ -409,6 +409,13 @@ export class JSONLSourceReader {
     if (length <= 0) {
       this.#setCursor(cursorId, legacyCursorId, metadata.size);
       return { records: [], malformed: 0, oversized: 0, processedRecords: 0 };
+    }
+    // Starting mid-file, read one byte early: if it is a newline the first
+    // record starts exactly at the offset and must not be skipped as partial.
+    const resync = knownOffset === undefined && offset > 0;
+    if (resync) {
+      offset -= 1;
+      length += 1;
     }
     const handle = await open(fileReal, "r");
     let content: Buffer;
@@ -419,7 +426,7 @@ export class JSONLSourceReader {
     } finally {
       await handle.close();
     }
-    if (knownOffset === undefined && offset > 0) {
+    if (resync) {
       const firstNewline = content.indexOf(0x0a);
       if (firstNewline < 0) {
         this.#setCursor(

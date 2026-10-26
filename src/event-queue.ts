@@ -42,7 +42,7 @@ export class BoundedEventQueue<T> {
       if (index >= 0) {
         this.#events[index] = { value, sequence, coalesceKey };
         this.#events.sort((left, right) =>
-          left.sequence < right.sequence ? -1 : 1,
+          left.sequence < right.sequence ? -1 : left.sequence > right.sequence ? 1 : 0,
         );
         this.#coalesced++;
         return;

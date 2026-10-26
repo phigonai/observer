@@ -1472,7 +1472,8 @@ function flagValue(
   for (let index = 0; index < flags.length; index++) {
     const flag = flags[index];
     if (flag === name) {
-      return flags[index + 1];
+      const value = flags[index + 1];
+      return value === undefined || value.startsWith("--") ? undefined : value;
     }
     if (flag?.startsWith(equalsPrefix)) {
       return flag.slice(equalsPrefix.length);
