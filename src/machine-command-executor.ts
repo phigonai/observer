@@ -124,6 +124,8 @@ export function powerCommand(restart: boolean): CommandSpec {
 export function redactCommandOutput(value: string): string {
   let safe = redactSecrets(value, "[REDACTED]");
   for (const [key, secret] of Object.entries(process.env)) if (/TOKEN|SECRET|PASSWORD|API_KEY/iu.test(key) && secret && secret.length >= 8) safe = safe.split(secret).join("[REDACTED]");
+  // The paired credential lives in the data directory, not the environment;
+  // redactSecrets masks its phg_m_ prefix wherever it is printed.
   return safe;
 }
 

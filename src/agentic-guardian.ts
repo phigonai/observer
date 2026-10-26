@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { redactSecrets } from "./content-redaction.js";
 import type { GuardianIntervention } from "./action-policy.js";
 
 const maxResponseBytes = 64 << 10;
@@ -160,9 +161,9 @@ export async function readGuardianActionContext(
     throw new Error("Guardian context file contains an unsupported field.");
   }
   return Object.freeze({
-    ...optionalContext(record, "task_id", "taskId", 128),
-    ...optionalContext(record, "proposal_id", "proposalId", 128),
-    ...optionalContext(record, "plan_step_id", "planStepId", 128),
+    ...optionalContext(record, "task_id", "taskId", 128, false),
+    ...optionalContext(record, "proposal_id", "proposalId", 128, false),
+    ...optionalContext(record, "plan_step_id", "planStepId", 128, false),
     ...optionalContext(record, "user_prompt", "userPrompt", 2_000),
     ...optionalContext(record, "agent_plan", "agentPlan", 2_000),
     ...optionalContext(record, "justification", "justification", 1_000),
@@ -176,13 +177,14 @@ function optionalContext(
   source: string,
   target: keyof GuardianActionContext,
   maximum: number,
+  redact = true,
 ): Partial<Record<keyof GuardianActionContext, string>> {
   const value = record[source];
   if (value === undefined || value === "") return {};
   if (typeof value !== "string" || value.length > maximum || /[\u0000]/u.test(value)) {
     throw new Error(`Guardian context ${source} is invalid.`);
   }
-  return { [target]: value };
+  return { [target]: redact ? redactSecrets(value) : value };
 }
 
 export function semanticDecision(

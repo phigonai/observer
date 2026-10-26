@@ -113,16 +113,17 @@ export async function pairMachine(options: PairOptions): Promise<PairResult> {
     throw new Error("The pairing response was incomplete or invalid. Retry with the same code before it expires; keep the existing data directory.");
   }
   const paired = parsePairingResponse(value);
+  const pairedAt = new Date().toISOString();
   await credentialStore.save({
     machineId: paired.machine.id,
     tenantId: paired.machine.tenant_id,
     credential: paired.credential,
     controlPlaneOrigin: options.config.controlPlaneUrl.origin,
     grpcOrigin: options.config.grpcUrl.origin,
-    createdAt: new Date().toISOString(),
+    createdAt: pairedAt,
     consentProfile: options.consentProfile,
     consentPolicyVersion: OBSERVER_CONSENT_POLICY_VERSION,
-    consentedAt: new Date().toISOString(),
+    consentedAt: pairedAt,
   });
 
   return Object.freeze({

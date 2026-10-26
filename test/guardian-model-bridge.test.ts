@@ -60,3 +60,17 @@ test("bridge recovers capacity after upstream failure and aborts broken response
     const recovered = await fetch(`${bridge.baseURL}/responses`, options); assert.equal(recovered.status, 200); assert.equal(await recovered.text(), "recovered");
   } finally { await bridge.close(); }
 });
+
+test("bridge accepts allowed endpoints with a query string and forwards it", async () => {
+  let forwarded = "";
+  const bridge = await startGuardianModelBridge({ controlPlaneURL: new URL("https://guardian.example"), credential: "secret", agentId: "test", provider: "example",
+    fetcher: (async (url) => { forwarded = String(url); return new Response("{}"); }) as typeof fetch });
+  try {
+    const messages = bridge.baseURL.replace(/\/v1$/u, "");
+    const allowed = await fetch(`${messages}/v1/messages?beta=true`, { method: "POST", headers: { "x-api-key": bridge.token }, body: "{}" });
+    assert.equal(allowed.status, 200); await allowed.text();
+    assert.equal(forwarded, "https://guardian.example/v1/machine/guardian/models/example/v1/messages?beta=true");
+    const other = await fetch(`${messages}/v1/models?x=1`, { method: "POST", headers: { "x-api-key": bridge.token }, body: "{}" });
+    assert.equal(other.status, 403); await other.text();
+  } finally { await bridge.close(); }
+});
