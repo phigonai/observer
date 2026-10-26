@@ -16,7 +16,8 @@ export async function startGuardianModelBridge(options: Readonly<{
       const presented = request.headers.authorization?.replace(/^Bearer /u, "") ?? request.headers["x-api-key"];
       const supplied = typeof presented === "string" ? Buffer.from(presented) : Buffer.alloc(0);
       if (request.method !== "POST" || request.headers.origin !== undefined || supplied.length !== token.length || !timingSafeEqual(supplied, Buffer.from(token)) ||
-          !["/v1/chat/completions", "/v1/responses", "/v1/embeddings", "/v1/messages"].includes(request.url ?? "")) {
+          // Clients such as Anthropic's send query strings (/v1/messages?beta=true).
+          !["/v1/chat/completions", "/v1/responses", "/v1/embeddings", "/v1/messages"].includes((request.url ?? "").split("?")[0]!)) {
         response.writeHead(403, { Connection: "close" }); response.end("Phigon Guardian: model gateway access denied."); return;
       }
       // Admission starts before body buffering. Slow uploads consume a slot too.
