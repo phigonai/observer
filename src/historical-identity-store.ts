@@ -1,3 +1,4 @@
+import { makeDirectoryPrivate } from "./private-directory.js";
 import { randomUUID } from "node:crypto";
 import {
   chmod,
@@ -187,7 +188,7 @@ export class HistoricalIdentityStore {
 
   async #save(): Promise<void> {
     await mkdir(this.#dataDirectory, { recursive: true, mode: 0o700 });
-    await chmod(this.#dataDirectory, 0o700);
+    await makeDirectoryPrivate(this.#dataDirectory);
     const temporaryPath =
       `${this.#path}.${process.pid}.${randomUUID()}.tmp`;
     const catalog: StoredCatalog = {

@@ -1,3 +1,4 @@
+import { makeDirectoryPrivate } from "./private-directory.js";
 import { randomUUID } from "node:crypto";
 import {
   chmod,
@@ -122,7 +123,7 @@ export class CustomAgentRegistry {
 
   async #save(agents: readonly CustomAgentRegistration[]): Promise<void> {
     await mkdir(this.#dataDirectory, { recursive: true, mode: 0o700 });
-    await chmod(this.#dataDirectory, 0o700);
+    await makeDirectoryPrivate(this.#dataDirectory);
     const temporary = `${this.#path}.${process.pid}.${randomUUID()}.tmp`;
     const registry: StoredRegistry = {
       version: registryVersion,

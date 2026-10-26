@@ -1,3 +1,4 @@
+import { makeDirectoryPrivate } from "../private-directory.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmod,
@@ -128,7 +129,7 @@ export class ActivityCursorStore {
 
   async save(cursors: ReadonlyMap<string, number>): Promise<void> {
     await mkdir(this.#dataDirectory, { recursive: true, mode: 0o700 });
-    await chmod(this.#dataDirectory, 0o700);
+    await makeDirectoryPrivate(this.#dataDirectory);
     const files = Object.fromEntries(
       [...cursors.entries()]
         .slice(-maxCursorEntries)

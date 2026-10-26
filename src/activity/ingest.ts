@@ -1,3 +1,4 @@
+import { makeDirectoryPrivate } from "../private-directory.js";
 import { randomUUID } from "node:crypto";
 import {
   chmod,
@@ -44,7 +45,7 @@ export async function ingestActivityJSONL(options: Readonly<{
   const bridgeRoot = join(options.dataDirectory, "bridges");
   const agentRoot = join(bridgeRoot, agent.id);
   await mkdir(agentRoot, { recursive: true, mode: 0o700 });
-  await chmod(options.dataDirectory, 0o700);
+  await makeDirectoryPrivate(options.dataDirectory);
   await chmod(bridgeRoot, 0o700);
   await chmod(agentRoot, 0o700);
   const target = join(

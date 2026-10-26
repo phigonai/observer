@@ -1,3 +1,4 @@
+import { makeDirectoryPrivate } from "./private-directory.js";
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, open } from "node:fs/promises";
 import { join } from "node:path";
@@ -36,7 +37,7 @@ export class GuardianDecisionJournal {
   async append(record: GuardianDecisionRecord): Promise<void> {
     const directory = join(this.#dataDirectory, "bridges", "generic");
     await mkdir(directory, { recursive: true, mode: 0o700 });
-    await chmod(this.#dataDirectory, 0o700);
+    await makeDirectoryPrivate(this.#dataDirectory);
     await chmod(join(this.#dataDirectory, "bridges"), 0o700);
     await chmod(directory, 0o700);
     const path = join(directory, "guardian-decisions.jsonl");
