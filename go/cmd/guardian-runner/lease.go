@@ -107,6 +107,11 @@ func hexDigest(value string) bool {
 	return err == nil
 }
 
+// errLeaseUnavailable means the control plane could not be reached. Unlike a
+// rejected or mismatched lease, it says nothing about authorization, so the
+// watchdog tolerates one missed renewal while the lease is still valid.
+var errLeaseUnavailable = errors.New("native lease renewal unavailable")
+
 func (lease *executionLease) renew(ctx context.Context) error {
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, lease.Origin+"/v1/machine/guardian/executions/renew", bytes.NewReader(lease.Request))
 	if err != nil {
@@ -116,7 +121,7 @@ func (lease *executionLease) renew(ctx context.Context) error {
 	request.Header.Set("Content-Type", "application/json")
 	response, err := lease.client.Do(request)
 	if err != nil {
-		return errors.New("native lease renewal unavailable")
+		return errLeaseUnavailable
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
@@ -146,17 +151,25 @@ func (lease *executionLease) watch(ctx context.Context, interval time.Duration) 
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+		// The lease lasts 30s and renews every 10s, so a renewal that fails to
+		// reach the server leaves time for the next one. A second consecutive
+		// miss (or any rejection) ends the workload.
+		lastRenewed := time.Now()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
 				if err := lease.renew(ctx); err != nil {
+					if errors.Is(err, errLeaseUnavailable) && ctx.Err() == nil && time.Since(lastRenewed) < 2*interval {
+						continue
+					}
 					if ctx.Err() == nil {
 						failed <- err
 					}
 					return
 				}
+				lastRenewed = time.Now()
 			}
 		}
 	}()

@@ -130,3 +130,72 @@ func TestNativeLeaseWatchRunsWithoutObserverCallbacks(t *testing.T) {
 		t.Fatal("native watchdog did not notice revocation")
 	}
 }
+
+// dropConnection closes the TCP connection without answering, as a network
+// blip would.
+func dropConnection(w http.ResponseWriter) {
+	connection, _, err := w.(http.Hijacker).Hijack()
+	if err == nil {
+		_ = connection.Close()
+	}
+}
+
+func testRenewalServer(t *testing.T, lease **executionLease, answer func(call int32) bool) *httptest.Server {
+	t.Helper()
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !answer(calls.Add(1)) {
+			dropConnection(w)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"authorized": true, "policy_digest": (*lease).policyDigest, "manifest_digest": (*lease).manifestDigest, "lease_seconds": 30})
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func TestNativeLeaseToleratesOneMissedRenewal(t *testing.T) {
+	var lease *executionLease
+	// Call 1 is the initial renewal; call 2 is dropped; later calls succeed.
+	server := testRenewalServer(t, &lease, func(call int32) bool { return call != 2 })
+	file, command := testLeaseBootstrap(t, server.URL, nil)
+	var err error
+	lease, err = loadExecutionLease(file, command, strings.Repeat("a", 64), filepath.Dir(file), "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.renew(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	select {
+	case err := <-lease.watch(ctx, 50*time.Millisecond):
+		t.Fatalf("one dropped renewal ended the workload: %v", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+func TestNativeLeaseGivesUpWhenRenewalStaysUnavailable(t *testing.T) {
+	var lease *executionLease
+	server := testRenewalServer(t, &lease, func(call int32) bool { return call == 1 })
+	file, command := testLeaseBootstrap(t, server.URL, nil)
+	var err error
+	lease, err = loadExecutionLease(file, command, strings.Repeat("a", 64), filepath.Dir(file), "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.renew(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	select {
+	case err := <-lease.watch(ctx, 20*time.Millisecond):
+		if err == nil {
+			t.Fatal("a lasting outage was not reported")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the workload kept running with no renewal")
+	}
+}
