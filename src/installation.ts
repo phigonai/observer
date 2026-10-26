@@ -1,5 +1,6 @@
+import { makeDirectoryPrivate } from "./private-directory.js";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 const uuidPattern =
@@ -9,7 +10,7 @@ export async function loadOrCreateInstallationID(
   dataDirectory: string,
 ): Promise<string> {
   await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
-  await chmod(dataDirectory, 0o700);
+  await makeDirectoryPrivate(dataDirectory);
   const installationPath = join(dataDirectory, "installation-id");
   try {
     const existing = (await readFile(installationPath, "utf8")).trim();

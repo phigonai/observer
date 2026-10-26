@@ -1,3 +1,4 @@
+import { makeDirectoryPrivate } from "./private-directory.js";
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, mkdir, open, unlink } from "node:fs/promises";
@@ -213,7 +214,7 @@ class ManagedCommandJournal {
   async append(record: ManagedCommandRecord): Promise<void> {
     const directory = join(this.#dataDirectory, "bridges", "generic");
     await mkdir(directory, { recursive: true, mode: 0o700 });
-    await chmod(this.#dataDirectory, 0o700);
+    await makeDirectoryPrivate(this.#dataDirectory);
     await chmod(join(this.#dataDirectory, "bridges"), 0o700);
     await chmod(directory, 0o700);
     const path = join(directory, "guardian-managed-commands.jsonl");

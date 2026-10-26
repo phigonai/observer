@@ -1,3 +1,4 @@
+import { makeDirectoryPrivate } from "./private-directory.js";
 import {
   chmod,
   mkdir,
@@ -38,7 +39,7 @@ export class FileCredentialStore implements CredentialStore {
   async save(value: StoredMachineCredential): Promise<void> {
     validateCredential(value);
     await mkdir(this.#dataDirectory, { recursive: true, mode: 0o700 });
-    await chmod(this.#dataDirectory, 0o700);
+    await makeDirectoryPrivate(this.#dataDirectory);
     const temporaryPath = `${this.#credentialPath}.${process.pid}.${randomUUID()}.tmp`;
     try {
       await writeFile(

@@ -1,3 +1,4 @@
+import { makeDirectoryPrivateSync } from "./private-directory.js";
 import {
   createCipheriv,
   createDecipheriv,
@@ -264,7 +265,7 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
 
   #append(record: SpoolRecord): void {
     mkdirSync(this.#dataDirectory, { recursive: true, mode: 0o700 });
-    chmodSync(this.#dataDirectory, 0o700);
+    makeDirectoryPrivateSync(this.#dataDirectory);
     const encoded = `${JSON.stringify(record)}\n`;
     let size = existsSync(this.#path) ? statSync(this.#path).size : 0;
     if (size + Buffer.byteLength(encoded) > maxSpoolBytes) {
@@ -295,7 +296,7 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
   #writeCompactedQueue(queue: BoundedEventQueue<EventEnvelope>): void {
     this.#requireScope();
     mkdirSync(this.#dataDirectory, { recursive: true, mode: 0o700 });
-    chmodSync(this.#dataDirectory, 0o700);
+    makeDirectoryPrivateSync(this.#dataDirectory);
     const records: SpoolRecord[] = [
       this.#sequenceRecord("acknowledge", queue.metrics().acknowledged),
       ...queue.entries().map((entry) =>
