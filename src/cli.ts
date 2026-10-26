@@ -195,6 +195,7 @@ export async function run(
       const action = parseManagedAction(flagValue(flags, "--action"));
       const resource = flagValue(flags, "--resource");
       const agentID = flagValue(flags, "--agent") ?? "";
+      if (agentID !== "") validatedAgentID(agentID);
       const processID = parseOptionalProcessID(flagValue(flags, "--process-id"));
       const processStartedAt = flagValue(flags, "--process-started-at");
       if ((processID === undefined) !== (processStartedAt === undefined)) {
@@ -983,6 +984,7 @@ async function runGuardianLaunch(
   if (agentID === undefined) {
     throw new Error("guardian launch requires --agent <agent-id>.");
   }
+  validatedAgentID(agentID);
   const model = validatedModelResource(flagValue(gatewayFlags, "--model"));
   const executable = flags[separator + 1] as string;
   const commandArguments = flags.slice(separator + 2);
@@ -991,6 +993,15 @@ async function runGuardianLaunch(
     throw new Error("guardian launch executable or arguments are invalid.");
   }
   return await runGuardedCommand(executable, commandArguments, gatewayFlags, model, environment, output, dataDirectory);
+}
+
+// The control plane refuses any other agent ID with a generic manifest error,
+// so check here and say what is wrong.
+function validatedAgentID(value: string): string {
+  if (!/^[A-Za-z0-9._:-]{1,128}$/u.test(value)) {
+    throw new Error("--agent must be 1-128 letters, numbers, dots, underscores, colons or hyphens.");
+  }
+  return value;
 }
 
 function validateGuardianExecFlags(flags: readonly string[]): void {
@@ -1047,7 +1058,7 @@ async function runGuardedCommand(
   if (!credential || credential.controlPlaneOrigin !== config.controlPlaneUrl.origin) throw new Error("Guardian execution requires a paired machine and its configured control plane.");
   const policy = await new FileActionPolicyStore(dataDirectory).load(credential.machineId);
   if (!policy) { output.stdout("Phigon Guardian blocked execution: administrator policy is unavailable.\n"); return 77; }
-  const agentId = flagValue(flags, "--agent") ?? "managed-agent";
+  const agentId = validatedAgentID(flagValue(flags, "--agent") ?? "managed-agent");
   const context = await readGuardianActionContext(flagValue(flags, "--context-file"));
   const hosted = new GuardianHostedClient({ controlPlaneURL: config.controlPlaneUrl, credential: credential.credential });
   const childEnvironment = executionEnvironment({ ...process.env, ...environment });
