@@ -249,11 +249,20 @@ export class ObserverStreamClient {
     }
     if (signal.aborted) return;
     if (this.#queue instanceof FileBackedEventQueue) {
-      this.#queue.restore(
-        credential.tenantId,
-        credential.machineId,
-        credential.credential,
-      );
+      try {
+        this.#queue.restore(
+          credential.tenantId,
+          credential.machineId,
+          credential.credential,
+        );
+      } catch (error) {
+        // Retrying cannot repair a corrupt, oversized or foreign spool; stop
+        // and say so instead of reconnecting forever with nothing delivered.
+        throw new PermanentTelemetryError(
+          `The local telemetry spool cannot be used (${error instanceof Error ? error.message : "unknown error"}). ` +
+            "Keep the data directory and contact your administrator before removing it.",
+        );
+      }
     }
     const spooledAcknowledgement = this.#queue.metrics().acknowledged;
     const state = await this.#stateStore.load(
