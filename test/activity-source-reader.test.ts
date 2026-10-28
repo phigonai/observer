@@ -715,6 +715,7 @@ test("OpenCode SQLite replay preserves native ordered message evidence", async (
       ],
     );
   } finally {
+    reader.close();
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -739,6 +740,8 @@ test("OpenCode SQLite source baselines old rows and resumes only after acknowled
     format: "opencode-sqlite" as const,
   };
   const reader = new JSONLSourceReader(dataDirectory, false);
+  const beforeAckRestart = new JSONLSourceReader(dataDirectory, false);
+  const afterAckRestart = new JSONLSourceReader(dataDirectory, false);
 
   try {
     const baseline = await reader.scan([source]);
@@ -760,15 +763,14 @@ test("OpenCode SQLite source baselines old rows and resumes only after acknowled
       JSON.stringify(record.value).includes("ses_after_pairing")
     ));
 
-    const beforeAckRestart = new JSONLSourceReader(dataDirectory, false);
     const replayed = await beforeAckRestart.scan([source]);
     assert.equal(replayed.records.length, 4);
     await beforeAckRestart.commit(replayed.checkpoint);
 
-    const afterAckRestart = new JSONLSourceReader(dataDirectory, false);
     const acknowledged = await afterAckRestart.scan([source]);
     assert.deepEqual(acknowledged.records, []);
   } finally {
+    for (const opened of [reader, beforeAckRestart, afterAckRestart]) opened.close();
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -1236,9 +1238,16 @@ test("Goose session database rows are delivered once in insertion order", async 
     scan.records.map((record) =>
       ((record.value as { content: Array<{ text: string }> }).content[0]?.text ?? "")
     );
+  // Live readers keep their database connection open until closed.
+  const readers: JSONLSourceReader[] = [];
+  const liveReader = (dataDirectory: string) => {
+    const reader = new JSONLSourceReader(dataDirectory, false);
+    readers.push(reader);
+    return reader;
+  };
   try {
     // A database created after startup holds only new work.
-    const reader = new JSONLSourceReader(data, false);
+    const reader = liveReader(data);
     await reader.commit((await reader.scan(sources, 32)).checkpoint);
     const database = gooseDatabase(join(root, "sessions.db"));
     try {
@@ -1254,13 +1263,13 @@ test("Goose session database rows are delivered once in insertion order", async 
       // Work written while the observer was stopped is caught up on restart.
       addGooseMessage(database, "msg_2", "second");
       addGooseMessage(database, "msg_3", "third");
-      const restarted = new JSONLSourceReader(data, false);
+      const restarted = liveReader(data);
       const caughtUp = await restarted.scan(sources, 1);
       assert.deepEqual(texts(caughtUp), ["second"]);
       assert.deepEqual(texts(await restarted.scan(sources, 32)), ["third"]);
 
       // A fresh install baselines saved history instead of replaying it.
-      const fresh = new JSONLSourceReader(join(directory, "fresh"), false);
+      const fresh = liveReader(join(directory, "fresh"));
       assert.deepEqual(texts(await fresh.scan(sources, 32)), []);
       addGooseMessage(database, "msg_4", "fourth");
       assert.deepEqual(texts(await fresh.scan(sources, 32)), ["fourth"]);
@@ -1280,6 +1289,7 @@ test("Goose session database rows are delivered once in insertion order", async 
       database.close();
     }
   } finally {
+    for (const reader of readers) reader.close();
     await rm(directory, { recursive: true, force: true });
   }
 });

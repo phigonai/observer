@@ -697,6 +697,13 @@ export async function run(
             );
             publishInventory();
           },
+          (error) => output.stderr(
+            `Agent discovery failed and will retry on the next pass: ${
+              (error instanceof Error ? error.message : String(error))
+                .replace(/\s+/gu, " ")
+                .slice(0, 200)
+            }\n`,
+          ),
         );
         const processMonitor = new GuardianProcessMonitor({
           coverageClient: new GuardianHostedClient({ controlPlaneURL: config.controlPlaneUrl, credential: credential.credential }),

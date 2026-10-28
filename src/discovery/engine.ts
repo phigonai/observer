@@ -230,16 +230,27 @@ function compareRuntimeRetention(
   return rightObserved - leftObserved || left.agentId.localeCompare(right.agentId);
 }
 
+/**
+ * Discovers and publishes the inventory every interval until aborted. A pass
+ * that throws, while discovering or publishing, is reported to `onError`
+ * and retried after the interval: one failed pass must not stop the
+ * observer, whose other tasks end when this loop rejects.
+ */
 export async function runDiscoveryLoop(
   engine: DiscoveryEngine,
   machineId: string,
   intervalMs: number,
   signal: AbortSignal,
   publish: (inventory: AgentInventory) => void | Promise<void>,
+  onError: (error: unknown) => void = () => undefined,
 ): Promise<void> {
   while (!signal.aborted) {
-    const snapshot = await engine.discover(machineId);
-    await publish(snapshot.inventory);
+    try {
+      const snapshot = await engine.discover(machineId);
+      await publish(snapshot.inventory);
+    } catch (error) {
+      onError(error);
+    }
     await abortableDelay(intervalMs, signal);
   }
 }

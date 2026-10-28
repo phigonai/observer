@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { constants } from "node:fs";
 import { access, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, delimiter, join } from "node:path";
+import { basename, delimiter, join, win32 } from "node:path";
 import { promisify } from "node:util";
 import type {
   ConfigurationEvidence,
@@ -13,6 +13,7 @@ import type {
   ProcessEvidence,
 } from "./evidence.js";
 import { observedProcessKey } from "./process-identity.js";
+import { guardianRunnerPath } from "../guardian-native.js";
 
 const execFileAsync = promisify(execFile);
 const executableNamePattern = /^[a-zA-Z0-9._+-]{1,128}$/;
@@ -296,7 +297,59 @@ export class SystemEvidenceProvider implements HostEvidenceProvider {
   }
 }
 
+// Set once the native helper is found missing (for example, a source
+// checkout built without Go); PowerShell is used from then on.
+let nativeProcessListingMissing = false;
+
+/**
+ * Windows processes, listed by the bundled native helper in tens of
+ * milliseconds. PowerShell's Win32_Process query, which costs 0.3-1 s (most
+ * of it PowerShell start-up), is the fallback when the helper is missing or
+ * fails. Both report the same IDs, names and start times, and paths are
+ * normalized (see windowsPathIdentity) before identities are derived. Each
+ * listing is one short-lived process with a timeout, so nothing outlives
+ * the observer.
+ */
 async function readWindowsProcesses(): Promise<readonly ProcessEvidence[]> {
+  return listWindowsProcesses(
+    nativeProcessListingMissing ? undefined : runNativeProcessListing,
+    runPowerShellProcessListing,
+  );
+}
+
+export async function listWindowsProcesses(
+  native: (() => Promise<string>) | undefined,
+  powerShell: () => Promise<string>,
+): Promise<readonly ProcessEvidence[]> {
+  if (native !== undefined) {
+    try {
+      return windowsProcessEvidence(nativeProcessValues(await native()));
+    } catch {
+      // A crashed, timed-out or unreadable helper is retried next pass.
+    }
+  }
+  const parsed: unknown = JSON.parse(await powerShell());
+  return windowsProcessEvidence(Array.isArray(parsed) ? parsed : [parsed]);
+}
+
+export async function runNativeProcessListing(): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync(guardianRunnerPath(), ["__processes"], {
+      timeout: 5_000,
+      maxBuffer: 8 << 20,
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    return stdout;
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      nativeProcessListingMissing = true;
+    }
+    throw error;
+  }
+}
+
+export async function runPowerShellProcessListing(): Promise<string> {
   const script = [
     "Get-CimInstance Win32_Process",
     "Select-Object ProcessId,CreationDate,ExecutablePath,Name",
@@ -312,8 +365,35 @@ async function readWindowsProcesses(): Promise<readonly ProcessEvidence[]> {
       windowsHide: true,
     },
   );
+  return stdout;
+}
+
+/**
+ * The native listing in Win32_Process's shape. PowerShell serializes
+ * CreationDate as `/Date(<Unix ms>)/`; the helper reports those milliseconds,
+ * so rebuilding the string keeps process identities unchanged.
+ */
+export function nativeProcessValues(stdout: string): unknown[] {
   const parsed: unknown = JSON.parse(stdout);
-  const values = Array.isArray(parsed) ? parsed : [parsed];
+  if (!Array.isArray(parsed)) {
+    throw new Error("Native process listing is invalid.");
+  }
+  return parsed.map((value: unknown) => {
+    if (typeof value !== "object" || value === null) return undefined;
+    const entry = value as Record<string, unknown>;
+    const created = entry["created_ms"];
+    return {
+      ProcessId: entry["pid"],
+      Name: entry["name"],
+      CreationDate: typeof created === "number" && Number.isSafeInteger(created) && created > 0
+        ? `/Date(${created})/`
+        : undefined,
+      ExecutablePath: entry["path"],
+    };
+  });
+}
+
+function windowsProcessEvidence(values: readonly unknown[]): ProcessEvidence[] {
   const processes: ProcessEvidence[] = [];
   for (const value of values) {
     if (
@@ -334,7 +414,7 @@ async function readWindowsProcesses(): Promise<readonly ProcessEvidence[]> {
         ? value.ExecutablePath
         : value.Name;
     const startedAt = processStartDate(value.CreationDate);
-    const executablePathDigest = digest(rawPath);
+    const executablePathDigest = digest(windowsPathIdentity(rawPath));
     const processKey = observedProcessKey(
       "win32",
       value.ProcessId,
@@ -351,6 +431,22 @@ async function readWindowsProcesses(): Promise<readonly ProcessEvidence[]> {
     });
   }
   return processes;
+}
+
+/**
+ * One spelling of a Windows executable path, so a process has the same
+ * identity whichever listing found it. Win32_Process reports the path the
+ * process was started with (`C:\windows\Explorer.EXE`,
+ * `C:\Program Files\Git\bin\..\usr\bin\bash.exe`); the native helper reports
+ * the file's own path (`C:\Windows\explorer.exe`). Windows paths are
+ * case-insensitive, so case, `.` and `..` segments and a `\\?\` prefix are
+ * removed. A path reached through a junction still differs from its target.
+ */
+export function windowsPathIdentity(path: string): string {
+  let value = path;
+  if (/^\\\\\?\\UNC\\/iu.test(value)) value = `\\\\${value.slice(8)}`;
+  else if (value.startsWith("\\\\?\\")) value = value.slice(4);
+  return win32.normalize(value).toLowerCase();
 }
 
 async function readVersion(executablePath: string): Promise<string> {
