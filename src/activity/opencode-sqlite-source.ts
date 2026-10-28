@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import {
   historyTableRows,
   liveTableRows,
+  readableTables,
   type TableScan,
   tableColumns,
 } from "./opencode-message-tables.js";
@@ -112,20 +113,25 @@ async function scanDatabase(
   }
   const database = scan?.database ?? openDatabase(databaseReal);
   try {
-    if (!hasSupportedSchema(database)) {
+    // Sessions without event rows exist only in the message tables (see
+    // opencode-message-tables.ts). Each row is read from one place: its
+    // session's events when it has any, else the tables. A database only
+    // OpenCode 2 has used may have no OpenCode 1 event log at all.
+    const hasEvents = hasSupportedSchema(database);
+    const columns = tableColumns(database);
+    const hasTables = readableTables(columns).length > 0;
+    if (!hasEvents && !hasTables) {
       scan?.finish(undefined);
       return { records: [], files: 1, malformed: 1, oversized: 0, complete: true };
     }
-    const sessions = readSessionSequences(database, options.historical ? -1 : maxTrackedSessions);
+    const sessions = hasEvents
+      ? readSessionSequences(database, options.historical ? -1 : maxTrackedSessions)
+      : [];
     const marker = cursorID(databaseReal, "initialized");
     const firstDatabaseScan = options.cursors.get(marker) !== 1;
-    // Sessions without event rows exist only in the message and part tables
-    // (see opencode-message-tables.ts). Each row is read from one place: its
-    // session's events when it has any, else the tables.
-    const columns = tableColumns(database);
-    const tableContext = (found: NonNullable<typeof columns>, limit: number) => ({
+    const tableContext = (limit: number) => ({
       database,
-      columns: found,
+      columns,
       cursors: options.cursors,
       key: (scope: string) => cursorID(databaseReal, scope),
       now: (options.clock ?? Date.now)(),
@@ -146,9 +152,9 @@ async function scanDatabase(
       );
       rows = unread.rows;
       eventsComplete = unread.exhausted;
-      if (columns !== undefined) {
+      if (hasTables) {
         tables = historyTableRows({
-          ...tableContext(columns, options.maxReplayRecords - rows.length),
+          ...tableContext(options.maxReplayRecords - rows.length),
           // A history cursor is set only by delivering events, so a session
           // stays with its event log even once OpenCode deletes those events.
           deliveredByEvents: (sessionID) =>
@@ -174,10 +180,10 @@ async function scanDatabase(
           session.maxSequence,
         );
       }
-      if (columns !== undefined) {
+      if (hasTables) {
         const limit = options.maxReplayRecords - rows.length;
         tables = liveTableRows({
-          ...tableContext(columns, limit),
+          ...tableContext(limit),
           replay: options.initialScan && options.replayOnFirstStart ? limit : 0,
         });
       }
@@ -192,10 +198,10 @@ async function scanDatabase(
         limit,
       );
       rows = unread.rows;
-      if (columns !== undefined) {
-        tables = liveTableRows({ ...tableContext(columns, limit - rows.length), replay: 0 });
+      if (hasTables) {
+        tables = liveTableRows({ ...tableContext(limit - rows.length), replay: 0 });
       }
-      if (unread.selected === 0 && (columns === undefined || tables?.idle !== undefined)) {
+      if (unread.selected === 0 && (!hasTables || tables?.idle !== undefined)) {
         // No session had any row past its cursor, so the row limit did not
         // matter: the same database and cursors give the same empty scan,
         // until a row the tables wait for settles.
@@ -204,8 +210,7 @@ async function scanDatabase(
     }
 
     const sourceID = `ses_${digest(databaseReal).slice(0, 32)}`;
-    const hasMessages = columns !== undefined ||
-      database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='message'").get() !== undefined;
+    const hasMessages = columns.has("message");
     const messageLookup = hasMessages
       ? database.prepare("SELECT id, session_id, data FROM message WHERE id = ? AND session_id = ?")
       : undefined;
@@ -321,6 +326,7 @@ function unreadEvents(
   cursors: Array<readonly [string, number | undefined]>;
   exhausted: boolean;
 }> {
+  if (sessions.length === 0) return { rows: [], selected: 0, cursors: [], exhausted: true };
   const result: Array<Readonly<{ sessionID: string; row: EventRow }>> = [];
   const read: Array<readonly [string, number | undefined]> = [];
   let selected = 0;
@@ -366,6 +372,7 @@ function replayRows(
   sessions: readonly SessionSequence[],
   limit: number,
 ): Array<Readonly<{ sessionID: string; row: EventRow }>> {
+  if (sessions.length === 0) return [];
   const result: Array<Readonly<{ sessionID: string; row: EventRow }>> = [];
   const statement = database.prepare(
     "SELECT seq, type, data FROM event " +

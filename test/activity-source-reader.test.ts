@@ -1267,6 +1267,373 @@ test("an OpenCode session with event rows is read only from its events", async (
   }
 });
 
+/**
+ * OpenCode 2's session tables, with the columns and indexes OpenCode 2
+ * creates (packages/core/src/session/sql.ts), on a database that has them.
+ */
+function addOpenCode2Tables(database: DatabaseSync): void {
+  database.exec(`
+    CREATE TABLE session_v2 (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      slug TEXT NOT NULL,
+      directory TEXT NOT NULL,
+      title TEXT,
+      version TEXT NOT NULL,
+      time_created INTEGER NOT NULL,
+      time_updated INTEGER NOT NULL
+    );
+    CREATE TABLE session_message (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      seq INTEGER NOT NULL,
+      time_created INTEGER NOT NULL,
+      time_updated INTEGER NOT NULL,
+      data TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX session_message_session_seq_idx ON session_message (session_id, seq);
+    CREATE INDEX session_message_session_type_seq_idx ON session_message (session_id, type, seq);
+    CREATE INDEX session_message_session_time_created_id_idx ON session_message (session_id, time_created, id);
+    CREATE INDEX session_message_time_created_idx ON session_message (time_created);
+  `);
+}
+
+/**
+ * A database only OpenCode 2 has used: its session tables and its event
+ * log tables, which it leaves empty unless configured to keep events.
+ */
+function createOpenCode2Database(path: string): DatabaseSync {
+  const database = new DatabaseSync(path);
+  database.exec(`
+    CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER NOT NULL, owner_id TEXT);
+    CREATE TABLE event (
+      id TEXT PRIMARY KEY,
+      aggregate_id TEXT NOT NULL,
+      seq INTEGER NOT NULL,
+      type TEXT NOT NULL,
+      data TEXT NOT NULL,
+      created INTEGER
+    );
+  `);
+  addOpenCode2Tables(database);
+  return database;
+}
+
+/** Insert or rewrite a session_message row, as OpenCode 2 does while a step runs. */
+function insertOpenCode2Message(
+  database: DatabaseSync,
+  row: Readonly<{
+    sessionID: string;
+    id: string;
+    seq: number;
+    type: string;
+    created: number;
+    updated?: number;
+    data: Record<string, unknown>;
+  }>,
+): void {
+  database.prepare(
+    "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) " +
+      "VALUES (?, ?, ?, ?, ?, ?, ?) " +
+      "ON CONFLICT (id) DO UPDATE SET time_updated = excluded.time_updated, data = excluded.data",
+  ).run(row.id, row.sessionID, row.type, row.seq, row.created, row.updated ?? row.created, JSON.stringify(row.data));
+}
+
+const openCode2Model = { id: "example-model", providerID: "example-provider" };
+
+/** A finished OpenCode 2 assistant step: reasoning, a reply and one tool call. */
+function finishedOpenCode2Step(at: number, response: string): Record<string, unknown> {
+  return {
+    agent: "build",
+    model: openCode2Model,
+    content: [
+      { type: "reasoning", text: "Check the tests first.", time: { created: at, completed: at + 1 } },
+      { type: "text", text: response },
+      {
+        type: "tool",
+        id: "call_tests",
+        name: "bash",
+        executed: true,
+        state: {
+          status: "completed",
+          input: { command: "npm test" },
+          content: [{ type: "text", text: "All tests passed." }],
+          metadata: { exit: 0 },
+        },
+        time: { created: at + 2, ran: at + 3, completed: at + 4 },
+      },
+    ],
+    finish: "stop",
+    cost: 0.01,
+    tokens: { input: 120, output: 40, reasoning: 8, cache: { read: 0, write: 0 } },
+    time: { created: at, streamed: at + 1, completed: at + 5 },
+  };
+}
+
+/**
+ * A finished OpenCode 2 conversation: the session, a prompt, one assistant
+ * step and the idle marker that ends the turn.
+ */
+function insertOpenCode2Conversation(
+  database: DatabaseSync,
+  conversation: OpenCodeConversation,
+): void {
+  const at = conversation.updatedAt;
+  const session = conversation.sessionID;
+  database.prepare(
+    "INSERT INTO session_v2 (id, project_id, slug, directory, version, time_created, time_updated) " +
+      "VALUES (?, 'global', 'example', '/workspace', '2.1.0', ?, ?)",
+  ).run(session, at, at + 10);
+  insertOpenCode2Message(database, {
+    sessionID: session, id: `msg_user_${session}`, seq: 0, type: "user", created: at,
+    data: { text: conversation.prompt, time: { created: at } },
+  });
+  insertOpenCode2Message(database, {
+    sessionID: session, id: `msg_agent_${session}`, seq: 1, type: "assistant", created: at + 1, updated: at + 6,
+    data: finishedOpenCode2Step(at + 1, conversation.response),
+  });
+  insertOpenCode2Message(database, {
+    sessionID: session, id: `msg_idle_${session}`, seq: 2, type: "idle", created: at + 7,
+    data: { outcome: "succeeded", time: { created: at + 7 } },
+  });
+}
+
+/** Each OpenCode 2 record as `<record type>:<message id>`, in delivery order. */
+function openCode2Records(records: readonly { value: unknown }[]): string[] {
+  return records.map((record) => {
+    const value = record.value as { type?: string; info?: { id?: string }; messageID?: string };
+    return `${value.type}:${value.info?.id ?? value.messageID}`;
+  });
+}
+
+/** The records one finished conversation from insertOpenCode2Conversation yields. */
+function openCode2ConversationRecords(session: string): string[] {
+  return [
+    `session_message.user:msg_user_${session}`,
+    `session_message.assistant:msg_agent_${session}`,
+    `session_message.assistant.reasoning:msg_agent_${session}`,
+    `session_message.assistant.text:msg_agent_${session}`,
+    `session_message.assistant.tool:msg_agent_${session}`,
+    `session_message.idle:msg_idle_${session}`,
+  ];
+}
+
+test("an OpenCode 2 history import reads each message and its parts once", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-opencode2-history-"));
+  const sourceRoot = join(directory, "opencode");
+  await mkdir(sourceRoot, { recursive: true });
+  const database = createOpenCode2Database(join(sourceRoot, "opencode.db"));
+  insertOpenCode2Conversation(database, {
+    sessionID: "ses_v2_first",
+    prompt: "Rename the config loader.",
+    response: "The loader is renamed.",
+    updatedAt: 1_785_686_000_000,
+  });
+  insertOpenCode2Conversation(database, {
+    sessionID: "ses_v2_second",
+    prompt: "Add a retry to the upload.",
+    response: "The upload retries once.",
+    updatedAt: 1_785_686_100_000,
+  });
+  database.close();
+  const sources = openCodeSources(sourceRoot);
+  const dataDirectory = join(directory, "history");
+  try {
+    const first = await importOpenCodeHistory(dataDirectory, sources);
+    assert.equal(first.complete, true);
+    assert.deepEqual(openCode2Records(first.records), [
+      ...openCode2ConversationRecords("ses_v2_first"),
+      ...openCode2ConversationRecords("ses_v2_second"),
+    ]);
+    assert.equal(new Set(first.records.map((record) => record.sourceRecordId)).size, 12);
+    // The step's own record keeps its usage; its parts are separate records.
+    const step = first.records[1]?.value as { info?: { tokens?: unknown; content?: unknown } };
+    assert.deepEqual(step.info?.tokens, { input: 120, output: 40, reasoning: 8, cache: { read: 0, write: 0 } });
+    assert.equal(step.info?.content, undefined);
+    assert.deepEqual(first.records.slice(2, 5).map((record) => record.observedAt.getTime() - 1_785_686_000_000), [2, 2, 5]);
+
+    const again = await importOpenCodeHistory(dataDirectory, sources);
+    assert.deepEqual([again.records.length, again.complete], [0, true]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("live OpenCode 2 capture reads a new message", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-opencode2-live-"));
+  const sourceRoot = join(directory, "opencode");
+  const dataDirectory = join(directory, "data");
+  await mkdir(sourceRoot, { recursive: true });
+  const database = createOpenCode2Database(join(sourceRoot, "opencode.db"));
+  insertOpenCode2Conversation(database, {
+    sessionID: "ses_v2",
+    prompt: "Existing prompt",
+    response: "Existing response",
+    updatedAt: 1_785_686_000_000,
+  });
+  const sources = openCodeSources(sourceRoot);
+  const reader = new JSONLSourceReader(dataDirectory, false);
+  const restarted = new JSONLSourceReader(dataDirectory, false);
+  try {
+    const baseline = await reader.scan(sources);
+    assert.deepEqual(baseline.records, [], "messages written before the reader started are history");
+    await reader.commit(baseline.checkpoint);
+
+    const now = Date.now();
+    insertOpenCode2Message(database, {
+      sessionID: "ses_v2", id: "msg_user_next", seq: 3, type: "user", created: now,
+      data: { text: "Add a changelog entry.", time: { created: now } },
+    });
+    const live = await reader.scan(sources);
+    assert.deepEqual(openCode2Records(live.records), ["session_message.user:msg_user_next"]);
+    const prompt = live.records[0];
+    assert.equal((prompt?.value as { info?: { text?: string } }).info?.text, "Add a changelog entry.");
+    assert.equal(prompt?.observedAt.getTime(), now);
+    await reader.commit(live.checkpoint);
+    assert.deepEqual((await reader.scan(sources)).records, []);
+    assert.deepEqual((await restarted.scan(sources)).records, [], "a restart resumes after acknowledged rows");
+  } finally {
+    for (const opened of [reader, restarted]) opened.close();
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a streamed OpenCode 2 reply is delivered once its step is final", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-opencode2-stream-"));
+  const sourceRoot = join(directory, "opencode");
+  await mkdir(sourceRoot, { recursive: true });
+  const database = createOpenCode2Database(join(sourceRoot, "opencode.db"));
+  insertOpenCode2Conversation(database, {
+    sessionID: "ses_v2",
+    prompt: "Existing prompt",
+    response: "Existing response",
+    updatedAt: 1_785_686_000_000,
+  });
+  const sources = openCodeSources(sourceRoot);
+  const reader = new JSONLSourceReader(join(directory, "data"), false);
+  try {
+    assert.deepEqual((await reader.scan(sources)).records, []);
+    const start = Date.now();
+    const step = finishedOpenCode2Step(start, "The build passes.");
+    const content = step["content"] as Array<Record<string, unknown>>;
+    const tool = content[2] as Record<string, unknown>;
+    // OpenCode 2 rewrites the step's row at each event, from its start to
+    // the end of its last tool call.
+    const writes: Array<Record<string, unknown>> = [
+      { ...step, content: [], time: { created: start } },
+      { ...step, content: [{ type: "reasoning", text: "", time: { created: start } }], time: { created: start } },
+      { ...step, content: [content[0], { type: "text", text: "" }], time: { created: start } },
+      { ...step, content: [content[0], content[1]], time: { created: start, streamed: start + 1 } },
+      {
+        ...step,
+        content: [content[0], content[1], { ...tool, state: { status: "streaming", input: "" } }],
+        time: { created: start, streamed: start + 1 },
+      },
+      {
+        ...step,
+        content: [content[0], content[1], { ...tool, state: { status: "running", input: { command: "npm test" }, metadata: {} } }],
+        time: { created: start, streamed: start + 1 },
+      },
+      { ...step, time: { created: start, streamed: start + 1 } },
+    ];
+    for (const [index, data] of writes.entries()) {
+      insertOpenCode2Message(database, {
+        sessionID: "ses_v2", id: "msg_agent_stream", seq: 3, type: "assistant",
+        created: start, updated: start + index, data,
+      });
+      assert.deepEqual((await reader.scan(sources)).records, [], "an unfinished step is held back");
+    }
+
+    insertOpenCode2Message(database, {
+      sessionID: "ses_v2", id: "msg_agent_stream", seq: 3, type: "assistant",
+      created: start, updated: start + writes.length, data: step,
+    });
+    const finished = await reader.scan(sources);
+    assert.deepEqual(openCode2Records(finished.records), [
+      "session_message.assistant:msg_agent_stream",
+      "session_message.assistant.reasoning:msg_agent_stream",
+      "session_message.assistant.text:msg_agent_stream",
+      "session_message.assistant.tool:msg_agent_stream",
+    ]);
+    const parts = finished.records.slice(1).map((record) => (record.value as { part: unknown }).part);
+    assert.deepEqual(parts, content, "each part is delivered with its final content");
+    assert.deepEqual((await reader.scan(sources)).records, []);
+
+    // The history import reads the same rows under the same identities, so
+    // the control plane keeps one copy of each.
+    const history = await importOpenCodeHistory(join(directory, "history"), sources);
+    const historical = new Set(history.records.map((record) => record.sourceRecordId));
+    for (const record of finished.records) assert.ok(historical.has(record.sourceRecordId));
+  } finally {
+    reader.close();
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("OpenCode 1 sessions that OpenCode 2 copied are read only from their OpenCode 1 rows", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-opencode2-copied-"));
+  const sourceRoot = join(directory, "opencode");
+  await mkdir(sourceRoot, { recursive: true });
+  const database = createOpenCodeDatabase(join(sourceRoot, "opencode.db"));
+  addOpenCode2Tables(database);
+  // OpenCode 2's first start deleted the session's events and copied it,
+  // keeping the session id and each message's creation time.
+  const copied = { sessionID: "ses_copied", prompt: "Old prompt", response: "Old response", updatedAt: 1_785_686_000_000 };
+  insertOpenCodeTableConversation(database, copied);
+  insertOpenCode2Conversation(database, { ...copied });
+  database.prepare("UPDATE session_message SET time_created = ? WHERE id = ?")
+    .run(copied.updatedAt + 2, "msg_agent_ses_copied");
+  database.prepare("UPDATE session_message SET time_created = ? WHERE id = ?")
+    .run(copied.updatedAt + 2, "msg_idle_ses_copied");
+  insertOpenCode2Conversation(database, {
+    sessionID: "ses_v2_only",
+    prompt: "New prompt",
+    response: "New response",
+    updatedAt: 1_785_686_100_000,
+  });
+  // The copied session continued in OpenCode 2.
+  insertOpenCode2Message(database, {
+    sessionID: "ses_copied", id: "msg_user_resumed", seq: 3, type: "user", created: 1_785_686_200_000,
+    data: { text: "Continue the old plan.", time: { created: 1_785_686_200_000 } },
+  });
+  const sources = openCodeSources(sourceRoot);
+  const reader = new JSONLSourceReader(join(directory, "data"), false);
+  try {
+    const history = await importOpenCodeHistory(join(directory, "history"), sources);
+    assert.equal(history.complete, true);
+    assert.deepEqual(openCodeRecordIDs(history.records.filter((record) =>
+      !(record.value as { type: string }).type.startsWith("session_message.")
+    )).sort(), [
+      "message:msg_agent_ses_copied",
+      "message:msg_user_ses_copied",
+      "part:part_prompt_ses_copied",
+      "part:part_response_ses_copied",
+    ], "the copied session from its OpenCode 1 rows");
+    assert.deepEqual(openCode2Records(history.records.filter((record) =>
+      (record.value as { type: string }).type.startsWith("session_message.")
+    )), [
+      ...openCode2ConversationRecords("ses_v2_only"),
+      "session_message.user:msg_user_resumed",
+    ], "OpenCode 2's own messages, none of the copies");
+
+    // Live capture also skips copies and reads what OpenCode 2 adds.
+    assert.deepEqual((await reader.scan(sources)).records, []);
+    const now = Date.now();
+    insertOpenCode2Message(database, {
+      sessionID: "ses_copied", id: "msg_user_live", seq: 4, type: "user", created: now,
+      data: { text: "And the next step.", time: { created: now } },
+    });
+    assert.deepEqual(openCode2Records((await reader.scan(sources)).records), ["session_message.user:msg_user_live"]);
+  } finally {
+    reader.close();
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("first replay keeps a record that starts exactly at the replay offset", async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-source-boundary-"));
   const root = join(directory, "sessions");

@@ -116,6 +116,114 @@ test("OpenCode CLI JSON produces canonical tool and lifecycle events", async () 
   assert.doesNotMatch(serialized, /fixturesecret/u);
 });
 
+test("OpenCode 2 session messages become prompts, reasoning, replies, tool calls and turn ends", () => {
+  const policy = new LocalPolicyEngine(loadConfig({
+    PHIGON_COLLECT_PROMPT_CONTENT: "true",
+    PHIGON_COLLECT_RESPONSE_CONTENT: "true",
+    PHIGON_COLLECT_REASONING_CONTENT: "true",
+    PHIGON_COLLECT_COMMAND_ARGUMENTS: "true",
+    PHIGON_COLLECT_TOOL_OUTPUT: "true",
+  }).policy);
+  const sessionID = "ses_opencode2_adapter";
+  const context = { sessionId: sessionID, observedAt, policy };
+  const parse = (record: Record<string, unknown>) =>
+    openCodeActivityAdapter.parse({ sessionID, ...record }, context);
+  const step = { id: "msg_step", sessionID, type: "assistant", agent: "build", time: { created: 1, completed: 9 } };
+
+  const prompt = parse({
+    type: "session_message.user",
+    info: { id: "msg_prompt", sessionID, type: "user", text: "Rename the loader.", time: { created: 1 } },
+  });
+  assert.deepEqual(prompt.map(activityOf), [[ActivityKind.PROMPT, "Rename the loader."]]);
+
+  const started = parse({
+    type: "session_message.assistant",
+    info: { ...step, tokens: { input: 120, output: 40, reasoning: 8, cache: { read: 0, write: 0 } } },
+  });
+  assert.deepEqual(started.map((draft) => draft.payload.case === "lifecycle" ? draft.payload.value.phase : draft.payload.case), [LifecyclePhase.STARTED]);
+  assert.deepEqual(parse({ type: "session_message.assistant", info: step }), [], "a turn starts once");
+
+  const reasoning = parse({
+    type: "session_message.assistant.reasoning",
+    messageID: "msg_step",
+    part: { type: "reasoning", text: "Check the tests first.", time: { created: 2, completed: 3 } },
+  });
+  assert.deepEqual(reasoning.map(activityOf), [[ActivityKind.REASONING, "Check the tests first."]]);
+  const reply = parse({
+    type: "session_message.assistant.text",
+    messageID: "msg_step",
+    part: { type: "text", text: "The loader is renamed." },
+  });
+  assert.deepEqual(reply.map(activityOf), [[ActivityKind.RESPONSE, "The loader is renamed."]]);
+  assert.deepEqual(parse({
+    type: "session_message.assistant.text",
+    messageID: "msg_step",
+    part: { type: "text", text: "" },
+  }), []);
+
+  const tool = parse({
+    type: "session_message.assistant.tool",
+    messageID: "msg_step",
+    part: {
+      type: "tool",
+      id: "call_tests",
+      name: "bash",
+      state: {
+        status: "completed",
+        input: { command: "npm test" },
+        content: [{ type: "text", text: "All tests passed." }],
+        metadata: { exit: 0 },
+      },
+      time: { created: 4, ran: 5, completed: 6 },
+    },
+  }).find((draft) => draft.payload.case === "tool");
+  assert.ok(tool?.payload.case === "tool");
+  assert.deepEqual(
+    [tool.payload.value.invocationId, tool.payload.value.toolName, tool.payload.value.phase, tool.payload.value.exitCode],
+    ["call_tests", "bash", ToolPhase.SUCCEEDED, 0],
+  );
+  assert.match(tool.payload.value.argumentsJson ?? "", /npm test/u);
+  assert.match(tool.payload.value.output ?? "", /All tests passed\./u);
+  const failed = parse({
+    type: "session_message.assistant.tool",
+    messageID: "msg_step",
+    part: {
+      type: "tool",
+      id: "call_read",
+      name: "read",
+      state: { status: "error", input: { path: "missing.txt" }, error: { type: "tool", message: "File not found." } },
+      time: { created: 7, completed: 8 },
+    },
+  }).find((draft) => draft.payload.case === "tool");
+  assert.ok(failed?.payload.case === "tool");
+  assert.equal(failed.payload.value.phase, ToolPhase.FAILED);
+  assert.match(failed.payload.value.output ?? "", /File not found\./u);
+
+  // Messages OpenCode adds itself stay vendor records only.
+  assert.deepEqual(parse({
+    type: "session_message.synthetic",
+    info: { id: "msg_note", sessionID, type: "synthetic", text: "Continue.", time: { created: 9 } },
+  }), []);
+
+  const ended = parse({
+    type: "session_message.idle",
+    info: { id: "msg_idle", sessionID, type: "idle", outcome: "failed", time: { created: 10 } },
+  });
+  assert.deepEqual(
+    ended.map((draft) => draft.payload.case === "lifecycle" ? draft.payload.value.phase : draft.payload.case),
+    [LifecyclePhase.IDLE, "activity"],
+  );
+  assert.equal(ended[1]?.payload.case === "activity" ? ended[1].payload.value.kind : undefined, ActivityKind.ERROR);
+  assert.equal(parse({ type: "session_message.assistant", info: step }).length, 1, "the next turn starts again");
+});
+
+/** An activity draft's kind and content. */
+function activityOf(draft: ActivityDraft): readonly [ActivityKind | undefined, string | undefined] {
+  return draft.payload.case === "activity"
+    ? [draft.payload.value.kind, draft.payload.value.content]
+    : [undefined, undefined];
+}
+
 test("OpenCode database events preserve speaker roles and fail closed on conflict", () => {
   const policy = new LocalPolicyEngine(loadConfig({
     PHIGON_COLLECT_PROMPT_CONTENT: "true",

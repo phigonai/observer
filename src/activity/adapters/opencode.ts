@@ -37,7 +37,11 @@ class OpenCodeActivityAdapter implements VendorActivityAdapter {
         ...context,
         observedAt: openCodeObservedAt(object, context.observedAt),
       };
-      const type = normalizeOpenCodeType(stringField(object, "type"));
+      const recordType = stringField(object, "type");
+      if (recordType.startsWith("session_message.")) {
+        return this.#parseSessionMessage(recordType, object, observedContext);
+      }
+      const type = normalizeOpenCodeType(recordType);
       const part = objectValue(object["part"]);
       this.#rememberMessageRole(objectValue(object["message_info"]), context.sessionId);
       if (type === "message.updated") {
@@ -133,6 +137,120 @@ class OpenCodeActivityAdapter implements VendorActivityAdapter {
     }
   }
 
+  /**
+   * An OpenCode 2 record: a session_message row without its parts, or one
+   * part of it. See opencode-message-tables.ts.
+   */
+  #parseSessionMessage(
+    type: string,
+    object: Record<string, unknown>,
+    context: ParseContext,
+  ): readonly ActivityDraft[] {
+    const info = objectValue(object["info"]);
+    const part = objectValue(object["part"]);
+    switch (type) {
+      case "session_message.user": {
+        if (stringField(info, "text").trim() === "") return [];
+        return [activityDraft(
+          this.agentKind,
+          context,
+          ActivityKind.PROMPT,
+          "User prompt submitted.",
+          info?.["text"],
+          "promptContent",
+          "text",
+        )];
+      }
+      case "session_message.assistant": {
+        // A step's text, reasoning and tool calls are records of their own;
+        // its usage stays in the record for usage reports.
+        const drafts: ActivityDraft[] = [];
+        if (!this.#startedSessions.has(context.sessionId)) {
+          this.#rememberStarted(context.sessionId);
+          const started = nestedField(info, "time", "created");
+          drafts.push(lifecycleDraft(
+            this.agentKind,
+            typeof started === "number" && Number.isFinite(started)
+              ? { ...context, observedAt: new Date(started) }
+              : context,
+            LifecyclePhase.STARTED,
+            "OpenCode task started.",
+          ));
+        }
+        if (info?.["error"] !== undefined && info["error"] !== null) {
+          drafts.push(errorDraft(this.agentKind, context, "session_message.assistant.error"));
+        }
+        return drafts;
+      }
+      case "session_message.assistant.text":
+        if (stringField(part, "text").trim() === "") return [];
+        return [activityDraft(
+          this.agentKind,
+          context,
+          ActivityKind.RESPONSE,
+          "Agent response produced.",
+          part?.["text"],
+          "responseContent",
+          "text",
+        )];
+      case "session_message.assistant.reasoning":
+        if (stringField(part, "text").trim() === "") return [];
+        return [activityDraft(
+          this.agentKind,
+          context,
+          ActivityKind.REASONING,
+          "Agent reasoning updated.",
+          part?.["text"],
+          "reasoningContent",
+          "text",
+        )];
+      case "session_message.assistant.tool": {
+        const state = objectValue(part?.["state"]);
+        const status = stringField(state, "status");
+        return toolDrafts(this.agentKind, context, {
+          invocationId: part?.["id"],
+          toolName: part?.["name"],
+          phase: openCodeToolPhase(status),
+          arguments: state?.["input"],
+          output: openCodeToolOutput(state),
+          exitCode: nestedField(state, "metadata", "exit") ??
+            nestedField(state, "metadata", "exitCode"),
+        });
+      }
+      case "session_message.shell": {
+        // A command the user ran in the session.
+        const exit = info?.["exit"];
+        return toolDrafts(this.agentKind, context, {
+          invocationId: info?.["shellID"],
+          toolName: "shell",
+          phase: openCodeShellPhase(stringField(info, "status"), exit),
+          arguments: { command: info?.["command"] },
+          output: nestedField(info, "output", "output"),
+          exitCode: exit,
+        });
+      }
+      case "session_message.idle": {
+        // Ends the turn: every step since the previous marker belongs to it.
+        this.#startedSessions.delete(context.sessionId);
+        const outcome = stringField(info, "outcome");
+        const drafts = [lifecycleDraft(
+          this.agentKind,
+          context,
+          LifecyclePhase.IDLE,
+          outcome === "interrupted" ? "OpenCode task interrupted." : "OpenCode task completed.",
+        )];
+        if (outcome === "failed") {
+          drafts.push(errorDraft(this.agentKind, context, "session_message.idle.failed"));
+        }
+        return drafts;
+      }
+      default:
+        // Synthetic and system messages, compactions, model and agent
+        // switches, and user files stay as the vendor's own records.
+        return [];
+    }
+  }
+
   #rememberStarted(sessionId: string): void {
     this.#startedSessions.add(sessionId);
     if (this.#startedSessions.size <= 4_096) return;
@@ -176,6 +294,28 @@ function openCodeObservedAt(
   }
   const parsed = new Date(timestamp);
   return Number.isNaN(parsed.getTime()) ? fallback : parsed;
+}
+
+/** A finished OpenCode 2 tool call's text output, or its error. */
+function openCodeToolOutput(state: Record<string, unknown> | null): string | undefined {
+  const content = state?.["content"];
+  const texts = Array.isArray(content)
+    ? content.flatMap((item: unknown) => {
+      const value = objectValue(item);
+      return value?.["type"] === "text" && typeof value["text"] === "string" ? [value["text"]] : [];
+    })
+    : [];
+  const error = nestedField(state, "error", "message");
+  if (typeof error === "string" && error !== "") texts.unshift(error);
+  return texts.length === 0 ? undefined : texts.join("\n");
+}
+
+function openCodeShellPhase(status: string, exit: unknown): ToolPhase {
+  if (status === "running") return ToolPhase.RUNNING;
+  if (status === "killed") return ToolPhase.CANCELLED;
+  if (status === "timeout") return ToolPhase.FAILED;
+  if (status === "exited") return exit === undefined || exit === 0 ? ToolPhase.SUCCEEDED : ToolPhase.FAILED;
+  return ToolPhase.REQUESTED;
 }
 
 function openCodeToolPhase(status: string): ToolPhase {

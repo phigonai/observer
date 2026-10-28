@@ -561,3 +561,77 @@ test("an idle OpenCode tick reads no message or part rows, even while it waits f
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("an idle OpenCode 2 tick reads no session_message rows, even while a step runs", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-sqlite-v2-idle-"));
+  const root = join(directory, "opencode");
+  await mkdir(root);
+  const path = join(root, "opencode.db");
+  // A database only OpenCode 2 has used: no OpenCode 1 session table.
+  const writer = new DatabaseSync(path);
+  writer.exec(
+    "PRAGMA journal_mode = WAL;" +
+    "CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER NOT NULL);" +
+    "CREATE TABLE event (aggregate_id TEXT NOT NULL, seq INTEGER NOT NULL, type TEXT NOT NULL, data TEXT NOT NULL);" +
+    "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, time_updated INTEGER NOT NULL);" +
+    "CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, " +
+    "seq INTEGER NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);" +
+    "INSERT INTO session_v2 VALUES ('ses_v2', 0);",
+  );
+  let now = Date.now();
+  const clock = () => now;
+  const connections = new CountingConnections({ clock });
+  const cursors = new Map<string, number>();
+  const scan = (initialScan = false) => scanOpenCodeSQLiteSources({
+    adapterId: "opencode",
+    roots: [root],
+    cursors,
+    initialScan,
+    replayOnFirstStart: false,
+    maxReplayRecords: 64,
+    connections,
+    clock,
+  });
+  const messageRows = /FROM session_message t\b/u;
+  try {
+    assert.deepEqual((await scan(true)).records, []);
+    assert.deepEqual((await scan()).records, []);
+    connections.take();
+    connections.takeRows(messageRows);
+
+    // Unchanged: answered by data_version alone.
+    assert.deepEqual((await scan()).records, []);
+    assert.deepEqual(connections.take(), ["PRAGMA data_version"]);
+
+    // A commit that adds no message runs one full scan that reads no row.
+    writer.prepare("UPDATE session_v2 SET time_updated = time_updated + 1").run();
+    const full = await scan();
+    assert.deepEqual([full.records.length, full.malformed], [0, 0]);
+    assert.equal(connections.takeRows(messageRows), 0);
+    assert.ok(connections.take().length <= 10, "a full scan prepares a bounded set of statements");
+    assert.deepEqual((await scan()).records, []);
+    assert.deepEqual(connections.take(), ["PRAGMA data_version"]);
+
+    // A step still running is waited for without rescanning an unchanged
+    // database, until it settles.
+    const updated = now - settleMilliseconds + 1_000;
+    writer.prepare("INSERT INTO session_message VALUES ('msg_step', 'ses_v2', 'assistant', 0, ?, ?, ?)")
+      .run(updated, updated, JSON.stringify({ content: [{ type: "text", text: "Working" }], time: { created: updated } }));
+    assert.deepEqual((await scan()).records, []);
+    assert.deepEqual((await scan()).records, []);
+    connections.take();
+    assert.deepEqual((await scan()).records, []);
+    assert.deepEqual(connections.take(), ["PRAGMA data_version"]);
+    now = updated + settleMilliseconds;
+    const settled = await scan();
+    assert.deepEqual(
+      settled.records.map((record) => (record.value as { type: string }).type),
+      ["session_message.assistant", "session_message.assistant.text"],
+    );
+    assert.deepEqual((await scan()).records, []);
+  } finally {
+    connections.closeAll();
+    writer.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
