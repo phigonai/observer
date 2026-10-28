@@ -198,6 +198,25 @@ test("a command that expires during slow process discovery is never dispatched",
   assert.equal(child.exitCode, null); assert.equal(child.signalCode, null);
 });
 
+test("a discovery deadline set by the expiry reports expiry even if the timer fires early", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-agent-action-early-timer-"));
+  const realNow = Date.now.bind(Date);
+  const expiresAt = new Date(realNow() + 150);
+  // Timers can fire a millisecond before Date.now() reaches the deadline;
+  // pin the clock just short of expiry once discovery has started.
+  let pinned = false;
+  t.mock.method(Date, "now", () => pinned ? expiresAt.getTime() - 1 : realNow());
+  const executor = new AgentActionExecutor({ enabled: true, machineID, dataDirectory: directory,
+    inventory: () => { pinned = true; return new Promise<never>(() => {}); },
+  });
+  const result = await executor.execute(create(AgentActionCommandSchema, {
+    actionId: actionID, idempotencyKey, machineId: machineID, agentId: "slow-runtime", processId: 4242n,
+    expectedStartedAt: timestampFromDate(new Date(realNow() - 60_000)), expiresAt: timestampFromDate(expiresAt), action: RemoteActionType.KILL_AGENT,
+  }));
+  assert.equal(result.state, RemoteActionResultState.EXPIRED);
+  assert.equal(result.resultCode, "command_expired");
+});
+
 test("a replay after the command expires returns the original receipt, not a false expiry", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-agent-action-retained-"));
   const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
