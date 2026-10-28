@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 export type ObserverLogLevel = "debug" | "info" | "warn" | "error";
 export const DEFAULT_CONTROL_PLANE_ORIGIN = "https://api.phigon.online";
@@ -12,6 +12,9 @@ export type ActivitySourceDirectories = Readonly<{
   openclaw: readonly string[];
   copilot: readonly string[];
   opencode: readonly string[];
+  gemini: readonly string[];
+  cline: readonly string[];
+  goose: readonly string[];
   generic: readonly string[];
 }>;
 
@@ -270,6 +273,18 @@ export function loadConfig(
       opencode: parseDirectoryList(
         environment["PHIGON_OPENCODE_ACTIVITY_DIRS"],
         [join(homedir(), ".local", "share", "opencode")],
+      ),
+      gemini: parseDirectoryList(
+        environment["PHIGON_GEMINI_ACTIVITY_DIRS"],
+        [join(homedir(), ".gemini", "tmp")],
+      ),
+      cline: parseDirectoryList(
+        environment["PHIGON_CLINE_ACTIVITY_DIRS"],
+        [join(homedir(), ".cline", "data", "sessions")],
+      ),
+      goose: parseDirectoryList(
+        environment["PHIGON_GOOSE_ACTIVITY_DIRS"],
+        gooseSessionDirectories(environment),
       ),
       generic: parseDirectoryList(
         environment["PHIGON_GENERIC_ACTIVITY_DIRS"],
@@ -538,6 +553,34 @@ function parseRedactionPathPatterns(value: string): readonly string[] {
     );
   }
   return Object.freeze(patterns);
+}
+
+/**
+ * Goose keeps sessions.db in <data dir>/sessions. The data directory is
+ * $GOOSE_PATH_ROOT/data when that is an absolute path, otherwise the
+ * etcetera app strategy for author "Block" and app "goose": XDG on Linux
+ * and macOS, %APPDATA%/Block/goose/data on Windows.
+ */
+function gooseSessionDirectories(
+  environment: NodeJS.ProcessEnv,
+): readonly string[] {
+  const pathRoot = environment["GOOSE_PATH_ROOT"]?.trim();
+  if (pathRoot !== undefined && isAbsolute(pathRoot)) {
+    return [join(pathRoot, "data", "sessions")];
+  }
+  if (process.platform === "win32") {
+    const appData = environment["APPDATA"]?.trim() ||
+      join(homedir(), "AppData", "Roaming");
+    return [join(appData, "Block", "goose", "data", "sessions")];
+  }
+  const dataHome = environment["XDG_DATA_HOME"]?.trim();
+  return [join(
+    dataHome !== undefined && isAbsolute(dataHome)
+      ? dataHome
+      : join(homedir(), ".local", "share"),
+    "goose",
+    "sessions",
+  )];
 }
 
 function parseDirectoryList(

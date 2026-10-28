@@ -39,6 +39,24 @@ class ClaudeActivityAdapter implements VendorActivityAdapter {
       };
       const type = stringField(object, "type");
       if (type === "system" || type === "summary") {
+        // Claude Code transcripts write many system records per session
+        // (turn timing, hook summaries, notices). Only the session start,
+        // a finished turn, and an API failure carry lifecycle meaning.
+        const subtype = stringField(object, "subtype");
+        if (subtype === "turn_duration") {
+          return [lifecycleDraft(
+            this.agentKind,
+            observedContext,
+            LifecyclePhase.IDLE,
+            "Claude turn completed.",
+          )];
+        }
+        if (subtype === "api_error") {
+          return [errorDraft(this.agentKind, observedContext, "api_error")];
+        }
+        if (type === "system" && subtype !== "" && subtype !== "init") {
+          return [];
+        }
         return [lifecycleDraft(
           this.agentKind,
           observedContext,
@@ -108,7 +126,13 @@ class ClaudeActivityAdapter implements VendorActivityAdapter {
           textBlocks.push(item["text"] ?? block);
         }
       }
-      const text = extractText(textBlocks);
+      // Claude Code marks text it injects into the user turn (command
+      // caveats, reminders, compaction summaries). It was not typed by the
+      // user, so it must not appear as a user prompt.
+      const injected =
+        type === "user" &&
+        (object["isMeta"] === true || object["isCompactSummary"] === true);
+      const text = injected ? "" : extractText(textBlocks);
       if (text !== "") {
         drafts.unshift(activityDraft(
           this.agentKind,

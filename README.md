@@ -49,10 +49,10 @@ exactly what runs on your computers and what leaves them.
 | <img src="https://phigon.online/agents/openclaw.svg" width="20" alt=""> | OpenClaw | Yes | Built in |
 | <img src="https://phigon.online/agents/hermes.svg" width="20" alt=""> | Hermes Agent | Yes | Built in |
 | <img src="https://phigon.online/agents/cursor.svg" width="20" alt=""> | Cursor Agent | Yes | Bridge |
-| <img src="https://phigon.online/agents/gemini-cli.svg" width="20" alt=""> | Gemini CLI | Yes | Bridge |
+| <img src="https://phigon.online/agents/gemini-cli.svg" width="20" alt=""> | Gemini CLI | Yes | Built in |
 | <img src="https://phigon.online/agents/amp.svg" width="20" alt=""> | Amp | Yes | Bridge |
-| <img src="https://phigon.online/agents/goose.svg" width="20" alt=""> | Goose | Yes | Bridge |
-| <img src="https://phigon.online/agents/cline.svg" width="20" alt=""> | Cline | Yes | Bridge |
+| <img src="https://phigon.online/agents/goose.svg" width="20" alt=""> | Goose | Yes | Built in |
+| <img src="https://phigon.online/agents/cline.svg" width="20" alt=""> | Cline (CLI) | Yes | Built in |
 | <img src="https://phigon.online/agents/openhands.svg" width="20" alt=""> | OpenHands | Yes | Bridge |
 | | Aider, Amazon Q Developer CLI, Continue | Yes | Bridge |
 | | Any other agent | [Register it](#custom-agents) | Bridge |
