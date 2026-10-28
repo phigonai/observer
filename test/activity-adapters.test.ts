@@ -2,8 +2,11 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { claudeActivityAdapter } from "../src/activity/adapters/claude.js";
+import { clineActivityAdapter } from "../src/activity/adapters/cline.js";
 import { codexActivityAdapter } from "../src/activity/adapters/codex.js";
 import { copilotActivityAdapter } from "../src/activity/adapters/copilot.js";
+import { geminiActivityAdapter } from "../src/activity/adapters/gemini.js";
+import { gooseActivityAdapter } from "../src/activity/adapters/goose.js";
 import { genericActivityAdapter } from "../src/activity/adapters/generic.js";
 import { hermesActivityAdapter } from "../src/activity/adapters/hermes.js";
 import { openClawActivityAdapter } from "../src/activity/adapters/openclaw.js";
@@ -22,6 +25,7 @@ import {
 } from "../src/generated/phigon/v1/common_pb.js";
 import {
   FilesystemOperation,
+  LifecyclePhase,
   TerminalPhase,
   ToolPhase,
 } from "../src/generated/phigon/v1/telemetry_pb.js";
@@ -320,6 +324,112 @@ test("Codex response-item messages fail closed on conflict and missing coverage"
   for (const candidate of candidates) {
     assert.deepEqual(codexActivityAdapter.parse(candidate, context), []);
   }
+});
+
+test("Codex completed command and file-change items become terminal and file events", () => {
+  const config = loadConfig({ PHIGON_OBSERVABILITY_PROFILE: "full" });
+  const context = {
+    sessionId: "session-codex-items",
+    observedAt,
+    policy: new LocalPolicyEngine(config.policy),
+  };
+  const command = codexActivityAdapter.parse({
+    timestamp: "2026-07-24T10:00:01.000Z",
+    type: "event_msg",
+    payload: {
+      type: "item_completed",
+      thread_id: "thread-1",
+      turn_id: "turn-1",
+      item: {
+        type: "CommandExecution",
+        id: "item-command",
+        command: ["/bin/bash", "-lc", "git status"],
+        cwd: "/workspace",
+        aggregated_output: "On branch main",
+        exit_code: 0,
+        status: "completed",
+        source: "unified_exec_startup",
+      },
+    },
+  }, context);
+  const terminal = command.find((draft) => draft.payload.case === "terminal");
+  assert.equal(terminal?.payload.case, "terminal");
+  if (terminal?.payload.case === "terminal") {
+    assert.equal(terminal.payload.value.phase, TerminalPhase.EXITED);
+    assert.equal(terminal.payload.value.exitCode, 0);
+    assert.equal(terminal.payload.value.executable, "bash");
+    assert.equal(terminal.payload.value.arguments, "/bin/bash -lc git status");
+  }
+  assert.ok(command.some((draft) => draft.payload.case === "git"));
+  const tool = command.find((draft) => draft.payload.case === "tool");
+  if (tool?.payload.case === "tool") {
+    assert.equal(tool.payload.value.phase, ToolPhase.SUCCEEDED);
+  }
+
+  const failed = codexActivityAdapter.parse({
+    type: "event_msg",
+    payload: {
+      type: "item_completed",
+      item: {
+        type: "CommandExecution",
+        id: "item-failed",
+        command: ["/bin/bash", "-lc", "npm test"],
+        aggregated_output: "1 failing",
+        exit_code: 1,
+        status: "failed",
+      },
+    },
+  }, context).find((draft) => draft.payload.case === "tool");
+  if (failed?.payload.case === "tool") {
+    assert.equal(failed.payload.value.phase, ToolPhase.FAILED);
+    assert.equal(failed.payload.value.exitCode, 1);
+  } else {
+    assert.fail("A failed command must produce a tool event.");
+  }
+
+  const files = codexActivityAdapter.parse({
+    type: "event_msg",
+    payload: {
+      type: "item_completed",
+      item: {
+        type: "FileChange",
+        id: "item-files",
+        status: "completed",
+        stdout: "",
+        stderr: "",
+        changes: {
+          "/workspace/new.ts": { type: "add", content: "export {};\n" },
+          "/workspace/app.ts": {
+            type: "update",
+            unified_diff: "@@ -1 +1 @@\n-old\n+new\n",
+            move_path: null,
+          },
+          "/workspace/old.ts": { type: "delete" },
+        },
+      },
+    },
+  }, context).flatMap((draft) =>
+    draft.payload.case === "filesystem"
+      ? [[
+          draft.payload.value.resource?.identifier,
+          draft.payload.value.operation,
+        ]]
+      : []
+  );
+  assert.deepEqual(files, [
+    ["/workspace/new.ts", FilesystemOperation.CREATE],
+    ["/workspace/app.ts", FilesystemOperation.WRITE],
+    ["/workspace/old.ts", FilesystemOperation.DELETE],
+  ]);
+
+  const repeatedMessage = codexActivityAdapter.parse({
+    type: "event_msg",
+    payload: {
+      type: "item_completed",
+      item: { type: "AgentMessage", id: "item-message", content: [{ type: "Text", text: "Done." }] },
+    },
+  }, context);
+  assert.deepEqual(repeatedMessage, []);
 });
 
 test("Codex reasoning indexes only source-emitted readable summaries", () => {
@@ -803,7 +913,574 @@ test("managed execution journals become correlated command telemetry", () => {
   }
 });
 
-test("Copilot CLI source records preserve prompts, replies, and tools", () => {
+test("Claude system records map to turn lifecycle without repeated discovery", () => {
+  const context = {
+    sessionId: "session-claude-system",
+    observedAt,
+    policy: metadataOnlyPolicy(),
+  };
+  const kinds = (record: unknown) =>
+    claudeActivityAdapter.parse(record, context).map((draft) =>
+      draft.payload.case === "lifecycle"
+        ? `lifecycle:${draft.payload.value.phase}`
+        : draft.payload.case === "activity"
+          ? `activity:${draft.payload.value.kind}`
+          : String(draft.payload.case)
+    );
+  assert.deepEqual(kinds({ type: "system", subtype: "turn_duration", durationMs: 1200 }), [
+    `lifecycle:${LifecyclePhase.IDLE}`,
+  ]);
+  assert.deepEqual(kinds({ type: "system", subtype: "stop_hook_summary" }), []);
+  assert.deepEqual(kinds({ type: "system", subtype: "informational" }), []);
+  assert.deepEqual(kinds({ type: "system", subtype: "compact_boundary" }), []);
+  assert.deepEqual(kinds({ type: "system", subtype: "api_error" }), [
+    `activity:${ActivityKind.ERROR}`,
+  ]);
+  assert.deepEqual(kinds({ type: "system", subtype: "init" }), [
+    `lifecycle:${LifecyclePhase.DISCOVERED}`,
+  ]);
+});
+
+test("Claude injected user-turn text is not reported as a user prompt", () => {
+  const context = {
+    sessionId: "session-claude-meta",
+    observedAt,
+    policy: metadataOnlyPolicy(),
+  };
+  const prompts = (record: unknown) =>
+    claudeActivityAdapter.parse(record, context).filter((draft) =>
+      draft.payload.case === "activity" &&
+      draft.payload.value.kind === ActivityKind.PROMPT
+    ).length;
+  assert.equal(prompts({
+    type: "user",
+    isMeta: true,
+    message: { role: "user", content: "<local-command-caveat>Caveat</local-command-caveat>" },
+  }), 0);
+  assert.equal(prompts({
+    type: "user",
+    isCompactSummary: true,
+    message: { role: "user", content: "This session is being continued from a previous conversation." },
+  }), 0);
+  assert.equal(prompts({
+    type: "user",
+    message: { role: "user", content: "Run the release checks." },
+  }), 1);
+  const injectedResult = claudeActivityAdapter.parse({
+    type: "user",
+    isMeta: true,
+    message: {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: "toolu_meta", content: "ok" }],
+    },
+  }, context);
+  assert.ok(injectedResult.some((draft) => draft.payload.case === "tool"));
+});
+
+test("Copilot CLI session events become prompts, replies, commands, and file events", () => {
+  const config = loadConfig({ PHIGON_OBSERVABILITY_PROFILE: "full" });
+  const context = {
+    sessionId: "session-copilot-events",
+    observedAt,
+    policy: new LocalPolicyEngine(config.policy),
+  };
+  const event = (type: string, data: unknown, index: number) => ({
+    id: `00000000-0000-4000-8000-00000000000${index}`,
+    parentId: null,
+    timestamp: `2026-07-24T10:00:0${index}.000Z`,
+    type,
+    data,
+  });
+  const drafts = [
+    event("session.start", {
+      sessionId: "copilot-session",
+      version: 1,
+      producer: "copilot-agent",
+      copilotVersion: "1.0.0",
+      startTime: "2026-07-24T10:00:00.000Z",
+    }, 0),
+    event("user.message", { content: "Fix the failing test.", attachments: [] }, 1),
+    event("user.message", {
+      content: "Continue working on the objective.",
+      isAutopilotContinuation: true,
+    }, 2),
+    event("assistant.reasoning", { reasoningId: "r1", content: "Check the test first." }, 3),
+    event("assistant.message", {
+      messageId: "m1",
+      content: "Running the tests.",
+      toolRequests: [
+        { toolCallId: "call-bash", name: "bash", arguments: { command: "npm test", description: "Run tests" } },
+        { toolCallId: "call-edit", name: "edit", arguments: { path: "/workspace/a.ts", old_str: "a", new_str: "b" } },
+      ],
+    }, 4),
+    event("tool.execution_start", {
+      toolCallId: "call-bash",
+      toolName: "bash",
+      arguments: { command: "npm test" },
+    }, 5),
+    event("tool.execution_complete", {
+      toolCallId: "call-bash",
+      success: false,
+      result: { content: "1 failing" },
+      shellExecution: { exitCode: 1 },
+    }, 6),
+    event("tool.execution_complete", {
+      toolCallId: "call-edit",
+      success: true,
+      result: { content: "Edited.", detailedContent: "@@ -1 +1 @@" },
+    }, 7),
+    event("session.task_complete", {}, 8),
+  ].flatMap((record) => copilotActivityAdapter.parse(record, context));
+
+  const activities = drafts.flatMap((draft) =>
+    draft.payload.case === "activity"
+      ? [[draft.payload.value.kind, draft.payload.value.content]]
+      : []
+  );
+  assert.deepEqual(activities, [
+    [ActivityKind.PROMPT, "Fix the failing test."],
+    [ActivityKind.REASONING, "Check the test first."],
+    [ActivityKind.RESPONSE, "Running the tests."],
+  ]);
+  const tools = drafts.flatMap((draft) =>
+    draft.payload.case === "tool"
+      ? [[draft.payload.value.toolName, draft.payload.value.phase]]
+      : []
+  );
+  assert.deepEqual(tools, [
+    ["bash", ToolPhase.REQUESTED],
+    ["edit", ToolPhase.REQUESTED],
+    ["bash", ToolPhase.FAILED],
+    ["edit", ToolPhase.SUCCEEDED],
+  ]);
+  const exited = drafts.find((draft) =>
+    draft.payload.case === "terminal" &&
+    draft.payload.value.phase === TerminalPhase.EXITED
+  );
+  if (exited?.payload.case === "terminal") {
+    assert.equal(exited.payload.value.exitCode, 1);
+    assert.equal(exited.payload.value.arguments, "npm test");
+  } else {
+    assert.fail("The completed shell command must report its exit status.");
+  }
+  const files = drafts.filter((draft) => draft.payload.case === "filesystem");
+  assert.equal(files.length, 1);
+  const lifecycle = drafts.flatMap((draft) =>
+    draft.payload.case === "lifecycle" ? [draft.payload.value.phase] : []
+  );
+  assert.deepEqual(lifecycle, [LifecyclePhase.STARTED, LifecyclePhase.IDLE]);
+});
+
+test("Copilot CLI user-requested tools are reported when they start", () => {
+  const context = {
+    sessionId: "session-copilot-user-tool",
+    observedAt,
+    policy: metadataOnlyPolicy(),
+  };
+  const started = copilotActivityAdapter.parse({
+    id: "00000000-0000-4000-8000-000000000010",
+    parentId: null,
+    timestamp: "2026-07-24T10:00:10.000Z",
+    type: "tool.execution_start",
+    data: { toolCallId: "call-view", toolName: "view", arguments: { path: "/private/project/a.ts" } },
+  }, context);
+  const tool = started.find((draft) => draft.payload.case === "tool");
+  if (tool?.payload.case === "tool") {
+    assert.equal(tool.payload.value.phase, ToolPhase.RUNNING);
+  } else {
+    assert.fail("A tool started without a request must still be reported.");
+  }
+  const file = started.find((draft) => draft.payload.case === "filesystem");
+  if (file?.payload.case === "filesystem") {
+    assert.equal(file.payload.value.operation, FilesystemOperation.READ);
+  } else {
+    assert.fail("Viewing a file is a file read.");
+  }
+  assertMetadataOnly(started);
+});
+
+test("Gemini CLI chat recordings report each message, thought, and tool call once", () => {
+  const config = loadConfig({ PHIGON_OBSERVABILITY_PROFILE: "full" });
+  const context = {
+    sessionId: "session-gemini",
+    observedAt,
+    policy: new LocalPolicyEngine(config.policy),
+  };
+  const shellCall = {
+    id: "call-shell",
+    name: "run_shell_command",
+    args: { command: "npm test", description: "Run the tests" },
+    result: [{
+      functionResponse: {
+        id: "call-shell",
+        name: "run_shell_command",
+        response: { output: "2 passing" },
+      },
+    }],
+    status: "success",
+    timestamp: "2026-07-24T10:00:05.000Z",
+  };
+  const editCall = {
+    id: "call-edit",
+    name: "replace",
+    args: { file_path: "/workspace/a.ts", old_string: "a", new_string: "b" },
+    result: null,
+    status: "error",
+    timestamp: "2026-07-24T10:00:06.000Z",
+  };
+  const answer = {
+    id: "msg-model",
+    timestamp: "2026-07-24T10:00:03.000Z",
+    type: "gemini",
+    content: "I will run the tests.",
+    thoughts: [{
+      subject: "Plan",
+      description: "Run the tests first.",
+      timestamp: "2026-07-24T10:00:02.000Z",
+    }],
+    model: "gemini-2.5-pro",
+  };
+  const lines = [
+    {
+      sessionId: "8f0f8a62-0000-4000-8000-000000000001",
+      projectHash: "a".repeat(64),
+      startTime: "2026-07-24T10:00:00.000Z",
+      lastUpdated: "2026-07-24T10:00:00.000Z",
+      kind: "main",
+    },
+    {
+      id: "msg-user",
+      timestamp: "2026-07-24T10:00:01.000Z",
+      type: "user",
+      content: [{ text: "Fix @a.ts" }, { text: "--- a.ts ---\nexport const a = 1;" }],
+      displayContent: [{ text: "Fix @a.ts" }],
+    },
+    { $set: { lastUpdated: "2026-07-24T10:00:01.000Z" } },
+    answer,
+    // Token counts arrive later: the same message is appended again.
+    { ...answer, tokens: { input: 10, output: 5, cached: 0, total: 15 } },
+    {
+      id: "msg-tools",
+      timestamp: "2026-07-24T10:00:05.000Z",
+      type: "gemini",
+      content: "",
+      toolCalls: [shellCall],
+      thoughts: [],
+      model: "gemini-2.5-pro",
+    },
+    // Completed tool calls are merged into the last model message.
+    {
+      id: "msg-tools",
+      timestamp: "2026-07-24T10:00:05.000Z",
+      type: "gemini",
+      content: "",
+      toolCalls: [shellCall, editCall],
+      thoughts: [],
+      model: "gemini-2.5-pro",
+    },
+    {
+      id: "msg-tool-response",
+      timestamp: "2026-07-24T10:00:07.000Z",
+      type: "user",
+      content: [{ functionResponse: { id: "call-shell", name: "run_shell_command", response: { output: "2 passing" } } }],
+    },
+    { id: "msg-info", timestamp: "2026-07-24T10:00:08.000Z", type: "info", content: "Checkpoint saved." },
+    { id: "msg-error", timestamp: "2026-07-24T10:00:09.000Z", type: "error", content: "Quota exceeded." },
+    { $patch: { updates: [{ id: "msg-tools", toolCalls: [{ id: "call-shell", result: [] }] }] } },
+    { $rewindTo: "msg-error" },
+  ];
+  const drafts = lines.flatMap((line) => geminiActivityAdapter.parse(line, context));
+
+  assert.deepEqual(
+    drafts.flatMap((draft) =>
+      draft.payload.case === "activity"
+        ? [[draft.payload.value.kind, draft.payload.value.content ?? ""]]
+        : []
+    ),
+    [
+      [ActivityKind.PROMPT, "Fix @a.ts"],
+      [ActivityKind.REASONING, "Plan\nRun the tests first."],
+      [ActivityKind.RESPONSE, "I will run the tests."],
+      [ActivityKind.ERROR, ""],
+    ],
+  );
+  assert.deepEqual(
+    drafts.flatMap((draft) =>
+      draft.payload.case === "tool"
+        ? [[draft.payload.value.toolName, draft.payload.value.phase]]
+        : []
+    ),
+    [
+      ["run_shell_command", ToolPhase.SUCCEEDED],
+      ["replace", ToolPhase.FAILED],
+    ],
+  );
+  const terminal = drafts.find((draft) => draft.payload.case === "terminal");
+  if (terminal?.payload.case === "terminal") {
+    assert.equal(terminal.payload.value.arguments, "npm test");
+    assert.equal(
+      Buffer.from(terminal.payload.value.output ?? []).toString("utf8"),
+      "2 passing",
+    );
+  } else {
+    assert.fail("The shell tool call must produce a terminal event.");
+  }
+  const file = drafts.find((draft) => draft.payload.case === "filesystem");
+  if (file?.payload.case === "filesystem") {
+    assert.equal(file.payload.value.resource?.identifier, "/workspace/a.ts");
+  } else {
+    assert.fail("The edit tool call must produce a file event.");
+  }
+  assert.deepEqual(
+    drafts.flatMap((draft) =>
+      draft.payload.case === "lifecycle" ? [draft.payload.value.phase] : []
+    ),
+    [LifecyclePhase.STARTED],
+  );
+});
+
+test("Gemini CLI recordings stay metadata-only under the default policy", () => {
+  const drafts = geminiActivityAdapter.parse({
+    id: "msg-private",
+    timestamp: "2026-07-24T10:00:01.000Z",
+    type: "gemini",
+    content: "Reading /private/project now.",
+    toolCalls: [{
+      id: "call-read",
+      name: "read_file",
+      args: { file_path: "/private/project/secret.ts" },
+      result: [{ functionResponse: { response: { output: "fixturesecret" } } }],
+      status: "success",
+      timestamp: "2026-07-24T10:00:02.000Z",
+    }],
+  }, {
+    sessionId: "session-gemini-private",
+    observedAt,
+    policy: metadataOnlyPolicy(),
+  });
+  assert.ok(drafts.some((draft) => draft.payload.case === "filesystem"));
+  assertMetadataOnly(drafts);
+});
+
+test("Cline CLI session messages become prompts, replies, commands, and file edits", () => {
+  const config = loadConfig({ PHIGON_OBSERVABILITY_PROFILE: "full" });
+  const context = {
+    sessionId: "session-cline",
+    observedAt,
+    policy: new LocalPolicyEngine(config.policy),
+  };
+  const messages = [
+    {
+      id: "msg-1",
+      role: "user",
+      content: [{ type: "text", text: "Add a health check." }],
+      ts: Date.parse("2026-07-24T10:00:01.000Z"),
+    },
+    {
+      id: "msg-2",
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "Inspect the server first." },
+        { type: "text", text: "Adding the endpoint." },
+        { type: "tool_use", id: "toolu_cmd", name: "run_commands", input: { commands: ["npm test"] } },
+        {
+          type: "tool_use",
+          id: "toolu_edit",
+          name: "editor",
+          input: { path: "/workspace/server.ts", old_text: "a", new_text: "b" },
+        },
+      ],
+      metrics: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      modelInfo: { id: "model", provider: "provider" },
+      ts: Date.parse("2026-07-24T10:00:02.000Z"),
+    },
+    {
+      id: "msg-3",
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_cmd",
+          name: "run_commands",
+          content: [{ query: "npm test", result: "1 failing", success: false, error: "exit 1" }],
+        },
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_edit",
+          name: "editor",
+          content: [{ query: "edit", result: "Edited.", success: true }],
+        },
+      ],
+      ts: Date.parse("2026-07-24T10:00:03.000Z"),
+    },
+  ];
+  const drafts = messages.flatMap((message) =>
+    clineActivityAdapter.parse(message, context)
+  );
+  assert.deepEqual(
+    drafts.flatMap((draft) =>
+      draft.payload.case === "activity"
+        ? [[draft.payload.value.kind, draft.payload.value.content]]
+        : []
+    ),
+    [
+      [ActivityKind.PROMPT, "Add a health check."],
+      [ActivityKind.RESPONSE, "Adding the endpoint."],
+      [ActivityKind.REASONING, "Inspect the server first."],
+    ],
+  );
+  assert.deepEqual(
+    drafts.flatMap((draft) =>
+      draft.payload.case === "tool"
+        ? [[draft.payload.value.toolName, draft.payload.value.phase]]
+        : []
+    ),
+    [
+      ["run_commands", ToolPhase.REQUESTED],
+      ["editor", ToolPhase.REQUESTED],
+      ["run_commands", ToolPhase.FAILED],
+      ["editor", ToolPhase.SUCCEEDED],
+    ],
+  );
+  const terminal = drafts.find((draft) => draft.payload.case === "terminal");
+  if (terminal?.payload.case === "terminal") {
+    assert.equal(terminal.payload.value.arguments, "npm test");
+  } else {
+    assert.fail("run_commands must produce a terminal event.");
+  }
+  const files = drafts.flatMap((draft) =>
+    draft.payload.case === "filesystem"
+      ? [draft.payload.value.resource?.identifier]
+      : []
+  );
+  assert.deepEqual(files, ["/workspace/server.ts"]);
+  assert.equal(
+    drafts[0]?.observedAt.toISOString(),
+    "2026-07-24T10:00:01.000Z",
+  );
+});
+
+test("Cline CLI messages stay metadata-only under the default policy", () => {
+  const drafts = clineActivityAdapter.parse({
+    id: "msg-private",
+    role: "assistant",
+    content: [
+      { type: "text", text: "Reading /private/project." },
+      { type: "tool_use", id: "toolu_read", name: "editor", input: { path: "/private/project/a.ts", new_text: "fixturesecret" } },
+    ],
+    ts: Date.parse("2026-07-24T10:00:02.000Z"),
+  }, {
+    sessionId: "session-cline-private",
+    observedAt,
+    policy: metadataOnlyPolicy(),
+  });
+  assert.ok(drafts.some((draft) => draft.payload.case === "filesystem"));
+  assertMetadataOnly(drafts);
+});
+
+test("Goose session messages become prompts, replies, commands, and file edits", () => {
+  const config = loadConfig({ PHIGON_OBSERVABILITY_PROFILE: "full" });
+  const context = {
+    sessionId: "session-goose",
+    observedAt,
+    policy: new LocalPolicyEngine(config.policy),
+  };
+  const message = (role: string, content: unknown, metadata: unknown = { userVisible: true, agentVisible: true }) => ({
+    type: "goose_message",
+    role,
+    content,
+    created: 1785000000,
+    timestamp: "2026-07-24T10:00:00.000Z",
+    metadata,
+  });
+  const drafts = [
+    message("user", [{ type: "text", text: "List the failing tests." }]),
+    message("user", [{ type: "text", text: "Summary of earlier context." }], { userVisible: false, agentVisible: true }),
+    message("assistant", [
+      { type: "thinking", thinking: "Run the suite.", signature: "sig" },
+      { type: "text", text: "Running them now." },
+      {
+        type: "toolRequest",
+        id: "call_shell",
+        toolCall: { status: "success", value: { name: "developer__shell", arguments: { command: "npm test" } } },
+      },
+      {
+        type: "toolRequest",
+        id: "call_edit",
+        toolCall: {
+          status: "success",
+          value: {
+            name: "developer__text_editor",
+            arguments: { command: "str_replace", path: "/workspace/a.ts", old_str: "a", new_str: "b" },
+          },
+        },
+      },
+    ]),
+    message("user", [
+      {
+        type: "toolResponse",
+        id: "call_shell",
+        toolResult: { status: "success", value: { content: [{ type: "text", text: "1 failing" }], isError: true } },
+      },
+      {
+        type: "toolResponse",
+        id: "call_edit",
+        toolResult: { status: "success", value: { content: [{ type: "text", text: "Edited." }] } },
+      },
+    ]),
+  ].flatMap((record) => gooseActivityAdapter.parse(record, context));
+
+  assert.deepEqual(
+    drafts.flatMap((draft) =>
+      draft.payload.case === "activity"
+        ? [[draft.payload.value.kind, draft.payload.value.content]]
+        : []
+    ),
+    [
+      [ActivityKind.PROMPT, "List the failing tests."],
+      [ActivityKind.RESPONSE, "Running them now."],
+      [ActivityKind.REASONING, "Run the suite."],
+    ],
+  );
+  assert.deepEqual(
+    drafts.flatMap((draft) =>
+      draft.payload.case === "tool"
+        ? [[draft.payload.value.toolName, draft.payload.value.phase]]
+        : []
+    ),
+    [
+      ["developer__shell", ToolPhase.REQUESTED],
+      ["developer__text_editor", ToolPhase.REQUESTED],
+      ["developer__shell", ToolPhase.FAILED],
+      ["developer__text_editor", ToolPhase.SUCCEEDED],
+    ],
+  );
+  assert.deepEqual(
+    drafts.flatMap((draft) =>
+      draft.payload.case === "terminal"
+        ? [[
+            draft.payload.value.phase,
+            draft.payload.value.arguments ?? "",
+            Buffer.from(draft.payload.value.output ?? []).toString("utf8"),
+          ]]
+        : []
+    ),
+    [
+      [TerminalPhase.STARTED, "npm test", ""],
+      [TerminalPhase.EXITED, "", "1 failing"],
+    ],
+  );
+  assert.deepEqual(
+    drafts.flatMap((draft) =>
+      draft.payload.case === "filesystem"
+        ? [[draft.payload.value.resource?.identifier, draft.payload.value.operation]]
+        : []
+    ),
+    [["/workspace/a.ts", FilesystemOperation.WRITE]],
+  );
+});
+
+test("Copilot CLI compatible bridge records preserve prompts, replies, and tools", () => {
   const drafts = copilotActivityAdapter.parse({
     type: "assistant.message",
     message: {
@@ -870,6 +1547,100 @@ test("filesystem tool events preserve their real operation", () => {
       assert.equal(filesystem.payload.value.operation, expected);
     }
   }
+});
+
+test("a file tool result without arguments does not add an unnamed file event", () => {
+  const context = {
+    sessionId: "session-claude-edit",
+    observedAt,
+    policy: metadataOnlyPolicy(),
+  };
+  const drafts = [
+    ...claudeActivityAdapter.parse({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        content: [{
+          type: "tool_use",
+          id: "toolu_edit",
+          name: "Edit",
+          input: { file_path: "/private/project/a.ts", old_string: "a", new_string: "b" },
+        }],
+      },
+    }, context),
+    ...claudeActivityAdapter.parse({
+      type: "user",
+      message: {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "toolu_edit", content: "Updated." }],
+      },
+    }, context),
+  ];
+  assert.deepEqual(countPayloads(drafts), { filesystem: 1, tool: 2 });
+});
+
+test("text-editor sub-commands are file operations, not shell commands", () => {
+  const context = {
+    sessionId: "session-editor",
+    observedAt,
+    policy: metadataOnlyPolicy(),
+  };
+  const kinds = (toolName: string, args: unknown) =>
+    toolDrafts(AgentKind.GENERIC, context, {
+      toolName,
+      phase: ToolPhase.REQUESTED,
+      arguments: args,
+    }).flatMap((draft) =>
+      draft.payload.case === "filesystem"
+        ? [`file:${draft.payload.value.operation}`]
+        : draft.payload.case === "terminal"
+          ? ["terminal"]
+          : []
+    );
+  assert.deepEqual(
+    kinds("str_replace_based_edit_tool", { command: "str_replace", path: "/private/project/a.ts", old_str: "a", new_str: "b" }),
+    [`file:${FilesystemOperation.WRITE}`],
+  );
+  assert.deepEqual(
+    kinds("developer__text_editor", { command: "view", path: "/private/project/a.ts" }),
+    [`file:${FilesystemOperation.READ}`],
+  );
+  assert.deepEqual(
+    kinds("str_replace_editor", { command: "create", path: "/private/project/b.ts", file_text: "x" }),
+    [`file:${FilesystemOperation.CREATE}`],
+  );
+  assert.deepEqual(kinds("developer__shell", { command: "view logs" }), ["terminal"]);
+});
+
+test("command arrays and command batches become readable terminal commands", () => {
+  const policy = new LocalPolicyEngine(loadConfig({
+    PHIGON_COLLECT_COMMAND_ARGUMENTS: "true",
+  }).policy);
+  const context = { sessionId: "session-argv", observedAt, policy };
+  const terminalArguments = (toolName: string, args: unknown) =>
+    toolDrafts(AgentKind.GENERIC, context, {
+      toolName,
+      phase: ToolPhase.REQUESTED,
+      arguments: args,
+    }).flatMap((draft) =>
+      draft.payload.case === "terminal"
+        ? [[draft.payload.value.executable, draft.payload.value.arguments]]
+        : []
+    );
+  assert.deepEqual(
+    terminalArguments("local_shell", { command: ["bash", "-lc", "npm test"] }),
+    [["bash", "bash -lc npm test"]],
+  );
+  assert.deepEqual(
+    terminalArguments("run_commands", { commands: ["npm ci", "npm test"] }),
+    [["npm", "npm ci\nnpm test"]],
+  );
+  const git = toolDrafts(AgentKind.GENERIC, context, {
+    toolName: "process",
+    phase: ToolPhase.REQUESTED,
+    arguments: { argv: ["git", "status"] },
+  }).find((draft) => draft.payload.case === "git");
+  assert.equal(git?.payload.case, "git");
 });
 
 test("structured custom tools derive terminal, filesystem, browser, and Git signals", () => {

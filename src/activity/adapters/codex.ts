@@ -131,6 +131,9 @@ class CodexActivityAdapter implements VendorActivityAdapter {
         output: payload["stderr"] || payload["stdout"],
       });
     }
+    if (eventType === "item_completed") {
+      return this.#parseCompletedItem(objectValue(payload["item"]), context);
+    }
     if (eventType === "mcp_tool_call_end") {
       const outcome = codexReportedToolOutcome(payload);
       return toolDrafts(this.agentKind, context, {
@@ -145,6 +148,71 @@ class CodexActivityAdapter implements VendorActivityAdapter {
     }
     if (/error|failed|crash/iu.test(eventType)) {
       return [errorDraft(this.agentKind, context, eventType)];
+    }
+    return [];
+  }
+
+  /**
+   * Current Codex releases report the shell commands and file edits made by
+   * a turn as completed thread items. The surrounding tool call (for example
+   * a code-mode `exec` cell) does not carry the command line, exit code or
+   * the edited paths, so these items are the only readable evidence.
+   * Messages and reasoning items repeat response items and are skipped.
+   */
+  #parseCompletedItem(
+    item: Record<string, unknown> | null,
+    context: ParseContext,
+  ): readonly ActivityDraft[] {
+    if (item === null) return [];
+    const itemType = stringField(item, "type");
+    const itemID = stringField(item, "id");
+    if (itemType === "CommandExecution") {
+      const outcome = codexReportedToolOutcome(item);
+      return toolDrafts(this.agentKind, context, {
+        invocationId: itemID,
+        toolName: "command_execution",
+        phase: outcome.phase === ToolPhase.UNSPECIFIED
+          ? codexItemPhase(stringField(item, "status"))
+          : outcome.phase,
+        arguments: {
+          command: item["command"],
+          ...(typeof item["cwd"] === "string" ? { cwd: item["cwd"] } : {}),
+        },
+        output: item["aggregated_output"],
+        ...(outcome.exitCode === undefined
+          ? {}
+          : { exitCode: outcome.exitCode }),
+      });
+    }
+    if (itemType === "FileChange") {
+      const changes = objectValue(item["changes"]);
+      if (changes === null) return [];
+      const phase = codexItemPhase(stringField(item, "status"));
+      return Object.entries(changes).slice(0, 15).flatMap(
+        ([path, rawChange], index) => {
+          const change = objectValue(rawChange);
+          const changeType = stringField(change, "type");
+          const movePath = stringField(change, "move_path");
+          const diff = change?.["unified_diff"];
+          const content = change?.["content"];
+          return toolDrafts(this.agentKind, context, {
+            invocationId: itemID === "" ? "" : `${itemID}:${index}`,
+            toolName: changeType === "add"
+              ? "create_file"
+              : changeType === "delete"
+                ? "delete_file"
+                : movePath !== ""
+                  ? "rename_file"
+                  : "edit_file",
+            phase,
+            arguments: {
+              path,
+              ...(typeof diff === "string" ? { patch: diff } : {}),
+              ...(typeof content === "string" ? { content } : {}),
+            },
+          });
+        },
+      );
     }
     return [];
   }
@@ -283,6 +351,16 @@ function codexCompletedToolPhase(status: string): ToolPhase {
     return ToolPhase.SUCCEEDED;
   }
   return ToolPhase.REQUESTED;
+}
+
+function codexItemPhase(status: string): ToolPhase {
+  if (status === "completed") return ToolPhase.SUCCEEDED;
+  if (status === "failed") return ToolPhase.FAILED;
+  if (status === "declined") return ToolPhase.CANCELLED;
+  if (status === "inProgress" || status === "in_progress") {
+    return ToolPhase.RUNNING;
+  }
+  return ToolPhase.UNSPECIFIED;
 }
 
 function codexReportedToolOutcome(

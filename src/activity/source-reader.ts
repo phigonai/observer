@@ -14,6 +14,7 @@ import {
 import { homedir } from "node:os";
 import { basename, join, relative, resolve, sep } from "node:path";
 import { atomicReplace } from "../atomic-replace.js";
+import { scanJSONDocumentSource } from "./json-document-source.js";
 
 const maxSourceFiles = 256;
 const historicalFilesPerScan = 16;
@@ -21,7 +22,10 @@ const historicalRecordsPerScan = 4;
 const maxDirectoryDepth = 8;
 const maxReadBytesPerFile = 8 << 20;
 const defaultInitialReplayBytes = 256 << 10;
-const maxLineBytes = 1 << 20;
+// Normal read window. A longer complete record widens the read up to the line
+// limit; the line limit stays below the per-file read limit.
+const readWindowBytes = 1 << 20;
+const maxLineBytes = 6 << 20;
 const maxCursorEntries = 16_384;
 
 export type SourceReaderMode = "live" | "history";
@@ -29,8 +33,15 @@ export type SourceReaderMode = "live" | "history";
 export type ActivitySource = Readonly<{
   adapterId: string;
   roots: readonly string[];
-  format?: "jsonl" | "opencode-sqlite";
+  format?: "jsonl" | "opencode-sqlite" | "json-messages" | "goose-sqlite";
   sourceDisplayName?: string;
+  /** For json-messages sources: the top-level messages array field. */
+  messagesField?: string;
+  /**
+   * Optional regular expression matched against each file path relative to
+   * its root, with `/` separators. Only matching files belong to the source.
+   */
+  pathPattern?: string;
 }>;
 
 export type SourceRecord = Readonly<{
@@ -169,6 +180,9 @@ export class JSONLSourceReader {
   #committedGeneration = 0;
   #sourceCache: { key: string; at: number; files: SourceFile[] } | undefined;
   readonly #completedHistoryFiles = new Map<string, number>();
+  // Cursors that stopped inside a record above the line limit. The next read
+  // skips to that record's end instead of parsing its tail as a new record.
+  readonly #oversizedContinuations = new Set<string>();
 
   constructor(
     dataDirectory: string,
@@ -209,11 +223,20 @@ export class JSONLSourceReader {
       candidates = this.#sourceCache.files;
     } else {
     for (const source of sources) {
-      if (source.format === "opencode-sqlite") continue;
+      if (source.format !== undefined && source.format !== "jsonl") continue;
+      const pathPattern = source.pathPattern === undefined
+        ? undefined
+        : new RegExp(source.pathPattern, "u");
       for (const configuredRoot of source.roots) {
         const root = expandedActivityRoot(configuredRoot);
         const rootFiles = await listJSONLFiles(root);
         for (const file of rootFiles) {
+          if (
+            pathPattern !== undefined &&
+            !pathPattern.test(relative(root, file.path).split(sep).join("/"))
+          ) {
+            continue;
+          }
           let canonicalPath: string;
           try {
             canonicalPath = await realpath(file.path);
@@ -295,6 +318,66 @@ export class JSONLSourceReader {
         this.#completedHistoryFiles.set(file.path, file.modifiedMs);
       }
     }
+    let documentsComplete = true;
+    let documentFiles = 0;
+    for (const source of sources) {
+      if (source.format !== "json-messages") continue;
+      const documents = await scanJSONDocumentSource({
+        adapterId: source.adapterId,
+        roots: source.roots.map(expandedActivityRoot),
+        pathPattern: source.pathPattern ?? "\\.json$",
+        messagesField: source.messagesField ?? "messages",
+      }, {
+        cursors: this.#cursors,
+        initialScan,
+        replayOnFirstStart: this.#replayOnFirstStart,
+        replaySessions: this.#initialReplaySessions,
+        maxReplayRecords: Math.max(
+          32,
+          Math.floor(this.#initialReplayBytes / 1_024),
+        ),
+        maxRecords: Math.max(0, remainingRecords - reservedDatabaseRecords),
+        historical: this.#mode === "history",
+      });
+      records.push(...documents.records);
+      fileCount += documents.files;
+      malformed += documents.malformed;
+      oversized += documents.oversized;
+      documentFiles += documents.files;
+      remainingRecords -= documents.records.length;
+      documentsComplete = documentsComplete && documents.complete;
+    }
+    for (const source of sources) {
+      if (source.format !== "goose-sqlite") continue;
+      if (remainingRecords <= reservedDatabaseRecords) {
+        documentsComplete = false;
+        break;
+      }
+      // Loaded on demand for the same reason as the OpenCode source below.
+      const { scanGooseSQLiteSources } = await import(
+        "./goose-sqlite-source.js"
+      );
+      const goose = await scanGooseSQLiteSources({
+        adapterId: source.adapterId,
+        roots: source.roots.map(expandedActivityRoot),
+        cursors: this.#cursors,
+        initialScan,
+        replayOnFirstStart: this.#replayOnFirstStart,
+        maxReplayRecords: Math.max(
+          32,
+          Math.floor(this.#initialReplayBytes / 1_024),
+        ),
+        maxRecords: remainingRecords - reservedDatabaseRecords,
+        historical: this.#mode === "history",
+      });
+      records.push(...goose.records);
+      fileCount += goose.files;
+      malformed += goose.malformed;
+      oversized += goose.oversized;
+      documentFiles += goose.files;
+      remainingRecords -= goose.records.length;
+      documentsComplete = documentsComplete && goose.complete;
+    }
     let sqliteComplete = true;
     let sqliteFiles = 0;
     for (const source of sources) {
@@ -342,13 +425,13 @@ export class JSONLSourceReader {
       records,
       metrics: {
         files: fileCount,
-        discoveredFiles: recentCandidates.length + sqliteFiles,
+        discoveredFiles: recentCandidates.length + sqliteFiles + documentFiles,
         records: records.length,
         malformed,
         oversized,
       },
       checkpoint,
-      complete: jsonlComplete && sqliteComplete,
+      complete: jsonlComplete && sqliteComplete && documentsComplete,
     };
   }
 
@@ -404,28 +487,24 @@ export class JSONLSourceReader {
     let length = Math.min(
       metadata.size - offset,
       maxReadBytesPerFile,
-      Math.max(maxLineBytes + 1, Math.min(1_024, maxRecords) * 16_384),
+      Math.max(readWindowBytes + 1, Math.min(1_024, maxRecords) * 16_384),
     );
     if (length <= 0) {
       this.#setCursor(cursorId, legacyCursorId, metadata.size);
+      this.#oversizedContinuations.delete(cursorId);
       return { records: [], malformed: 0, oversized: 0, processedRecords: 0 };
     }
     // Starting mid-file, read one byte early: if it is a newline the first
     // record starts exactly at the offset and must not be skipped as partial.
-    const resync = knownOffset === undefined && offset > 0;
+    // A cursor left inside an oversized record also resumes after its end.
+    const continuingOversized = this.#oversizedContinuations.has(cursorId);
+    const resync =
+      (knownOffset === undefined && offset > 0) || continuingOversized;
     if (resync) {
       offset -= 1;
       length += 1;
     }
-    const handle = await open(fileReal, "r");
-    let content: Buffer;
-    try {
-      content = Buffer.alloc(length);
-      const read = await handle.read(content, 0, length, offset);
-      content = content.subarray(0, read.bytesRead);
-    } finally {
-      await handle.close();
-    }
+    let content = await readRange(fileReal, offset, length);
     if (resync) {
       const firstNewline = content.indexOf(0x0a);
       if (firstNewline < 0) {
@@ -434,12 +513,26 @@ export class JSONLSourceReader {
           legacyCursorId,
           offset + content.length,
         );
-        return { records: [], malformed: 0, oversized: 1, processedRecords: 1 };
+        this.#rememberOversizedContinuation(cursorId);
+        return continuingOversized
+          ? { records: [], malformed: 0, oversized: 0, processedRecords: 1 }
+          : { records: [], malformed: 0, oversized: 1, processedRecords: 1 };
       }
+      this.#oversizedContinuations.delete(cursorId);
       offset += firstNewline + 1;
       content = content.subarray(firstNewline + 1);
     }
-    const lastNewline = content.lastIndexOf(0x0a);
+    let lastNewline = content.lastIndexOf(0x0a);
+    if (lastNewline < 0) {
+      // One complete record can be larger than the normal read window, for
+      // example a tool result or a pasted screenshot. Widen once, bounded by
+      // the record limit, instead of discarding it as oversized.
+      const widened = Math.min(metadata.size - offset, maxLineBytes + 1);
+      if (widened > content.length) {
+        content = await readRange(fileReal, offset, widened);
+        lastNewline = content.lastIndexOf(0x0a);
+      }
+    }
     if (lastNewline < 0) {
       if (content.length > maxLineBytes) {
         this.#setCursor(
@@ -447,6 +540,7 @@ export class JSONLSourceReader {
           legacyCursorId,
           offset + content.length,
         );
+        this.#rememberOversizedContinuation(cursorId);
         return { records: [], malformed: 0, oversized: 1, processedRecords: 1 };
       }
       return { records: [], malformed: 0, oversized: 0, processedRecords: 0 };
@@ -521,6 +615,13 @@ export class JSONLSourceReader {
       }
     }
     return pending;
+  }
+
+  #rememberOversizedContinuation(cursorId: string): void {
+    this.#oversizedContinuations.add(cursorId);
+    if (this.#oversizedContinuations.size <= maxSourceFiles) return;
+    const oldest = this.#oversizedContinuations.values().next().value;
+    if (oldest !== undefined) this.#oversizedContinuations.delete(oldest);
   }
 
   #setCursor(
@@ -623,6 +724,21 @@ async function listJSONLFiles(
   };
   await walk(root, 0);
   return result.sort(recentFileFirst).slice(0, maxCursorEntries);
+}
+
+async function readRange(
+  path: string,
+  position: number,
+  length: number,
+): Promise<Buffer> {
+  const handle = await open(path, "r");
+  try {
+    const content = Buffer.alloc(length);
+    const read = await handle.read(content, 0, length, position);
+    return content.subarray(0, read.bytesRead);
+  } finally {
+    await handle.close();
+  }
 }
 
 function recentFileFirst(

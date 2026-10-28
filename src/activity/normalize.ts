@@ -204,8 +204,9 @@ export function toolDrafts(
   }];
 
   const rawArguments = parseMaybeJSON(input.arguments);
-  const terminalTool =
-    isTerminalTool(toolName) || hasCommandArgument(rawArguments);
+  const editorCommand = fileEditorCommand(rawArguments);
+  const terminalTool = editorCommand === "" &&
+    (isTerminalTool(toolName) || hasCommandArgument(rawArguments));
   if (terminalTool) {
     drafts.push(
       terminalDraft(agentKind, context, {
@@ -232,10 +233,18 @@ export function toolDrafts(
     input.output,
   );
   if (git !== null) drafts.push(git);
+  const rawPath = pathFromArguments(rawArguments);
+  // A result that carries no arguments (for example a Claude tool_result)
+  // belongs to the file operation already reported with its request. Do not
+  // add a second, unnamed file event for it.
+  const argumentlessResult =
+    input.arguments === undefined &&
+    input.phase !== ToolPhase.REQUESTED &&
+    input.phase !== ToolPhase.RUNNING;
   if (
     context.policy.allowsMetadata("fileMetadata") &&
-    (isFilesystemTool(toolName) ||
-      (!terminalTool && pathFromArguments(rawArguments) !== ""))
+    !argumentlessResult &&
+    (isFilesystemTool(toolName) || (!terminalTool && rawPath !== ""))
   ) {
     drafts.push(
       filesystemDraft(
@@ -481,7 +490,8 @@ function isTerminalTool(value: string): boolean {
 }
 
 function hasCommandArgument(value: unknown): boolean {
-  return stringProperty(value, ["cmd", "command", "script"]) !== "";
+  if (typeof value !== "object" || value === null) return false;
+  return commandFromArguments(value) !== "";
 }
 
 function isFilesystemTool(value: string): boolean {
@@ -498,8 +508,12 @@ function filesystemOperation(
   toolName: string,
   rawArguments: unknown,
 ): FilesystemOperation {
+  const editorCommand = fileEditorCommand(rawArguments);
+  if (editorCommand === "view") return FilesystemOperation.READ;
+  if (editorCommand === "create") return FilesystemOperation.CREATE;
+  if (editorCommand !== "") return FilesystemOperation.WRITE;
   const normalized = toolName.toLowerCase().replace(/[^a-z0-9]+/gu, "_");
-  if (/(?:^|_)(?:read|get)(?:_|$)/u.test(normalized)) {
+  if (/(?:^|_)(?:read|get|view)(?:_|$)/u.test(normalized)) {
     return FilesystemOperation.READ;
   }
   if (/(?:^|_)(?:search|find|glob|grep)(?:_|$)/u.test(normalized)) {
@@ -529,6 +543,25 @@ function filesystemOperation(
   return FilesystemOperation.WRITE;
 }
 
+// Text-editor tools (Anthropic str_replace_based_edit_tool, Goose
+// text_editor, Copilot str_replace_editor) name their sub-command in a
+// `command` field next to the file path. That is not a shell command.
+const fileEditorCommands = new Set([
+  "view",
+  "create",
+  "write",
+  "str_replace",
+  "insert",
+  "undo_edit",
+]);
+
+function fileEditorCommand(value: unknown): string {
+  const command = stringProperty(value, ["command"]);
+  return fileEditorCommands.has(command) && pathFromArguments(value) !== ""
+    ? command
+    : "";
+}
+
 function isBrowserTool(value: string): boolean {
   return /(?:browser|chrome|playwright)/iu.test(value);
 }
@@ -545,7 +578,29 @@ function parseMaybeJSON(value: unknown): unknown {
 
 function commandFromArguments(value: unknown): string {
   if (typeof value === "string") return value;
-  return stringProperty(value, ["cmd", "command", "script"]);
+  const direct = stringProperty(value, ["cmd", "command", "script"]);
+  if (direct !== "" || typeof value !== "object" || value === null) {
+    return direct;
+  }
+  const object = value as Record<string, unknown>;
+  // Agents also report argv arrays (["bash", "-lc", "git status"]) and
+  // batches of shell commands; keep them readable as one command line.
+  for (const name of ["command", "cmd", "argv"]) {
+    const argv = stringArray(object[name]);
+    if (argv.length > 0) return argv.join(" ");
+  }
+  const commands = object["commands"];
+  if (typeof commands === "string") return commands;
+  return stringArray(commands).join("\n");
+}
+
+function stringArray(value: unknown): readonly string[] {
+  return Array.isArray(value) &&
+      value.length > 0 &&
+      value.length <= 256 &&
+      value.every((item) => typeof item === "string")
+    ? value as string[]
+    : [];
 }
 
 function executableFromCommand(command: string): string {

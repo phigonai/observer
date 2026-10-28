@@ -751,3 +751,293 @@ test("first replay keeps a record that starts exactly at the replay offset", asy
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("JSON document sources deliver each rewritten message once", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-json-document-"));
+  const root = join(directory, "sessions");
+  const sessionDirectory = join(root, "1789500000000_abcde");
+  const file = join(sessionDirectory, "1789500000000_abcde.messages.json");
+  const data = join(directory, "data");
+  await mkdir(sessionDirectory, { recursive: true });
+  const sources = [{
+    adapterId: "cline-cli",
+    roots: [root],
+    format: "json-messages" as const,
+    pathPattern: "^[^/]+/[^/]+\\.messages\\.json$",
+    messagesField: "messages",
+  }];
+  const message = (id: string) => ({
+    id,
+    role: "user",
+    content: [{ type: "text", text: id }],
+    ts: 1789500000000,
+  });
+  const document = async (ids: readonly string[], mtimeSeconds: number) => {
+    await writeFile(file, JSON.stringify({
+      version: 1,
+      sessionId: "1789500000000_abcde",
+      messages: ids.map(message),
+    }, null, 2));
+    await utimes(file, mtimeSeconds, mtimeSeconds);
+  };
+  const ids = (scan: Awaited<ReturnType<JSONLSourceReader["scan"]>>) =>
+    scan.records.map((record) => (record.value as { id: string }).id);
+  try {
+    await document(["m1", "m2"], 1_000);
+    const reader = new JSONLSourceReader(data, false);
+    const baseline = await reader.scan(sources, 32);
+    assert.deepEqual(ids(baseline), []);
+    await reader.commit(baseline.checkpoint);
+
+    await document(["m1", "m2", "m3", "m4"], 1_010);
+    const appended = await reader.scan(sources, 32);
+    assert.deepEqual(ids(appended), ["m3", "m4"]);
+    assert.equal(new Set(appended.records.map((record) => record.sourceRecordId)).size, 2);
+    await reader.commit(appended.checkpoint);
+    assert.deepEqual(ids(await reader.scan(sources, 32)), []);
+
+    // A partially written document is retried, not treated as history.
+    await writeFile(file, '{"version":1,"messages":[{"id":"m1"');
+    await utimes(file, 1_020, 1_020);
+    assert.deepEqual(ids(await reader.scan(sources, 32)), []);
+
+    // Compaction drops old messages; delivery resumes after the last one.
+    await document(["summary", "m4", "m5"], 1_030);
+    const compacted = await reader.scan(sources, 32);
+    assert.deepEqual(ids(compacted), ["m5"]);
+    await reader.commit(compacted.checkpoint);
+
+    // A rewrite without the delivered message is re-baselined.
+    await document(["other-1", "other-2"], 1_040);
+    assert.deepEqual(ids(await reader.scan(sources, 32)), []);
+    await document(["other-1", "other-2", "other-3"], 1_050);
+    const afterRewrite = await reader.scan(sources, 32);
+    assert.deepEqual(ids(afterRewrite), ["other-3"]);
+    await reader.commit(afterRewrite.checkpoint);
+
+    // Work written while the observer was stopped is caught up on restart.
+    await document(["other-1", "other-2", "other-3", "other-4"], 1_060);
+    const restarted = new JSONLSourceReader(data, false);
+    assert.deepEqual(ids(await restarted.scan(sources, 32)), ["other-4"]);
+
+    // A conversation started after startup is read from its first message.
+    const second = join(root, "1789500009999_fghij");
+    await mkdir(second);
+    await writeFile(
+      join(second, "1789500009999_fghij.messages.json"),
+      JSON.stringify({ messages: [message("n1"), message("n2")] }),
+    );
+    assert.deepEqual(ids(await restarted.scan(sources, 32)), ["n1", "n2"]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("JSON document history sync pages through every saved message", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-json-history-"));
+  const root = join(directory, "sessions");
+  await mkdir(join(root, "s1"), { recursive: true });
+  await writeFile(join(root, "s1", "s1.messages.json"), JSON.stringify({
+    messages: Array.from({ length: 7 }, (_, index) => ({ id: `m${index}`, role: "user", content: "x" })),
+  }));
+  const sources = [{
+    adapterId: "cline-cli",
+    roots: [root],
+    format: "json-messages" as const,
+    pathPattern: "^[^/]+/[^/]+\\.messages\\.json$",
+  }];
+  try {
+    const reader = new JSONLSourceReader(join(directory, "history"), false, 4096, 1, "history");
+    const seen: string[] = [];
+    let complete = false;
+    for (let pass = 0; pass < 10 && !complete; pass++) {
+      const scan = await reader.scan(sources, 3);
+      seen.push(...scan.records.map((record) => (record.value as { id: string }).id));
+      await reader.commit(scan.checkpoint);
+      complete = scan.complete;
+    }
+    assert.equal(complete, true);
+    assert.deepEqual(seen, Array.from({ length: 7 }, (_, index) => `m${index}`));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+function gooseDatabase(path: string): DatabaseSync {
+  const database = new DatabaseSync(path);
+  database.exec(
+    "CREATE TABLE sessions (id TEXT PRIMARY KEY, working_dir TEXT NOT NULL);" +
+    "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT, " +
+    "session_id TEXT NOT NULL REFERENCES sessions(id), role TEXT NOT NULL, " +
+    "content_json TEXT NOT NULL, created_timestamp INTEGER NOT NULL, " +
+    "timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP, tokens INTEGER, metadata_json TEXT);" +
+    "INSERT INTO sessions (id, working_dir) VALUES ('20260724_1', '/workspace');",
+  );
+  return database;
+}
+
+function addGooseMessage(database: DatabaseSync, messageID: string, text: string): void {
+  database.prepare(
+    "INSERT INTO messages (message_id, session_id, role, content_json, created_timestamp, metadata_json) " +
+    "VALUES (?, '20260724_1', 'user', ?, 1785000000, ?)",
+  ).run(
+    messageID,
+    JSON.stringify([{ type: "text", text }]),
+    JSON.stringify({ userVisible: true, agentVisible: true }),
+  );
+}
+
+test("Goose session database rows are delivered once in insertion order", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-goose-source-"));
+  const root = join(directory, "sessions");
+  const data = join(directory, "data");
+  await mkdir(root, { recursive: true });
+  const sources = [{ adapterId: "goose-session", roots: [root], format: "goose-sqlite" as const }];
+  const texts = (scan: Awaited<ReturnType<JSONLSourceReader["scan"]>>) =>
+    scan.records.map((record) =>
+      ((record.value as { content: Array<{ text: string }> }).content[0]?.text ?? "")
+    );
+  try {
+    // A database created after startup holds only new work.
+    const reader = new JSONLSourceReader(data, false);
+    await reader.commit((await reader.scan(sources, 32)).checkpoint);
+    const database = gooseDatabase(join(root, "sessions.db"));
+    try {
+      addGooseMessage(database, "msg_1", "first");
+      const created = await reader.scan(sources, 32);
+      assert.deepEqual(texts(created), ["first"]);
+      const value = created.records[0]?.value as { type: string; timestamp: string; metadata: unknown };
+      assert.equal(value.type, "goose_message");
+      assert.equal(value.timestamp, new Date(1785000000 * 1000).toISOString());
+      await reader.commit(created.checkpoint);
+      assert.deepEqual(texts(await reader.scan(sources, 32)), []);
+
+      // Work written while the observer was stopped is caught up on restart.
+      addGooseMessage(database, "msg_2", "second");
+      addGooseMessage(database, "msg_3", "third");
+      const restarted = new JSONLSourceReader(data, false);
+      const caughtUp = await restarted.scan(sources, 1);
+      assert.deepEqual(texts(caughtUp), ["second"]);
+      assert.deepEqual(texts(await restarted.scan(sources, 32)), ["third"]);
+
+      // A fresh install baselines saved history instead of replaying it.
+      const fresh = new JSONLSourceReader(join(directory, "fresh"), false);
+      assert.deepEqual(texts(await fresh.scan(sources, 32)), []);
+      addGooseMessage(database, "msg_4", "fourth");
+      assert.deepEqual(texts(await fresh.scan(sources, 32)), ["fourth"]);
+
+      // History sync uploads every saved message.
+      const history = new JSONLSourceReader(join(directory, "history"), false, 4096, 1, "history");
+      const all: string[] = [];
+      let complete = false;
+      for (let pass = 0; pass < 10 && !complete; pass++) {
+        const scan = await history.scan(sources, 3);
+        all.push(...texts(scan));
+        await history.commit(scan.checkpoint);
+        complete = scan.complete;
+      }
+      assert.deepEqual(all, ["first", "second", "third", "fourth"]);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a source path pattern limits which files belong to the source", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-source-pattern-"));
+  const root = join(directory, "tmp");
+  await mkdir(join(root, "my-project", "chats", "parent-session"), { recursive: true });
+  await mkdir(join(root, "my-project", "tool-output"), { recursive: true });
+  try {
+    await writeFile(join(root, "my-project", "chats", "session-1.jsonl"), '{"type":"chat"}\n');
+    await writeFile(join(root, "my-project", "chats", "parent-session", "sub.jsonl"), '{"type":"subagent"}\n');
+    await writeFile(join(root, "my-project", "tool-output", "other.jsonl"), '{"type":"other"}\n');
+    const reader = new JSONLSourceReader(join(directory, "data"), false, 4096, 1, "history");
+    const scan = await reader.scan([{
+      adapterId: "gemini-cli",
+      roots: [root],
+      pathPattern: "^[^/]+/chats/",
+    }], 16);
+    assert.deepEqual(
+      scan.records.map((record) => (record.value as { type: string }).type).sort(),
+      ["chat", "subagent"],
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("JSONL source reader keeps records larger than one read window", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-source-large-"));
+  const root = join(directory, "sessions");
+  await mkdir(root, { recursive: true });
+  const file = join(root, "session.jsonl");
+  await writeFile(file, '{"type":"existing"}\n', "utf8");
+  const reader = new JSONLSourceReader(join(directory, "data"), false);
+  const sources = [{ adapterId: "claude", roots: [root] }];
+  try {
+    await reader.commit((await reader.scan(sources, 4)).checkpoint);
+    // A tool result or pasted screenshot can make one transcript line larger
+    // than the normal read window. It is still one complete source record.
+    const large = JSON.stringify({
+      type: "user",
+      message: {
+        role: "user",
+        content: [{
+          type: "tool_result",
+          tool_use_id: "toolu_large",
+          content: "x".repeat(3 << 20),
+        }],
+      },
+    });
+    await appendFile(file, `${large}\n{"type":"after"}\n`, "utf8");
+    const values: unknown[] = [];
+    let oversized = 0;
+    for (let pass = 0; pass < 4; pass++) {
+      const scan = await reader.scan(sources, 4);
+      values.push(...scan.records.map((record) =>
+        (record.value as { type: string }).type
+      ));
+      oversized += scan.metrics.oversized;
+      await reader.commit(scan.checkpoint);
+    }
+    assert.deepEqual(values, ["user", "after"]);
+    assert.equal(oversized, 0);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("JSONL source reader skips a record above the line limit and resumes after it", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-source-oversized-"));
+  const root = join(directory, "sessions");
+  await mkdir(root, { recursive: true });
+  const file = join(root, "session.jsonl");
+  await writeFile(file, '{"type":"existing"}\n', "utf8");
+  const reader = new JSONLSourceReader(join(directory, "data"), false);
+  const sources = [{ adapterId: "claude", roots: [root] }];
+  try {
+    await reader.commit((await reader.scan(sources, 4)).checkpoint);
+    await appendFile(
+      file,
+      `{"type":"huge","pad":"${"y".repeat(7 << 20)}"}\n{"type":"after"}\n`,
+      "utf8",
+    );
+    const values: unknown[] = [];
+    let oversized = 0;
+    for (let pass = 0; pass < 6; pass++) {
+      const scan = await reader.scan(sources, 4);
+      values.push(...scan.records.map((record) =>
+        (record.value as { type: string }).type
+      ));
+      oversized += scan.metrics.oversized;
+      await reader.commit(scan.checkpoint);
+    }
+    assert.deepEqual(values, ["after"]);
+    assert.equal(oversized, 1);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

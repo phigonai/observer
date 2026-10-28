@@ -21,8 +21,11 @@ import {
   type EventEnvelope,
 } from "../generated/phigon/v1/telemetry_pb.js";
 import { claudeActivityAdapter } from "./adapters/claude.js";
+import { clineActivityAdapter } from "./adapters/cline.js";
 import { codexActivityAdapter } from "./adapters/codex.js";
 import { copilotActivityAdapter } from "./adapters/copilot.js";
+import { geminiActivityAdapter } from "./adapters/gemini.js";
+import { gooseActivityAdapter } from "./adapters/goose.js";
 import { hermesActivityAdapter } from "./adapters/hermes.js";
 import { openClawActivityAdapter } from "./adapters/openclaw.js";
 import { openCodeActivityAdapter } from "./adapters/opencode.js";
@@ -69,6 +72,11 @@ const adapters: ReadonlyMap<string, VendorActivityAdapter> = new Map([
   // the generic bridge cannot accidentally replace it with a fixed label.
   ["generic", genericActivityAdapter],
   ["opencode", openCodeActivityAdapter],
+  // Native recordings use their own adapter IDs so the OpenAI-compatible
+  // `ingest --agent` bridges for the same products keep their parser.
+  ["gemini-cli", geminiActivityAdapter],
+  ["cline-cli", clineActivityAdapter],
+  ["goose-session", gooseActivityAdapter],
 ]);
 
 export type ActivityCollectorMetrics = Readonly<{
@@ -802,6 +810,25 @@ function configuredSources(config: ObserverConfig): readonly ActivitySource[] {
       format: "opencode-sqlite",
     },
     {
+      adapterId: "gemini-cli",
+      roots: config.activitySourceDirectories.gemini,
+      // <project>/chats/session-*.jsonl and subagent <parent>/<id>.jsonl.
+      pathPattern: "^[^/]+/chats/",
+    },
+    {
+      adapterId: "cline-cli",
+      roots: config.activitySourceDirectories.cline,
+      format: "json-messages",
+      // <session>/<session>.messages.json, rewritten in place per turn.
+      pathPattern: "^[^/]+/[^/]+\\.messages\\.json$",
+      messagesField: "messages",
+    },
+    {
+      adapterId: "goose-session",
+      roots: config.activitySourceDirectories.goose,
+      format: "goose-sqlite",
+    },
+    {
       adapterId: "generic",
       roots: config.activitySourceDirectories.generic,
     },
@@ -863,6 +890,9 @@ function sourceIdentityDisplayName(
       case "hermes": return "Hermes Agent";
       case "openclaw": return "OpenClaw";
       case "opencode": return "OpenCode";
+      case "gemini-cli": return "Gemini CLI";
+      case "cline-cli": return "Cline";
+      case "goose-session": return "Goose";
       default: return "Agent activity";
     }
   })();

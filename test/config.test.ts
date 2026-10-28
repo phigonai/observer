@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { loadConfig } from "../src/config.js";
 
@@ -161,6 +163,49 @@ test("loadConfig uses Copilot CLI's native session event directory", () => {
   assert.deepEqual(config.activitySourceDirectories.copilot, [
     "/var/lib/copilot-sessions",
   ]);
+});
+
+test("loadConfig reads Gemini CLI chat recordings from its temp directory", () => {
+  assert.deepEqual(loadConfig({}).activitySourceDirectories.gemini, [
+    join(homedir(), ".gemini", "tmp"),
+  ]);
+  assert.deepEqual(
+    loadConfig({ PHIGON_GEMINI_ACTIVITY_DIRS: "/var/lib/gemini-home/tmp" })
+      .activitySourceDirectories.gemini,
+    ["/var/lib/gemini-home/tmp"],
+  );
+});
+
+test("loadConfig reads Cline CLI sessions from its data directory", () => {
+  assert.deepEqual(loadConfig({}).activitySourceDirectories.cline, [
+    join(homedir(), ".cline", "data", "sessions"),
+  ]);
+  assert.deepEqual(
+    loadConfig({ PHIGON_CLINE_ACTIVITY_DIRS: "/var/lib/cline/sessions" })
+      .activitySourceDirectories.cline,
+    ["/var/lib/cline/sessions"],
+  );
+});
+
+test("loadConfig finds the Goose sessions database directory", () => {
+  assert.deepEqual(
+    loadConfig({ GOOSE_PATH_ROOT: "/srv/goose" }).activitySourceDirectories.goose,
+    [join("/srv/goose", "data", "sessions")],
+  );
+  const expected = process.platform === "win32"
+    ? join("C:/Users/dev/AppData/Roaming", "Block", "goose", "data", "sessions")
+    : join("/home/dev/.data", "goose", "sessions");
+  assert.deepEqual(
+    loadConfig({
+      APPDATA: "C:/Users/dev/AppData/Roaming",
+      XDG_DATA_HOME: "/home/dev/.data",
+    }).activitySourceDirectories.goose,
+    [expected],
+  );
+  assert.deepEqual(
+    loadConfig({ PHIGON_GOOSE_ACTIVITY_DIRS: "none" }).activitySourceDirectories.goose,
+    [],
+  );
 });
 
 test("loadConfig accepts OpenCode's consented local database directory", () => {

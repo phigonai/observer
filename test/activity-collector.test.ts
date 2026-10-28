@@ -624,6 +624,74 @@ test("activity collector binds process-tagged records to the matching runtime id
   }
 });
 
+test("the default sources deliver Gemini CLI and Cline CLI conversations", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-native-sources-"));
+  const geminiRoot = join(directory, "gemini-tmp");
+  const clineRoot = join(directory, "cline-sessions");
+  await mkdir(join(geminiRoot, "my-project", "chats"), { recursive: true });
+  await mkdir(join(clineRoot, "1789500000000_abcde"), { recursive: true });
+  await writeFile(
+    join(geminiRoot, "my-project", "chats", "session-2026-07-24T10-00-8f0f8a62.jsonl"),
+    [
+      { sessionId: "8f0f8a62", projectHash: "b".repeat(64), startTime: "2026-07-24T10:00:00.000Z", lastUpdated: "2026-07-24T10:00:00.000Z" },
+      { id: "g1", timestamp: "2026-07-24T10:00:01.000Z", type: "user", content: [{ text: "Explain the build." }] },
+    ].map((line) => JSON.stringify(line)).join("\n") + "\n",
+  );
+  await writeFile(
+    join(clineRoot, "1789500000000_abcde", "1789500000000_abcde.messages.json"),
+    JSON.stringify({
+      version: 1,
+      sessionId: "1789500000000_abcde",
+      messages: [{ id: "c1", role: "user", content: [{ type: "text", text: "Add a test." }], ts: 1789500000000 }],
+    }),
+  );
+  const emitted: EventEnvelope[] = [];
+  const collector = new ActivityCollector({
+    config: loadConfig({
+      PHIGON_DATA_DIR: join(directory, "data"),
+      PHIGON_ACTIVITY_REPLAY_ON_FIRST_START: "true",
+      PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE: "200",
+      PHIGON_COLLECT_PROMPT_CONTENT: "true",
+      PHIGON_GEMINI_ACTIVITY_DIRS: geminiRoot,
+      PHIGON_CLINE_ACTIVITY_DIRS: clineRoot,
+      PHIGON_CODEX_ACTIVITY_DIRS: join(directory, "none"),
+      PHIGON_CLAUDE_ACTIVITY_DIRS: join(directory, "none"),
+      PHIGON_HERMES_ACTIVITY_DIRS: join(directory, "none"),
+      PHIGON_OPENCLAW_ACTIVITY_DIRS: join(directory, "none"),
+      PHIGON_COPILOT_ACTIVITY_DIRS: join(directory, "none"),
+      PHIGON_OPENCODE_ACTIVITY_DIRS: join(directory, "none"),
+      PHIGON_GENERIC_ACTIVITY_DIRS: join(directory, "none"),
+    }),
+    credential: {
+      machineId: "5f1b4cb4-a77d-4f53-af66-197e184683f4",
+      tenantId: "7d1b4cb4-a77d-4f53-af66-197e184683f4",
+      credential: `phg_m_${"0".repeat(43)}`,
+      controlPlaneOrigin: "http://127.0.0.1:8080",
+      createdAt: "2026-07-24T00:00:00.000Z",
+    },
+    initialSequence: 0n,
+    emit: (event) => emitted.push(event),
+  });
+  try {
+    await collector.scanOnce();
+    const prompts = emitted.flatMap((event) =>
+      event.payload.case === "activity" &&
+      event.payload.value.kind === ActivityKind.PROMPT
+        ? [event.payload.value.content]
+        : []
+    ).sort();
+    assert.deepEqual(prompts, ["Add a test.", "Explain the build."]);
+    assert.deepEqual(
+      collector.sourceIdentities().map((identity) =>
+        identity.displayName.split(" · ")[0]
+      ).sort(),
+      ["Cline", "Gemini CLI"],
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("Copilot records without process evidence remain source-isolated", async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-copilot-collector-"));
   const sourceRoot = join(directory, "session-state", "session-one");
