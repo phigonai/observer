@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, mkdir, readFile, writeFile, rm, utimes, readdir } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, rm, utimes, readdir, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { timestampFromDate } from "@bufbuild/protobuf/wkt";
 import { AgentActionCommandSchema, RemoteActionType as Action, RemoteActionResultState as State } from "../src/generated/phigon/v1/action_pb.js";
-import { MachineCommandExecutor, parseCommand, powerCommand, runCommand, pruneCommandReceipts } from "../src/machine-command-executor.js";
+import { MachineCommandExecutor, parseCommand, powerCommand, redactCommandOutput, runCommand, pruneCommandReceipts } from "../src/machine-command-executor.js";
 
 test("receipt cleanup removes only expired recognized records and preserves unrelated files", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-receipt-retention-"));
@@ -70,6 +70,90 @@ test("long-running commands time out; malformed requests never become shell text
   assert.equal(parseCommand(JSON.stringify({ executable: "node", arguments: "-e anything", timeout_seconds: 5 })), null);
   assert.equal(parseCommand(JSON.stringify({ executable: "node", arguments: ["\0"], timeout_seconds: 5 })), null);
   assert.equal(parseCommand(JSON.stringify({ executable: "node", arguments: [], timeout_seconds: 999 })), null);
+});
+
+test("an executable the OS refuses to start gets a durable failure receipt, not a lost result", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-command-launch-"));
+  t.after(async () => { if (!resolve(directory).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe test cleanup path"); await rm(directory, { recursive: true, force: true }); });
+  // Windows refuses batch files without a shell; elsewhere a missing binary fails to start.
+  const executable = process.platform === "win32" ? join(directory, "hello.cmd") : join(directory, "missing-binary");
+  if (process.platform === "win32") await writeFile(executable, "@echo hello\r\n");
+  const launched = await runCommand({ executable, arguments: [], timeout_seconds: 5 });
+  assert.equal(launched.exitCode, null); assert.equal(launched.timedOut, false); assert.equal(launched.launched, false);
+  assert.match(launched.output, /could not start/u);
+  const machineID = randomUUID();
+  const command = create(AgentActionCommandSchema, { actionId: randomUUID(), idempotencyKey: randomUUID(), machineId: machineID, agentId: "__machine__", processId: 0n,
+    action: Action.RUN_COMMAND, expiresAt: timestampFromDate(new Date(Date.now() + 60_000)), commandJson: JSON.stringify({ executable, arguments: [], timeout_seconds: 5 }) });
+  const executor = new MachineCommandExecutor({ enabled: true, machineID, dataDirectory: directory });
+  const first = await executor.execute(command);
+  assert.equal(first.state, State.FAILED); assert.equal(first.resultCode, "command_not_started");
+  assert.deepEqual(await new MachineCommandExecutor({ enabled: true, machineID, dataDirectory: directory }).execute(command), first);
+});
+
+test("a command that exits is not reported as timed out when its background child keeps the output open", async () => {
+  const started = Date.now();
+  // The background child exits by itself after four seconds.
+  const result = await runCommand({ executable: process.execPath, arguments: ["-e",
+    "require('node:child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 4000)'], { stdio: 'inherit', detached: true }).unref(); console.log('parent done')",
+  ], timeout_seconds: 3 });
+  assert.equal(result.timedOut, false);
+  assert.equal(result.exitCode, 0);
+  assert.match(result.output, /parent done/u);
+  assert.ok(Date.now() - started < 2_500, "the receipt must not wait for the background child");
+});
+
+test("command output hides credentials by name, by known format, and by the observer's own secret values", (t) => {
+  // Values are assembled at runtime so the source holds nothing token-shaped.
+  const filler = (letter: string, length: number) => letter.repeat(length);
+  const envName = ["EXAMPLE", "SIGNING", "KEY"].join("_");
+  const envValue = `value-${filler("v", 16)}`;
+  process.env[envName] = envValue;
+  t.after(() => { delete process.env[envName]; });
+  const secrets = [
+    `OPENAI_KEY=${filler("q", 20)}`, `MYSQL_PWD=${filler("w", 12)}`, `"passphrase": "${filler("e", 14)}"`,
+    `Cookie: session=${filler("r", 18)}`, `DefaultEndpointsProtocol=https;AccountKey=${filler("t", 30)}==;EndpointSuffix=core`,
+    `glpat-${filler("a", 20)}`, `hf_${filler("b", 34)}`, `ya29.${filler("c", 30)}`, `xapp-1-${filler("d", 20)}`, `rk_live_${filler("f", 24)}`,
+    `the observer value ${envValue} printed alone`,
+  ];
+  const redacted = redactCommandOutput(secrets.join("\n"));
+  for (const hidden of [filler("q", 20), filler("w", 12), filler("e", 14), filler("r", 18), filler("t", 30), filler("a", 20), filler("b", 34), filler("c", 30), filler("d", 20), filler("f", 24), envValue]) {
+    assert.doesNotMatch(redacted, new RegExp(hidden.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"), `leaked: ${hidden.slice(0, 6)}`);
+  }
+  // Ordinary output stays readable.
+  const ordinary = "PWD=/home/example\nOLDPWD=/tmp\nkey: display-name\nprimary_key=id\nSSH_AUTH_SOCK=/tmp/agent.sock";
+  assert.equal(redactCommandOutput(ordinary), ordinary);
+  const started = performance.now();
+  for (const adversarial of ["a-".repeat(16_384), "x".repeat(32_768), "k=".repeat(16_384), `${"token".repeat(6_000)}=`]) redactCommandOutput(adversarial);
+  assert.ok(performance.now() - started < 1_000, "redaction must stay linear on bounded output");
+});
+
+test("a timed-out command is stopped together with the child it started", async () => {
+  const result = await runCommand({ executable: process.execPath, arguments: ["-e", [
+    "const child = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
+    "console.log('child ' + child.pid);",
+    "setInterval(() => {}, 1000);",
+  ].join("\n")], timeout_seconds: 1 });
+  assert.equal(result.timedOut, true);
+  const childPid = Number(/child (\d+)/u.exec(result.output)?.[1]);
+  assert.ok(Number.isSafeInteger(childPid) && childPid > 0, result.output);
+  const alive = () => { try { process.kill(childPid, 0); return true; } catch { return false; } };
+  for (let attempt = 0; attempt < 30 && alive(); attempt++) await new Promise((done) => setTimeout(done, 100));
+  try { assert.equal(alive(), false, "the command's child must not outlive its timeout"); }
+  finally { if (alive()) process.kill(childPid, "SIGKILL"); }
+});
+
+test("a briefly locked receipt on Windows still records the completed command", { skip: process.platform !== "win32" }, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-command-locked-"));
+  t.after(async () => { if (!resolve(directory).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe test cleanup path"); await rm(directory, { recursive: true, force: true }); });
+  const machineID = randomUUID();
+  let attempts = 0;
+  const executor = new MachineCommandExecutor({ enabled: true, machineID, dataDirectory: directory,
+    replace: async (from, to) => { if (attempts++ === 0) throw Object.assign(new Error("locked by a scanner"), { code: "EBUSY" }); await rename(from, to); } });
+  const command = create(AgentActionCommandSchema, { actionId: randomUUID(), idempotencyKey: randomUUID(), machineId: machineID, agentId: "__machine__", processId: 0n,
+    action: Action.RUN_COMMAND, expiresAt: timestampFromDate(new Date(Date.now() + 60_000)), commandJson: JSON.stringify({ executable: process.execPath, arguments: ["-e", "console.log('done')"], timeout_seconds: 5 }) });
+  const result = await executor.execute(command);
+  assert.equal(result.resultCode, "command_completed");
+  assert.deepEqual(await new MachineCommandExecutor({ enabled: true, machineID, dataDirectory: directory }).execute(command), result);
 });
 
 test("power commands use the reviewed one-minute operating-system schedule", () => {

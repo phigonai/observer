@@ -202,14 +202,24 @@ Remote actions are off on every computer by default.
 - `PHIGON_REMOTE_ACTIONS_ENABLED=true` lets administrators stop or force-stop
   one exact running agent process. Each stop needs an operator proposal and a
   separate administrator confirmation, expires quickly, and leaves a receipt.
-  Graceful stop uses `taskkill /PID` on Windows and `SIGTERM` elsewhere; force
-  stop is approved separately. It does not enable shell access, file access,
-  screen capture or general remote control.
+  A stop acts on one exact process lifetime (process ID plus start time, checked
+  again just before anything is sent) and the child processes it started.
+  Graceful stop sends `SIGTERM` on Linux and macOS; on Windows it asks the
+  agent's windows to close, and for a console agent, which Windows can only
+  end by force, it sends nothing and reports `graceful_stop_unsupported`.
+  Force stop is approved separately. Receipts say when the process had already
+  exited, access was denied, or the agent or a child is still running. It does
+  not enable shell access, file access, screen capture or general remote
+  control.
 - `PHIGON_REMOTE_COMMANDS_ENABLED=true` additionally allows
   administrator-reviewed commands (executable and arguments, no shell), system
   inspection, and scheduled shutdown or restart. Commands run as the observer's
   account, are limited to 1–120 seconds and return at most 32 KB of redacted
   output. A durable journal prevents a command from running twice after a crash.
+  System inspection reports the operating system, memory, uptime, CPU load,
+  space on the main drive, the observer version, and each running agent's
+  name, process ID, CPU share, memory and run time, measured once over half a
+  second. It never includes file contents, environment values or command lines.
 
 ## Guardian: checks before an agent acts
 

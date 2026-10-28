@@ -669,6 +669,7 @@ export async function run(
           initialDiscovery.inventory.agents,
         );
         let latestDiscoveryInventory = initialDiscovery.inventory;
+        actionExecutor.observeInventory(latestDiscoveryInventory);
         const publishInventory = () => {
           const withHistory = mergeInventoryWithHistoricalIdentities(
             latestDiscoveryInventory,
@@ -689,6 +690,7 @@ export async function run(
           controller.signal,
           async (inventory) => {
             latestDiscoveryInventory = inventory;
+            actionExecutor.observeInventory(inventory);
             collector?.updateInventory(inventory);
             historicalIdentities = await historicalStore.remember(
               inventory.agents,

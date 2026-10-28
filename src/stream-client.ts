@@ -87,6 +87,9 @@ export type ObserverStreamMetrics = Readonly<{
   queue: QueueMetrics;
 }>;
 
+/** What the stream needs from the action executor. */
+export type ActionExecutor = Pick<AgentActionExecutor, "execute" | "manifest">;
+
 export type StreamClientOptions = Readonly<{
   config: ObserverConfig;
   credentialStore?: CredentialStore;
@@ -102,7 +105,7 @@ export type StreamClientOptions = Readonly<{
   onAcknowledgement?: (
     sequence: bigint,
   ) => void | Promise<void>;
-  actionExecutor?: AgentActionExecutor;
+  actionExecutor?: ActionExecutor;
   onHistorySync?: (command: HistorySyncCommand) => Promise<HistorySyncResult>;
   handshakeTimeoutMs?: number;
   responseTimeoutMs?: number;
@@ -123,7 +126,7 @@ export class ObserverStreamClient {
   readonly #onAcknowledgement: (
     sequence: bigint,
   ) => void | Promise<void>;
-  readonly #actionExecutor: AgentActionExecutor | undefined;
+  readonly #actionExecutor: ActionExecutor | undefined;
   readonly #onHistorySync:
     | ((command: HistorySyncCommand) => Promise<HistorySyncResult>)
     | undefined;
@@ -321,7 +324,6 @@ export class ObserverStreamClient {
     let lastResponseAt = Date.now();
     let saveState = Promise.resolve();
     let actionPolicyUpdates = Promise.resolve();
-    let actionExecutions = Promise.resolve();
     let historySyncExecutions = Promise.resolve();
     const activeHistorySyncJobs = new Set<string>();
     const connectionAbort = new AbortController();
@@ -574,16 +576,22 @@ export class ObserverStreamClient {
           }
           if (response.payload.case === "actionCommand") {
             const command = response.payload.value;
-            actionExecutions = actionExecutions.then(async () => {
+            // Executors serialize each kind of work and keep durable receipts,
+            // so actions run independently here: a stop or force-stop must not
+            // wait behind a command that may run for two minutes, and a lost
+            // connection must not wait for it before reconnecting. A result
+            // that outlives its connection is replayed from the receipt when
+            // the control plane redelivers the command.
+            const execution = (async () => {
               const receipt = this.#actionExecutor === undefined
                 ? disabledActionReceipt(command, credential.machineId)
                 : await this.#actionExecutor.execute(command);
-              if (signal.aborted) return;
+              if (signal.aborted || connectionAbort.signal.aborted) return;
               stream.write(create(StreamTelemetryRequestSchema, {
                 payload: { case: "actionResult", value: receipt },
               }));
-            });
-            void actionExecutions.catch((error: unknown) => {
+            })();
+            void execution.catch((error: unknown) => {
               reject(error);
               stream.cancel();
             });
@@ -787,7 +795,6 @@ export class ObserverStreamClient {
       await Promise.all([
         saveState,
         actionPolicyUpdates,
-        actionExecutions,
         historySyncExecutions,
       ]);
     } finally {
