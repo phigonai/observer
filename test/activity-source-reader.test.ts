@@ -102,6 +102,142 @@ test("JSONL source reader tails only new complete records by default", async () 
   }
 });
 
+test("idle scans do not rewrite an unchanged source checkpoint", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-source-idle-"));
+  const sourceRoot = join(directory, "sessions");
+  const dataDirectory = join(directory, "data");
+  const cursorPath = join(dataDirectory, "activity-cursors.json");
+  const sources = [{ adapterId: "codex", roots: [sourceRoot] }];
+  await mkdir(sourceRoot, { recursive: true });
+  const sourceFile = join(sourceRoot, "session.jsonl");
+  await writeFile(sourceFile, '{"type":"existing"}\n', "utf8");
+  try {
+    const reader = new JSONLSourceReader(dataDirectory, false);
+    const baseline = await reader.scan(sources);
+    await reader.commit(baseline.checkpoint);
+    // Mark the durable file. A rewrite of identical state would drop it.
+    const saved = await readFile(cursorPath, "utf8");
+    await writeFile(cursorPath, `${saved}\n`, "utf8");
+    for (let tick = 0; tick < 5; tick++) {
+      const idle = await reader.scan(sources);
+      assert.equal(idle.records.length, 0);
+      await reader.commit(idle.checkpoint);
+    }
+    assert.equal(await readFile(cursorPath, "utf8"), `${saved}\n`);
+
+    // A restarted reader also starts from the loaded state, not a rewrite.
+    const restarted = new JSONLSourceReader(dataDirectory, false);
+    const resumed = await restarted.scan(sources);
+    await restarted.commit(resumed.checkpoint);
+    assert.equal(await readFile(cursorPath, "utf8"), `${saved}\n`);
+
+    await appendFile(sourceFile, '{"type":"new"}\n', "utf8");
+    const changed = await restarted.scan(sources);
+    assert.deepEqual(changed.records.map((record) => record.value), [{ type: "new" }]);
+    await restarted.commit(changed.checkpoint);
+    assert.notEqual(await readFile(cursorPath, "utf8"), `${saved}\n`);
+    const afterRestart = new JSONLSourceReader(dataDirectory, false);
+    assert.deepEqual((await afterRestart.scan(sources)).records, []);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("live scans skip unchanged files but still read growth and same-size replacements", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-source-unchanged-"));
+  const sourceRoot = join(directory, "sessions");
+  const dataDirectory = join(directory, "data");
+  const sources = [{ adapterId: "codex", roots: [sourceRoot] }];
+  await mkdir(join(sourceRoot, "nested"), { recursive: true });
+  const grown = join(sourceRoot, "grown.jsonl");
+  const replaced = join(sourceRoot, "nested", "replaced.jsonl");
+  await writeFile(grown, '{"type":"old-a"}\n', "utf8");
+  await writeFile(replaced, '{"type":"old-b"}\n', "utf8");
+  try {
+    const reader = new JSONLSourceReader(dataDirectory, false);
+    const baseline = await reader.scan(sources);
+    assert.deepEqual(baseline.records, []);
+    assert.equal(baseline.metrics.files, 2);
+    for (let tick = 0; tick < 3; tick++) {
+      const idle = await reader.scan(sources);
+      assert.deepEqual(idle.records, []);
+      assert.equal(idle.metrics.files, 2);
+    }
+
+    await appendFile(grown, '{"type":"new-a"}\n', "utf8");
+    assert.deepEqual(
+      (await reader.scan(sources)).records.map((record) => record.value),
+      [{ type: "new-a" }],
+    );
+
+    // Rotation to a new file of exactly the same size is a new source file.
+    const temporary = join(sourceRoot, "nested", "replaced.tmp");
+    await writeFile(temporary, '{"type":"new-b"}\n', "utf8");
+    await rename(temporary, replaced);
+    assert.deepEqual(
+      (await reader.scan(sources)).records.map((record) => record.value),
+      [{ type: "new-b" }],
+    );
+    assert.deepEqual((await reader.scan(sources)).records, []);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a full cursor store evicts stale cursors, not the ones in use", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-source-evict-"));
+  const sourceRoot = join(directory, "sessions");
+  const dataDirectory = join(directory, "data");
+  const cursorPath = join(dataDirectory, "activity-cursors.json");
+  const sources = [{ adapterId: "codex", roots: [sourceRoot] }];
+  await mkdir(sourceRoot, { recursive: true });
+  const active = join(sourceRoot, "active.jsonl");
+  await writeFile(active, '{"type":"existing"}\n', "utf8");
+  try {
+    const first = new JSONLSourceReader(dataDirectory, false);
+    await first.commit((await first.scan(sources)).checkpoint);
+    // The store already holds its limit of cursors for long-gone sessions;
+    // the active file's cursor happens to be the oldest entry.
+    const saved = JSON.parse(await readFile(cursorPath, "utf8")) as {
+      version: 1;
+      files: Record<string, number>;
+    };
+    const files: Record<string, number> = { ...saved.files };
+    for (let index = 0; index < 16_384; index++) {
+      files[`e${index.toString(16).padStart(63, "0")}`] = index;
+    }
+    await writeFile(cursorPath, JSON.stringify({ version: 1, files }), "utf8");
+
+    const running = new JSONLSourceReader(dataDirectory, false);
+    await running.commit((await running.scan(sources)).checkpoint);
+    await appendFile(active, '{"type":"while-running"}\n', "utf8");
+    // A new session adds a cursor beyond the limit.
+    await writeFile(join(sourceRoot, "new.jsonl"), '{"type":"new-session"}\n', "utf8");
+    const live = await running.scan(sources);
+    assert.deepEqual(
+      live.records.map((record) => record.value).sort((left, right) =>
+        JSON.stringify(left).localeCompare(JSON.stringify(right))
+      ),
+      [{ type: "new-session" }, { type: "while-running" }],
+    );
+    await running.commit(live.checkpoint);
+    const stored = JSON.parse(await readFile(cursorPath, "utf8")) as {
+      files: Record<string, number>;
+    };
+    assert.equal(Object.keys(stored.files).length, 16_384);
+
+    // Written while the observer is stopped; must be read after restart.
+    await appendFile(active, '{"type":"while-stopped"}\n', "utf8");
+    const restarted = new JSONLSourceReader(dataDirectory, false);
+    assert.deepEqual(
+      (await restarted.scan(sources)).records.map((record) => record.value),
+      [{ type: "while-stopped" }],
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("JSONL source reader replays records after restart until their checkpoint is committed", async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-source-"));
   const sourceRoot = join(directory, "sessions");

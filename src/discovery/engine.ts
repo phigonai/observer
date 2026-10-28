@@ -18,7 +18,10 @@ import { hermesAdapter } from "./adapters/hermes.js";
 import { openClawAdapter } from "./adapters/openclaw.js";
 import type { HostEvidenceProvider } from "./evidence.js";
 import { sortAgentIdentities } from "./known-agent.js";
-import { SystemEvidenceProvider } from "./system-evidence.js";
+import {
+  ExecutableProbeCache,
+  SystemEvidenceProvider,
+} from "./system-evidence.js";
 import type {
   AgentDiscoveryAdapter,
   DiscoverySnapshot,
@@ -46,6 +49,9 @@ export class DiscoveryEngine {
   readonly #clock: () => Date;
   #retainedMachineID: string | undefined;
   readonly #retainedRuntimes = new Map<string, AgentIdentity>();
+  // Installed CLIs and their versions outlive one discovery pass; the
+  // process list never does and is read fresh on every pass.
+  readonly #executableCache = new ExecutableProbeCache();
 
   constructor(options: DiscoveryEngineOptions = {}) {
     this.#adapters = options.adapters ?? [
@@ -55,7 +61,13 @@ export class DiscoveryEngine {
         : [customAgentAdapter(options.customAgentRegistry)]),
     ];
     this.#evidenceFactory =
-      options.evidenceFactory ?? (() => new SystemEvidenceProvider());
+      options.evidenceFactory ??
+      (() =>
+        new SystemEvidenceProvider(
+          process.platform,
+          process.env,
+          this.#executableCache,
+        ));
     this.#clock = options.clock ?? (() => new Date());
   }
 

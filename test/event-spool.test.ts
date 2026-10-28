@@ -7,6 +7,7 @@ import {
   open,
   readFile,
   rm,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -51,6 +52,42 @@ test("encrypted event spool survives restart without storing plaintext", async (
     assert.equal(afterAck.metrics().acknowledged, 0n);
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("event spool keeps appending across compaction and a removed data directory", async () => {
+  const root = await mkdtemp(join(tmpdir(), "phigon-event-spool-append-"));
+  const directory = join(root, "data");
+  try {
+    const queue = new FileBackedEventQueue(directory, 2048);
+    queue.restore(tenantID, machineID, credential);
+    // 1,101 appends cross the 1,024-operation compaction threshold.
+    for (let sequence = 1n; sequence <= 600n; sequence++) {
+      queue.enqueue(lifecycleEvent(sequence, "batch"), sequence);
+    }
+    queue.acknowledge(500n);
+    for (let sequence = 601n; sequence <= 1_100n; sequence++) {
+      queue.enqueue(lifecycleEvent(sequence, "batch"), sequence);
+    }
+    const restarted = new FileBackedEventQueue(directory, 2048);
+    restarted.restore(tenantID, machineID, credential);
+    assert.equal(restarted.metrics().acknowledged, 500n);
+    assert.deepEqual(
+      restarted.pending().map((event) => event.sequence),
+      Array.from({ length: 600 }, (_, index) => BigInt(index + 501)),
+    );
+
+    await rm(directory, { recursive: true, force: true });
+    queue.enqueue(lifecycleEvent(1_101n, "after removal"), 1_101n);
+    const recreated = new FileBackedEventQueue(directory, 2048);
+    recreated.restore(tenantID, machineID, credential);
+    assert.deepEqual(recreated.pending().map((event) => event.sequence), [1_101n]);
+    if (process.platform !== "win32") {
+      const metadata = await stat(join(directory, "telemetry-spool.jsonl"));
+      assert.equal(metadata.mode & 0o777, 0o600);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 

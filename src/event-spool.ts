@@ -70,6 +70,12 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
   #scope: SpoolScope | undefined;
   #key: Buffer | undefined;
   #operations = 0;
+  // Appends run synchronously on the event loop for every event and every
+  // acknowledgement. Prepare the private directory and secure the file once,
+  // and track the spool size here instead of stat-ing it before each append.
+  #directoryPrepared = false;
+  #fileSecured = false;
+  #size: number | undefined;
 
   constructor(dataDirectory: string, capacity = 2048) {
     super(capacity);
@@ -264,24 +270,57 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
   }
 
   #append(record: SpoolRecord): void {
-    mkdirSync(this.#dataDirectory, { recursive: true, mode: 0o700 });
-    makeDirectoryPrivateSync(this.#dataDirectory);
+    this.#prepareDirectory();
     const encoded = `${JSON.stringify(record)}\n`;
-    let size = existsSync(this.#path) ? statSync(this.#path).size : 0;
-    if (size + Buffer.byteLength(encoded) > maxSpoolBytes) {
+    const bytes = Buffer.byteLength(encoded);
+    if (this.#currentSize() + bytes > maxSpoolBytes) {
       this.#compact();
-      size = statSync(this.#path).size;
     }
-    if (size + Buffer.byteLength(encoded) > maxSpoolBytes) {
+    if (this.#currentSize() + bytes > maxSpoolBytes) {
       throw new Error("Telemetry spool is full; collection stopped before data loss.");
     }
-    appendFileSync(this.#path, encoded, {
+    if (this.#currentSize() === 0) this.#fileSecured = false;
+    const options = {
       encoding: "utf8",
       mode: 0o600,
       flush: true,
-    });
-    chmodSync(this.#path, 0o600);
+    } as const;
+    try {
+      appendFileSync(this.#path, encoded, options);
+    } catch (error) {
+      if (!isNodeError(error) || error.code !== "ENOENT") throw error;
+      // The data directory was removed while running: recreate it privately.
+      this.#directoryPrepared = false;
+      this.#fileSecured = false;
+      this.#size = 0;
+      this.#prepareDirectory();
+      appendFileSync(this.#path, encoded, options);
+    }
+    if (!this.#fileSecured) {
+      chmodSync(this.#path, 0o600);
+      this.#fileSecured = true;
+    }
+    this.#size = this.#currentSize() + bytes;
     this.#operations++;
+  }
+
+  #prepareDirectory(): void {
+    if (this.#directoryPrepared) return;
+    mkdirSync(this.#dataDirectory, { recursive: true, mode: 0o700 });
+    makeDirectoryPrivateSync(this.#dataDirectory);
+    this.#directoryPrepared = true;
+  }
+
+  #currentSize(): number {
+    if (this.#size === undefined) {
+      try {
+        this.#size = statSync(this.#path).size;
+      } catch (error) {
+        if (!isNodeError(error) || error.code !== "ENOENT") throw error;
+        this.#size = 0;
+      }
+    }
+    return this.#size;
   }
 
   #compactIfNeeded(): void {
@@ -319,8 +358,12 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
         mode: 0o600,
         flush: true,
       });
+      this.#size = undefined;
       renameSync(temporaryPath, this.#path);
       chmodSync(this.#path, 0o600);
+      this.#directoryPrepared = true;
+      this.#fileSecured = true;
+      this.#size = Buffer.byteLength(encoded);
     } catch (error) {
       try {
         unlinkSync(temporaryPath);
