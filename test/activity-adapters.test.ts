@@ -5,10 +5,13 @@ import { claudeActivityAdapter } from "../src/activity/adapters/claude.js";
 import { clineActivityAdapter } from "../src/activity/adapters/cline.js";
 import { codexActivityAdapter } from "../src/activity/adapters/codex.js";
 import { copilotActivityAdapter } from "../src/activity/adapters/copilot.js";
+import { copilotChatActivityAdapter } from "../src/activity/adapters/copilot-chat.js";
+import { cursorActivityAdapter } from "../src/activity/adapters/cursor.js";
 import { geminiActivityAdapter } from "../src/activity/adapters/gemini.js";
 import { gooseActivityAdapter } from "../src/activity/adapters/goose.js";
 import { genericActivityAdapter } from "../src/activity/adapters/generic.js";
 import { hermesActivityAdapter } from "../src/activity/adapters/hermes.js";
+import { kiroActivityAdapter } from "../src/activity/adapters/kiro.js";
 import { openClawActivityAdapter } from "../src/activity/adapters/openclaw.js";
 import { openCodeActivityAdapter } from "../src/activity/adapters/opencode.js";
 import { errorDraft, toolDrafts } from "../src/activity/normalize.js";
@@ -1376,6 +1379,259 @@ test("Cline CLI messages stay metadata-only under the default policy", () => {
   });
   assert.ok(drafts.some((draft) => draft.payload.case === "filesystem"));
   assertMetadataOnly(drafts);
+});
+
+test("Cursor agent transcripts become prompts, replies, commands, and file edits", () => {
+  const config = loadConfig({ PHIGON_OBSERVABILITY_PROFILE: "full" });
+  const context = {
+    sessionId: "session-cursor",
+    observedAt,
+    policy: new LocalPolicyEngine(config.policy),
+  };
+  const lines = [
+    {
+      role: "user",
+      message: {
+        content: [{
+          type: "text",
+          text: "<attached_files>\n<file path=\"a.ts\" />\n</attached_files>\n<user_query>\nAdd a health check.\n</user_query>",
+        }],
+      },
+    },
+    {
+      role: "assistant",
+      message: {
+        content: [
+          { type: "text", text: "Adding the endpoint." },
+          { type: "tool_use", name: "Shell", input: { command: "npm test", working_directory: "/workspace" } },
+          { type: "tool_use", name: "StrReplace", input: { path: "/workspace/server.ts", old_string: "a", new_string: "b" } },
+          { type: "tool_use", name: "ApplyPatch", input: "*** Begin Patch\n*** Add File: /workspace/health.ts\n+export {};\n*** End Patch" },
+        ],
+      },
+    },
+    { type: "turn_ended", status: "success" },
+    { type: "turn_ended", status: "error", error: "provider unavailable" },
+    { role: "user", message: { content: [{ type: "text", text: "No wrapper here." }] } },
+  ];
+  const drafts = lines.flatMap((line) => cursorActivityAdapter.parse(line, context));
+  assert.deepEqual(
+    drafts.flatMap((draft) =>
+      draft.payload.case === "activity"
+        ? [[draft.payload.value.kind, draft.payload.value.content ?? ""]]
+        : []
+    ),
+    [
+      [ActivityKind.PROMPT, "Add a health check."],
+      [ActivityKind.RESPONSE, "Adding the endpoint."],
+      [ActivityKind.ERROR, ""],
+      [ActivityKind.PROMPT, "No wrapper here."],
+    ],
+  );
+  assert.deepEqual(
+    drafts.flatMap((draft) =>
+      draft.payload.case === "tool"
+        ? [[draft.payload.value.toolName, draft.payload.value.phase]]
+        : []
+    ),
+    [
+      ["Shell", ToolPhase.REQUESTED],
+      ["StrReplace", ToolPhase.REQUESTED],
+      ["ApplyPatch", ToolPhase.REQUESTED],
+    ],
+  );
+  const terminal = drafts.find((draft) => draft.payload.case === "terminal");
+  assert.equal(
+    terminal?.payload.case === "terminal" ? terminal.payload.value.arguments : "",
+    "npm test",
+  );
+  assert.deepEqual(
+    drafts.flatMap((draft) =>
+      draft.payload.case === "filesystem"
+        ? [draft.payload.value.resource?.identifier]
+        : []
+    ),
+    ["/workspace/server.ts", "/workspace/health.ts"],
+  );
+  assert.ok(drafts.some((draft) =>
+    draft.payload.case === "lifecycle" &&
+    draft.payload.value.phase === LifecyclePhase.IDLE
+  ));
+});
+
+test("Cursor transcripts stay metadata-only under the default policy", () => {
+  const drafts = cursorActivityAdapter.parse({
+    role: "assistant",
+    message: {
+      content: [
+        { type: "text", text: "Reading /private/project." },
+        { type: "tool_use", name: "Write", input: { path: "/private/project/a.ts", contents: "fixturesecret" } },
+      ],
+    },
+  }, {
+    sessionId: "session-cursor-private",
+    observedAt,
+    policy: metadataOnlyPolicy(),
+  });
+  assert.ok(drafts.some((draft) => draft.payload.case === "filesystem"));
+  assertMetadataOnly(drafts);
+});
+
+test("VS Code Copilot chat requests become prompts, replies, reasoning, and tool calls", () => {
+  const config = loadConfig({ PHIGON_OBSERVABILITY_PROFILE: "full" });
+  const context = {
+    sessionId: "session-copilot-chat",
+    observedAt,
+    policy: new LocalPolicyEngine(config.policy),
+  };
+  const fileUri = { $mid: 1, scheme: "file", path: "/workspace/server.ts", fsPath: "/workspace/server.ts" };
+  const drafts = copilotChatActivityAdapter.parse({
+    requestId: "request_1",
+    timestamp: Date.parse("2026-07-24T10:00:01.000Z"),
+    message: { text: "Why does the build fail?", parts: [{ kind: "text", text: "Why does the build fail?" }] },
+    response: [
+      { kind: "thinking", value: "Check the server.", id: "t1" },
+      { kind: "thinking", value: ["Then run ", "the tests."], id: "t2" },
+      { kind: "prepareToolInvocation", toolName: "copilot_readFile" },
+      {
+        kind: "toolInvocationSerialized",
+        toolId: "copilot_readFile",
+        toolCallId: "call_read",
+        invocationMessage: { value: "Reading [](file:///workspace/server.ts)", uris: { "file:///workspace/server.ts": fileUri } },
+        pastTenseMessage: { value: "Read [](file:///workspace/server.ts)", uris: { "file:///workspace/server.ts": fileUri } },
+        isConfirmed: { type: 1 },
+        isComplete: true,
+        source: { type: "internal" },
+      },
+      {
+        kind: "toolInvocationSerialized",
+        toolId: "run_in_terminal",
+        toolCallId: "call_test",
+        invocationMessage: "Running tests",
+        toolSpecificData: {
+          kind: "terminal",
+          commandLine: { original: "npm test" },
+          language: "sh",
+          terminalCommandOutput: { text: "1 failing" },
+          terminalCommandState: { exitCode: 1 },
+        },
+        isConfirmed: { type: 4 },
+        isComplete: true,
+      },
+      {
+        kind: "toolInvocationSerialized",
+        toolId: "run_in_terminal",
+        toolCallId: "call_denied",
+        invocationMessage: "Running cleanup",
+        toolSpecificData: { kind: "terminal", commandLine: { original: "rm -rf build" } },
+        isConfirmed: { type: 0 },
+        isComplete: true,
+      },
+      { value: "The test for ", supportThemeIcons: false, supportHtml: false },
+      { kind: "inlineReference", inlineReference: fileUri },
+      { value: " fails.", supportThemeIcons: false, supportHtml: false },
+    ],
+    result: { errorDetails: { message: "Rate limited", code: "rate" } },
+  }, context);
+  assert.deepEqual(
+    drafts.flatMap((draft) =>
+      draft.payload.case === "activity"
+        ? [[draft.payload.value.kind, draft.payload.value.content ?? ""]]
+        : []
+    ),
+    [
+      [ActivityKind.PROMPT, "Why does the build fail?"],
+      [ActivityKind.RESPONSE, "The test for `server.ts` fails."],
+      [ActivityKind.REASONING, "Check the server.\n\nThen run the tests."],
+      [ActivityKind.ERROR, ""],
+    ],
+  );
+  assert.deepEqual(
+    drafts.flatMap((draft) =>
+      draft.payload.case === "tool"
+        ? [[draft.payload.value.invocationId, draft.payload.value.toolName, draft.payload.value.phase]]
+        : []
+    ),
+    [
+      ["call_read", "read_file", ToolPhase.SUCCEEDED],
+      ["call_test", "run_in_terminal", ToolPhase.FAILED],
+      ["call_denied", "run_in_terminal", ToolPhase.CANCELLED],
+    ],
+  );
+  const terminal = drafts.find((draft) =>
+    draft.payload.case === "terminal" && draft.payload.value.commandId === "call_test"
+  );
+  if (terminal?.payload.case === "terminal") {
+    assert.equal(terminal.payload.value.arguments, "npm test");
+    assert.equal(terminal.payload.value.exitCode, 1);
+  } else {
+    assert.fail("run_in_terminal must produce a terminal event.");
+  }
+  const read = drafts.find((draft) => draft.payload.case === "filesystem");
+  if (read?.payload.case === "filesystem") {
+    assert.equal(read.payload.value.operation, FilesystemOperation.READ);
+    assert.equal(read.payload.value.resource?.identifier, "/workspace/server.ts");
+  } else {
+    assert.fail("read_file must produce a filesystem event.");
+  }
+});
+
+test("VS Code Copilot chat requests stay metadata-only under the default policy", () => {
+  const drafts = copilotChatActivityAdapter.parse({
+    requestId: "request_private",
+    message: { text: "Read /private/project/a.ts" },
+    response: [
+      { value: "fixturesecret is in /private/project/a.ts" },
+      {
+        kind: "toolInvocationSerialized",
+        toolId: "copilot_createFile",
+        toolCallId: "call_create",
+        invocationMessage: { value: "Creating", uris: { a: { path: "/private/project/a.ts" } } },
+        isComplete: true,
+      },
+    ],
+    result: {},
+  }, {
+    sessionId: "session-copilot-chat-private",
+    observedAt,
+    policy: metadataOnlyPolicy(),
+  });
+  assert.ok(drafts.some((draft) => draft.payload.case === "filesystem"));
+  assertMetadataOnly(drafts);
+});
+
+test("Kiro chat history items become prompts and replies", () => {
+  const config = loadConfig({ PHIGON_OBSERVABILITY_PROFILE: "full" });
+  const context = {
+    sessionId: "session-kiro",
+    observedAt,
+    policy: new LocalPolicyEngine(config.policy),
+  };
+  const items = [
+    { message: { id: "m1", role: "user", content: "Add a health check." }, contextItems: [], editorState: { type: "doc" } },
+    {
+      message: { id: "m2", role: "assistant", content: [{ type: "text", text: "Adding the endpoint." }, { type: "imageUrl", imageUrl: { url: "data:" } }] },
+      contextItems: [],
+      executionId: "exec-1",
+      promptLogs: [],
+    },
+    { message: { id: "m3", role: "system", content: "Injected instructions." } },
+    { message: { id: "m4", role: "assistant", content: [] } },
+  ];
+  assert.deepEqual(
+    items.flatMap((item) => kiroActivityAdapter.parse(item, context)).flatMap((draft) =>
+      draft.payload.case === "activity"
+        ? [[draft.payload.value.kind, draft.payload.value.content]]
+        : []
+    ),
+    [
+      [ActivityKind.PROMPT, "Add a health check."],
+      [ActivityKind.RESPONSE, "Adding the endpoint."],
+    ],
+  );
+  assertMetadataOnly(kiroActivityAdapter.parse(
+    { message: { id: "m5", role: "user", content: "fixturesecret in /private/project" } },
+    { sessionId: "session-kiro-private", observedAt, policy: metadataOnlyPolicy() },
+  ));
 });
 
 test("Goose session messages become prompts, replies, commands, and file edits", () => {

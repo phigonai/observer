@@ -32,6 +32,13 @@ export type KnownAgentSpec = Readonly<{
   processNames: readonly string[];
   configurationPaths: readonly string[];
   capabilities: readonly string[];
+  /**
+   * `agent` (default): each matching process is its own agent runtime.
+   * `application`: a desktop application whose many helper processes share
+   * one executable name. It is detected through its installation, and its
+   * processes only report that it is running.
+   */
+  processModel?: "agent" | "application";
 }>;
 
 export async function discoverKnownAgent(
@@ -69,7 +76,8 @@ export async function discoverKnownAgent(
       );
     }
   }
-  const runtimeMatches = processMatches.filter((process) => {
+  const application = spec.processModel === "application";
+  const runtimeMatches = application ? [] : processMatches.filter((process) => {
     const processKey = normalizedProcessKey(process.processKey);
     return (
       processKey !== undefined &&
@@ -82,7 +90,7 @@ export async function discoverKnownAgent(
     );
   });
   const processEvidenceIncomplete =
-    runtimeMatches.length !== processMatches.length;
+    !application && runtimeMatches.length !== processMatches.length;
   const executable =
     executableProbe.status === "ok" ? executableProbe.value : null;
   const configurations =
@@ -90,7 +98,7 @@ export async function discoverKnownAgent(
       ? configurationProbe.value
       : [];
   const detected =
-    processMatches.length > 0 ||
+    (!application && processMatches.length > 0) ||
     executable !== null ||
     configurations.length > 0;
 
@@ -160,7 +168,11 @@ export async function discoverKnownAgent(
         displayName: spec.displayName,
         version: executable?.version ?? "",
         runtime: "",
-        state: processMatches.length > 0 ? AgentState.UNKNOWN : state,
+        state: processMatches.length === 0
+          ? state
+          : application
+            ? AgentState.RUNNING
+            : AgentState.UNKNOWN,
         processId: 0n,
         lastObservedAt: timestampFromDate(observedAt),
         capabilities: [...spec.capabilities, productCapability].sort(),

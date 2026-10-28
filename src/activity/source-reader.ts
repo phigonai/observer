@@ -14,7 +14,10 @@ import {
 import { homedir } from "node:os";
 import { basename, join, relative, resolve, sep } from "node:path";
 import { atomicReplace } from "../atomic-replace.js";
-import { scanJSONDocumentSource } from "./json-document-source.js";
+import {
+  type JSONDocumentOptions,
+  scanJSONDocumentSource,
+} from "./json-document-source.js";
 
 const maxSourceFiles = 256;
 const historicalFilesPerScan = 16;
@@ -37,6 +40,8 @@ export type ActivitySource = Readonly<{
   sourceDisplayName?: string;
   /** For json-messages sources: the top-level messages array field. */
   messagesField?: string;
+  /** For json-messages sources: how documents are read and delivered. */
+  document?: JSONDocumentOptions;
   /**
    * Optional regular expression matched against each file path relative to
    * its root, with `/` separators. Only matching files belong to the source.
@@ -417,6 +422,7 @@ export class JSONLSourceReader {
         roots: source.roots.map(expandedActivityRoot),
         pathPattern: source.pathPattern ?? "\\.json$",
         messagesField: source.messagesField ?? "messages",
+        ...source.document,
       }, {
         cursors: this.#cursors,
         initialScan,

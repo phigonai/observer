@@ -624,12 +624,19 @@ test("activity collector binds process-tagged records to the matching runtime id
   }
 });
 
-test("the default sources deliver Gemini CLI and Cline CLI conversations", async () => {
+test("the default sources deliver Gemini CLI, Cline CLI, and Cursor conversations", async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-native-sources-"));
   const geminiRoot = join(directory, "gemini-tmp");
   const clineRoot = join(directory, "cline-sessions");
+  const cursorRoot = join(directory, "cursor-projects");
+  const cursorTranscript = join(cursorRoot, "c-workspace", "agent-transcripts", "conv-1");
   await mkdir(join(geminiRoot, "my-project", "chats"), { recursive: true });
   await mkdir(join(clineRoot, "1789500000000_abcde"), { recursive: true });
+  await mkdir(cursorTranscript, { recursive: true });
+  await writeFile(
+    join(cursorTranscript, "conv-1.jsonl"),
+    JSON.stringify({ role: "user", message: { content: [{ type: "text", text: "<user_query>\nFix the login.\n</user_query>" }] } }),
+  );
   await writeFile(
     join(geminiRoot, "my-project", "chats", "session-2026-07-24T10-00-8f0f8a62.jsonl"),
     [
@@ -650,10 +657,14 @@ test("the default sources deliver Gemini CLI and Cline CLI conversations", async
     config: loadConfig({
       PHIGON_DATA_DIR: join(directory, "data"),
       PHIGON_ACTIVITY_REPLAY_ON_FIRST_START: "true",
-      PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE: "200",
+      PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE: "600",
       PHIGON_COLLECT_PROMPT_CONTENT: "true",
       PHIGON_GEMINI_ACTIVITY_DIRS: geminiRoot,
       PHIGON_CLINE_ACTIVITY_DIRS: clineRoot,
+      PHIGON_CURSOR_ACTIVITY_DIRS: cursorRoot,
+      PHIGON_COPILOT_CHAT_ACTIVITY_DIRS: join(directory, "none"),
+      PHIGON_KIRO_ACTIVITY_DIRS: join(directory, "none"),
+      PHIGON_GOOSE_ACTIVITY_DIRS: join(directory, "none"),
       PHIGON_CODEX_ACTIVITY_DIRS: join(directory, "none"),
       PHIGON_CLAUDE_ACTIVITY_DIRS: join(directory, "none"),
       PHIGON_HERMES_ACTIVITY_DIRS: join(directory, "none"),
@@ -680,12 +691,90 @@ test("the default sources deliver Gemini CLI and Cline CLI conversations", async
         ? [event.payload.value.content]
         : []
     ).sort();
-    assert.deepEqual(prompts, ["Add a test.", "Explain the build."]);
+    assert.deepEqual(prompts, ["Add a test.", "Explain the build.", "Fix the login."]);
     assert.deepEqual(
       collector.sourceIdentities().map((identity) =>
         identity.displayName.split(" · ")[0]
       ).sort(),
-      ["Cline", "Gemini CLI"],
+      ["Cline", "Cursor", "Gemini CLI"],
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Cline source records keep their message time so the raw record pairs with its reply", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-cline-time-"));
+  const clineRoot = join(directory, "cline-sessions");
+  await mkdir(join(clineRoot, "1789500000000_abcde"), { recursive: true });
+  const replyTime = Date.parse("2026-07-24T10:00:02.000Z");
+  await writeFile(
+    join(clineRoot, "1789500000000_abcde", "1789500000000_abcde.messages.json"),
+    JSON.stringify({
+      version: 1,
+      sessionId: "1789500000000_abcde",
+      messages: [
+        { id: "c1", role: "user", content: [{ type: "text", text: "Fix the build." }], ts: replyTime - 1_000 },
+        {
+          id: "c2",
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "Line one.\nLine two." },
+            { type: "text", text: "Done.\nAll good." },
+          ],
+          ts: replyTime,
+        },
+      ],
+    }),
+  );
+  const emitted: EventEnvelope[] = [];
+  const collector = new ActivityCollector({
+    config: loadConfig({
+      PHIGON_DATA_DIR: join(directory, "data"),
+      PHIGON_OBSERVABILITY_PROFILE: "full",
+      PHIGON_ACTIVITY_REPLAY_ON_FIRST_START: "true",
+      PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE: "200",
+    }),
+    credential: {
+      machineId: "5f1b4cb4-a77d-4f53-af66-197e184683f4",
+      tenantId: "7d1b4cb4-a77d-4f53-af66-197e184683f4",
+      credential: `phg_m_${"0".repeat(43)}`,
+      controlPlaneOrigin: "http://127.0.0.1:8080",
+      createdAt: "2026-07-24T00:00:00.000Z",
+    },
+    initialSequence: 0n,
+    emit: (event) => emitted.push(event),
+    sources: [{
+      adapterId: "cline-cli",
+      roots: [clineRoot],
+      format: "json-messages",
+      pathPattern: "^[^/]+/[^/]+\\.messages\\.json$",
+      messagesField: "messages",
+    }],
+  });
+  try {
+    await collector.scanOnce();
+    const reply = emitted.find((event) =>
+      event.payload.case === "activity" &&
+      event.payload.value.kind === ActivityKind.RESPONSE
+    );
+    assert.equal(
+      reply?.payload.case === "activity" ? reply.payload.value.content : "",
+      "Done.\nAll good.",
+    );
+    const raw = emitted.find((event) =>
+      event.payload.case === "vendor" &&
+      (event.payload.value.payloadJson ?? "").includes("\"c2\"")
+    );
+    assert.ok(raw !== undefined && reply !== undefined);
+    // The file was written now; both events must carry the message's time.
+    assert.equal(
+      timestampDate(raw.observedAt!).toISOString(),
+      "2026-07-24T10:00:02.000Z",
+    );
+    assert.equal(
+      timestampDate(reply.observedAt!).toISOString(),
+      "2026-07-24T10:00:02.000Z",
     );
   } finally {
     await rm(directory, { recursive: true, force: true });

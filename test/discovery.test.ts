@@ -673,6 +673,88 @@ test("missing evidence yields an honest empty inventory", async () => {
   assert.equal(snapshot.adapterHealth.length, 5);
 });
 
+test("desktop applications are one running product, not one agent per helper process", async () => {
+  const helpers = [1, 2, 3].map((index) => ({
+    processKey: `process-cursor-${index}-start-a`,
+    processId: 400 + index,
+    startedAt: new Date("2026-07-24T09:00:00.000Z"),
+    executableName: "cursor",
+    executablePathDigest: `cursor-helper-digest-${index}`,
+  }));
+  const discover = (configured: boolean) => new DiscoveryEngine({
+    adapters: [genericAdapter],
+    evidenceFactory: () => new FixtureEvidenceProvider({
+      processes: { status: "ok", value: helpers },
+      configurations: configured
+        ? new Map([["~/AppData/Roaming/Cursor", [{ identifierDigest: "cursor-config-digest" }]]])
+        : new Map(),
+    }),
+    clock: () => observedAt,
+  }).discover();
+
+  const running = await discover(true);
+  const cursor = running.inventory.agents.filter((agent) =>
+    agent.displayName === "Cursor" || agent.displayName.startsWith("Cursor · ")
+  );
+  assert.equal(cursor.length, 1);
+  assert.equal(cursor[0]?.state, AgentState.RUNNING);
+  assert.equal(cursor[0]?.processId, 0n);
+  assert.equal(running.inventory.partial, false);
+
+  // A helper process alone does not show that the application is installed.
+  const unconfigured = await discover(false);
+  assert.ok(!unconfigured.inventory.agents.some((agent) =>
+    agent.displayName.startsWith("Cursor")
+  ));
+});
+
+test("agents whose conversations are not read are still discovered", async () => {
+  const agents: ReadonlyArray<Readonly<{
+    displayName: string;
+    configuration: string;
+    process?: string;
+  }>> = [
+    { displayName: "Antigravity", configuration: "~/.gemini/antigravity", process: "antigravity" },
+    { displayName: "Trae", configuration: "~/AppData/Roaming/Trae", process: "trae" },
+    { displayName: "Zed", configuration: "~/.config/zed", process: "zed" },
+    { displayName: "Factory Droid", configuration: "~/.factory" },
+    {
+      displayName: "Roo Code",
+      configuration: "~/AppData/Roaming/Code/User/globalStorage/rooveterinaryinc.roo-cline",
+    },
+  ];
+  for (const agent of agents) {
+    const snapshot = await new DiscoveryEngine({
+      adapters: [genericAdapter],
+      evidenceFactory: () => new FixtureEvidenceProvider({
+        processes: {
+          status: "ok",
+          value: agent.process === undefined ? [] : [1, 2].map((index) => ({
+            processKey: `process-${agent.process}-${index}-start-a`,
+            processId: 500 + index,
+            startedAt: new Date("2026-07-24T09:00:00.000Z"),
+            executableName: agent.process ?? "",
+            executablePathDigest: `${agent.process}-digest-${index}`,
+          })),
+        },
+        configurations: new Map([
+          [agent.configuration, [{ identifierDigest: `${agent.displayName}-config` }]],
+        ]),
+      }),
+      clock: () => observedAt,
+    }).discover();
+    const found = snapshot.inventory.agents.filter((identity) =>
+      identity.displayName.split(" · ")[0] === agent.displayName
+    );
+    assert.equal(found.length, 1, agent.displayName);
+    assert.equal(
+      found[0]?.state,
+      agent.process === undefined ? AgentState.INSTALLED : AgentState.RUNNING,
+      agent.displayName,
+    );
+  }
+});
+
 type FixtureOptions = Readonly<{
   processes: ProbeResult<readonly ProcessEvidence[]>;
   executables?: ReadonlyMap<string, ExecutableEvidence>;

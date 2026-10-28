@@ -999,6 +999,209 @@ test("JSON document history sync pages through every saved message", async () =>
   }
 });
 
+test("JSONL document sources read a final line without its newline and skip unrelated folders", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-jsonl-document-"));
+  const root = join(directory, "projects");
+  const transcripts = join(root, "c-workspace", "agent-transcripts", "conv-1");
+  const file = join(transcripts, "conv-1.jsonl");
+  const data = join(directory, "data");
+  await mkdir(join(transcripts, "subagents"), { recursive: true });
+  // Folders outside the transcript layout are never walked, even when they
+  // hold files the path pattern would accept.
+  await mkdir(join(transcripts, "tool-cache"), { recursive: true });
+  await writeFile(join(transcripts, "tool-cache", "cache.jsonl"), '{"role":"user","message":{"content":"cached"}}');
+  const sources = [{
+    adapterId: "cursor-transcript",
+    roots: [root],
+    format: "json-messages" as const,
+    pathPattern: "^[^/]+/agent-transcripts/.+\\.jsonl$",
+    document: {
+      documentFormat: "jsonl" as const,
+      directoryPattern: "^[^/]+(?:/agent-transcripts(?:/[^/]+(?:/subagents)?)?)?$",
+    },
+  }];
+  const line = (text: string) => JSON.stringify({ role: "user", message: { content: [{ type: "text", text }] } });
+  const texts = (scan: Awaited<ReturnType<JSONLSourceReader["scan"]>>) =>
+    scan.records.map((record) =>
+      (record.value as { message: { content: Array<{ text: string }> } }).message.content[0]?.text
+    );
+  try {
+    await writeFile(file, line("one"));
+    await utimes(file, 1_000, 1_000);
+    const reader = new JSONLSourceReader(data, true, 262_144, 4);
+    const first = await reader.scan(sources, 32);
+    assert.deepEqual(texts(first), ["one"]);
+    await reader.commit(first.checkpoint);
+
+    // The writer puts the separator before each record; a half-written
+    // record waits for the rest of its line.
+    await writeFile(file, `${line("one")}\n${line("two")}\n{"role":"assis`);
+    await utimes(file, 1_010, 1_010);
+    const partial = await reader.scan(sources, 32);
+    assert.deepEqual(texts(partial), ["two"]);
+    await reader.commit(partial.checkpoint);
+
+    await writeFile(file, `${line("one")}\n${line("two")}\n${line("three")}`);
+    await utimes(file, 1_020, 1_020);
+    assert.deepEqual(texts(await reader.scan(sources, 32)), ["three"]);
+
+    await writeFile(join(transcripts, "subagents", "sub-1.jsonl"), line("delegated"));
+    const subagent = await reader.scan(sources, 32);
+    assert.deepEqual(texts(subagent), ["delegated"]);
+    assert.notEqual(subagent.records[0]?.sourceId, first.records[0]?.sourceId);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("VS Code chat operation logs replay into requests delivered once each is finished", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-chat-log-"));
+  const root = join(directory, "workspaceStorage");
+  const sessions = join(root, "0123abcd", "chatSessions");
+  const log = join(sessions, "session-1.jsonl");
+  await mkdir(sessions, { recursive: true });
+  const sources = (["json", "jsonl"] as const).map((extension) => ({
+    adapterId: "copilot-chat",
+    roots: [root],
+    format: "json-messages" as const,
+    pathPattern: `^(?:[^/]+/chatSessions/)?[^/]+\\.${extension}$`,
+    messagesField: "requests",
+    document: {
+      documentFormat: extension === "json" ? "json" as const : "mutation-log" as const,
+      directoryPattern: "^[^/]+(?:/chatSessions)?$",
+      messageIdField: "requestId",
+      completeFields: ["result", "isCanceled", "modelState.completedAt"],
+      sessionIdField: "sessionId",
+    },
+  }));
+  const request = (id: string, extra: Record<string, unknown> = {}) => ({
+    requestId: id,
+    timestamp: 1_789_500_000_000,
+    message: { text: id },
+    response: [],
+    ...extra,
+  });
+  const entry = (value: unknown) => `${JSON.stringify(value)}\n`;
+  // Modification times in seconds, a minute ago plus an offset: recent
+  // enough that an unfinished final request is still being answered.
+  const base = Math.floor(Date.now() / 1_000) - 60;
+  const recent = (offset: number) => base + offset;
+  const ids = (scan: Awaited<ReturnType<JSONLSourceReader["scan"]>>) =>
+    scan.records.map((record) => (record.value as { requestId: string }).requestId);
+  try {
+    // r1 was interrupted long ago and never finished; r2 finished; r3 is
+    // still being answered.
+    await writeFile(log, [
+      entry({ kind: 0, v: { version: 3, sessionId: "session-1", requests: [request("r1")] } }),
+      entry({ kind: 2, k: ["requests"], v: [request("r2", { result: {} })] }),
+      entry({ kind: 2, k: ["requests"], v: [request("r3")] }),
+      entry({ kind: 2, k: ["requests", 2, "response"], v: [{ value: "partial" }] }),
+    ].join(""));
+    await utimes(log, recent(0), recent(0));
+    const reader = new JSONLSourceReader(join(directory, "data"), true, 262_144, 4);
+    const first = await reader.scan(sources, 32);
+    assert.deepEqual(ids(first), ["r1", "r2"]);
+    await reader.commit(first.checkpoint);
+
+    // The reply finishes; a half-written entry after it is ignored.
+    await appendFile(log, entry({ kind: 1, k: ["requests", 2, "result"], v: { timings: {} } }) + '{"kind":2,"k":["req');
+    await utimes(log, recent(10), recent(10));
+    const finished = await reader.scan(sources, 32);
+    assert.deepEqual(ids(finished), ["r3"]);
+    assert.deepEqual(
+      (finished.records[0]?.value as { response: unknown[] }).response,
+      [{ value: "partial" }],
+    );
+
+    // A compacted log with truncating pushes and deletes replays as VS Code
+    // applies them: the discarded draft request is never delivered.
+    await writeFile(log, [
+      entry({ kind: 0, v: { sessionId: "session-1", requests: [request("r1"), request("r2", { result: {} }), request("r3", { result: {} }), request("draft")] } }),
+      entry({ kind: 2, k: ["requests"], v: [request("r4", { result: {} })], i: 3 }),
+      entry({ kind: 3, k: ["requests", 3, "result"] }),
+    ].join(""));
+    await utimes(log, recent(20), recent(20));
+    assert.deepEqual(ids(await reader.scan(sources, 32)), []);
+    await appendFile(log, entry({ kind: 1, k: ["requests", 3, "isCanceled"], v: true }));
+    await utimes(log, recent(30), recent(30));
+    assert.deepEqual(ids(await reader.scan(sources, 32)), ["r4"]);
+
+    // A request the editor never finished is delivered once the session
+    // has been left unchanged long enough to be settled.
+    await appendFile(log, entry({ kind: 2, k: ["requests"], v: [request("r5")] }));
+    await utimes(log, recent(40), recent(40));
+    assert.deepEqual(ids(await reader.scan(sources, 32)), []);
+    await utimes(log, recent(-3_600), recent(-3_600));
+    assert.deepEqual(ids(await reader.scan(sources, 32)), ["r5"]);
+
+    // A flat .json copy of the same session yields the same record identities.
+    const copy = join(sessions, "session-1.json");
+    await writeFile(copy, JSON.stringify({ version: 3, sessionId: "session-1", requests: [request("r1"), request("r2", { result: {} }), request("r3", { result: {} }), request("r4", { isCanceled: true })] }));
+    const history = new JSONLSourceReader(join(directory, "history"), false, 262_144, 1, "history");
+    const archived = await history.scan(sources, 32);
+    const byFile = new Map<string, string[]>();
+    for (const record of archived.records) {
+      const key = `${record.sourceId}:${(record.value as { requestId: string }).requestId}`;
+      byFile.set(key, [...(byFile.get(key) ?? []), record.sourceRecordId]);
+    }
+    assert.equal(archived.records.length, 9);
+    assert.deepEqual(
+      [...byFile.values()].map((recordIds) => [recordIds.length, new Set(recordIds).size]),
+      [[2, 1], [2, 1], [2, 1], [2, 1], [1, 1]],
+    );
+    assert.equal(new Set(archived.records.map((record) => record.sourceId)).size, 1);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Kiro session documents skip the session index and key history by message id", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-kiro-source-"));
+  const root = join(directory, "workspace-sessions");
+  const workspace = join(root, "YzpcV29ya3NwYWNl");
+  const file = join(workspace, "0b5f3c1e-6a43-4c8e-9a51-7d2c8e0f4a10.json");
+  await mkdir(workspace, { recursive: true });
+  const sources = [{
+    adapterId: "kiro-session",
+    roots: [root],
+    format: "json-messages" as const,
+    pathPattern: "^[^/]+/(?!sessions[.]json$)[^/]+[.]json$",
+    messagesField: "history",
+    document: {
+      directoryPattern: "^[^/]+$",
+      messageIdField: "message.id",
+      sessionIdField: "sessionId",
+    },
+  }];
+  const item = (id: string, extra: Record<string, unknown> = {}) => ({
+    message: { id, role: "user", content: id },
+    contextItems: [],
+    ...extra,
+  });
+  const ids = (scan: Awaited<ReturnType<JSONLSourceReader["scan"]>>) =>
+    scan.records.map((record) => (record.value as { message: { id: string } }).message.id);
+  try {
+    await writeFile(join(workspace, "sessions.json"), JSON.stringify([{ sessionId: "s1", title: "t", history: [item("index")] }]));
+    await writeFile(file, JSON.stringify({ sessionId: "s1", title: "t", history: [item("m1")] }));
+    const reader = new JSONLSourceReader(join(directory, "data"), true, 262_144, 4);
+    const first = await reader.scan(sources, 32);
+    assert.deepEqual(ids(first), ["m1"]);
+    await reader.commit(first.checkpoint);
+
+    // Kiro adds detail to an item it already saved; the stable message id
+    // keeps the next item from being mistaken for a rewrite.
+    await writeFile(file, JSON.stringify({
+      sessionId: "s1",
+      title: "t",
+      history: [item("m1", { editorState: { type: "doc" } }), item("m2")],
+    }));
+    await utimes(file, Date.now() / 1_000 + 5, Date.now() / 1_000 + 5);
+    assert.deepEqual(ids(await reader.scan(sources, 32)), ["m2"]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 function gooseDatabase(path: string): DatabaseSync {
   const database = new DatabaseSync(path);
   database.exec(

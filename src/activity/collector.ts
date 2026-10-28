@@ -24,9 +24,12 @@ import { claudeActivityAdapter } from "./adapters/claude.js";
 import { clineActivityAdapter } from "./adapters/cline.js";
 import { codexActivityAdapter } from "./adapters/codex.js";
 import { copilotActivityAdapter } from "./adapters/copilot.js";
+import { copilotChatActivityAdapter } from "./adapters/copilot-chat.js";
+import { cursorActivityAdapter } from "./adapters/cursor.js";
 import { geminiActivityAdapter } from "./adapters/gemini.js";
 import { gooseActivityAdapter } from "./adapters/goose.js";
 import { hermesActivityAdapter } from "./adapters/hermes.js";
+import { kiroActivityAdapter } from "./adapters/kiro.js";
 import { openClawActivityAdapter } from "./adapters/openclaw.js";
 import { openCodeActivityAdapter } from "./adapters/opencode.js";
 import { createOpenAICompatibleAdapter } from "./adapters/openai-compatible.js";
@@ -77,6 +80,9 @@ const adapters: ReadonlyMap<string, VendorActivityAdapter> = new Map([
   ["gemini-cli", geminiActivityAdapter],
   ["cline-cli", clineActivityAdapter],
   ["goose-session", gooseActivityAdapter],
+  ["cursor-transcript", cursorActivityAdapter],
+  ["copilot-chat", copilotChatActivityAdapter],
+  ["kiro-session", kiroActivityAdapter],
 ]);
 
 export type ActivityCollectorMetrics = Readonly<{
@@ -829,6 +835,50 @@ function configuredSources(config: ObserverConfig): readonly ActivitySource[] {
       format: "goose-sqlite",
     },
     {
+      adapterId: "cursor-transcript",
+      roots: config.activitySourceDirectories.cursor,
+      format: "json-messages",
+      // <project>/agent-transcripts/<id>/<id>.jsonl and
+      // <id>/subagents/<sub>.jsonl. The final line often has no newline yet.
+      pathPattern: "^[^/]+/agent-transcripts/.+\\.jsonl$",
+      document: {
+        documentFormat: "jsonl",
+        directoryPattern:
+          "^[^/]+(?:/agent-transcripts(?:/[^/]+(?:/subagents)?)?)?$",
+      },
+    },
+    // VS Code chat sessions: <workspace>/chatSessions/<id>.json documents
+    // and, with operation-log storage, <id>.jsonl logs of the same session.
+    ...(["json", "jsonl"] as const).map((extension) => ({
+      adapterId: "copilot-chat",
+      roots: config.activitySourceDirectories.copilotChat,
+      format: "json-messages" as const,
+      pathPattern: `^(?:[^/]+/chatSessions/)?[^/]+\\.${extension}$`,
+      messagesField: "requests",
+      document: {
+        documentFormat: extension === "json"
+          ? "json" as const
+          : "mutation-log" as const,
+        directoryPattern: "^[^/]+(?:/chatSessions)?$",
+        messageIdField: "requestId",
+        completeFields: ["result", "isCanceled", "modelState.completedAt"],
+        sessionIdField: "sessionId",
+      },
+    })),
+    {
+      adapterId: "kiro-session",
+      roots: config.activitySourceDirectories.kiro,
+      format: "json-messages",
+      // <workspace>/<session id>.json beside the <workspace>/sessions.json index.
+      pathPattern: "^[^/]+/(?!sessions[.]json$)[^/]+[.]json$",
+      messagesField: "history",
+      document: {
+        directoryPattern: "^[^/]+$",
+        messageIdField: "message.id",
+        sessionIdField: "sessionId",
+      },
+    },
+    {
       adapterId: "generic",
       roots: config.activitySourceDirectories.generic,
     },
@@ -893,6 +943,9 @@ function sourceIdentityDisplayName(
       case "gemini-cli": return "Gemini CLI";
       case "cline-cli": return "Cline";
       case "goose-session": return "Goose";
+      case "cursor-transcript": return "Cursor";
+      case "copilot-chat": return "GitHub Copilot";
+      case "kiro-session": return "Kiro";
       default: return "Agent activity";
     }
   })();
