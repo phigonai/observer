@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { loadConfig } from "../src/config.js";
@@ -184,6 +184,46 @@ test("loadConfig reads Cline CLI sessions from its data directory", () => {
     loadConfig({ PHIGON_CLINE_ACTIVITY_DIRS: "/var/lib/cline/sessions" })
       .activitySourceDirectories.cline,
     ["/var/lib/cline/sessions"],
+  );
+});
+
+test("loadConfig reads Cursor agent transcripts from its projects directory", () => {
+  assert.deepEqual(loadConfig({}).activitySourceDirectories.cursor, [
+    join(homedir(), ".cursor", "projects"),
+  ]);
+  assert.deepEqual(
+    loadConfig({ PHIGON_CURSOR_ACTIVITY_DIRS: "none" })
+      .activitySourceDirectories.cursor,
+    [],
+  );
+});
+
+test("loadConfig reads VS Code chat sessions from the editor storage folders", () => {
+  const directories = loadConfig({ APPDATA: join(tmpdir(), "roaming") })
+    .activitySourceDirectories.copilotChat;
+  assert.equal(directories.length, 4);
+  assert.ok(directories.some((directory) =>
+    directory.endsWith(join("Code", "User", "workspaceStorage"))
+  ));
+  assert.ok(directories.some((directory) =>
+    directory.endsWith(join("Code - Insiders", "User", "globalStorage", "emptyWindowChatSessions"))
+  ));
+  assert.deepEqual(
+    loadConfig({ PHIGON_COPILOT_CHAT_ACTIVITY_DIRS: "/srv/vscode/workspaceStorage" })
+      .activitySourceDirectories.copilotChat,
+    ["/srv/vscode/workspaceStorage"],
+  );
+});
+
+test("loadConfig reads Kiro chat sessions from the editor storage folder", () => {
+  const [directory] = loadConfig({ APPDATA: join(tmpdir(), "roaming") })
+    .activitySourceDirectories.kiro;
+  assert.ok(directory?.endsWith(
+    join("Kiro", "User", "globalStorage", "kiro.kiroagent", "workspace-sessions"),
+  ));
+  assert.deepEqual(
+    loadConfig({ PHIGON_KIRO_ACTIVITY_DIRS: "none" }).activitySourceDirectories.kiro,
+    [],
   );
 });
 

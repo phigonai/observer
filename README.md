@@ -45,15 +45,22 @@ exactly what runs on your computers and what leaves them.
 | <img src="https://phigon.online/agents/claude-code.svg" width="20" alt=""> | Claude Code | Yes | Built in |
 | <img src="https://phigon.online/agents/codex.svg" width="20" alt=""> | OpenAI Codex | Yes | Built in |
 | <img src="https://phigon.online/agents/github-copilot.svg" width="20" alt=""> | GitHub Copilot CLI | Yes | Built in |
+| <img src="https://phigon.online/agents/github-copilot.svg" width="20" alt=""> | GitHub Copilot in VS Code (chat and agent mode) | Yes | Built in |
 | <img src="https://phigon.online/agents/opencode.svg" width="20" alt=""> | OpenCode | Yes | Built in |
 | <img src="https://phigon.online/agents/openclaw.svg" width="20" alt=""> | OpenClaw | Yes | Built in |
 | <img src="https://phigon.online/agents/hermes.svg" width="20" alt=""> | Hermes Agent | Yes | Built in |
-| <img src="https://phigon.online/agents/cursor.svg" width="20" alt=""> | Cursor Agent | Yes | Bridge |
+| <img src="https://phigon.online/agents/cursor.svg" width="20" alt=""> | Cursor (editor agent and `cursor-agent` CLI) | Yes | Built in |
 | <img src="https://phigon.online/agents/gemini-cli.svg" width="20" alt=""> | Gemini CLI | Yes | Built in |
 | <img src="https://phigon.online/agents/amp.svg" width="20" alt=""> | Amp | Yes | Bridge |
 | <img src="https://phigon.online/agents/goose.svg" width="20" alt=""> | Goose | Yes | Built in |
 | <img src="https://phigon.online/agents/cline.svg" width="20" alt=""> | Cline (CLI) | Yes | Built in |
 | <img src="https://phigon.online/agents/openhands.svg" width="20" alt=""> | OpenHands | Yes | Bridge |
+| | Kiro | Yes | Built in (chat; agent actions not yet) |
+| | Antigravity | Yes | Not yet (no documented conversation format) |
+| | Trae | Yes | Not yet (its history database is encrypted) |
+| | Zed | Yes | Not yet |
+| | Factory Droid | Yes | Not yet |
+| | Roo Code | Yes | Not yet |
 | | Aider, Amazon Q Developer CLI, Continue | Yes | Bridge |
 | | Any other agent | [Register it](#custom-agents) | Bridge |
 

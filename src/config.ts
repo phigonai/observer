@@ -15,6 +15,9 @@ export type ActivitySourceDirectories = Readonly<{
   gemini: readonly string[];
   cline: readonly string[];
   goose: readonly string[];
+  cursor: readonly string[];
+  copilotChat: readonly string[];
+  kiro: readonly string[];
   generic: readonly string[];
 }>;
 
@@ -285,6 +288,29 @@ export function loadConfig(
       goose: parseDirectoryList(
         environment["PHIGON_GOOSE_ACTIVITY_DIRS"],
         gooseSessionDirectories(environment),
+      ),
+      cursor: parseDirectoryList(
+        environment["PHIGON_CURSOR_ACTIVITY_DIRS"],
+        [join(homedir(), ".cursor", "projects")],
+      ),
+      copilotChat: parseDirectoryList(
+        environment["PHIGON_COPILOT_CHAT_ACTIVITY_DIRS"],
+        ["Code", "Code - Insiders"].flatMap((product) => {
+          const user = editorUserDirectory(environment, product);
+          return [
+            join(user, "workspaceStorage"),
+            join(user, "globalStorage", "emptyWindowChatSessions"),
+          ];
+        }),
+      ),
+      kiro: parseDirectoryList(
+        environment["PHIGON_KIRO_ACTIVITY_DIRS"],
+        [join(
+          editorUserDirectory(environment, "Kiro"),
+          "globalStorage",
+          "kiro.kiroagent",
+          "workspace-sessions",
+        )],
       ),
       generic: parseDirectoryList(
         environment["PHIGON_GENERIC_ACTIVITY_DIRS"],
@@ -581,6 +607,33 @@ function gooseSessionDirectories(
     "goose",
     "sessions",
   )];
+}
+
+/**
+ * The `User` folder of a VS Code-based editor: %APPDATA%/<product>/User on
+ * Windows, ~/Library/Application Support/<product>/User on macOS, and
+ * $XDG_CONFIG_HOME (or ~/.config)/<product>/User elsewhere.
+ */
+function editorUserDirectory(
+  environment: NodeJS.ProcessEnv,
+  product: string,
+): string {
+  if (process.platform === "win32") {
+    const appData = environment["APPDATA"]?.trim() ||
+      join(homedir(), "AppData", "Roaming");
+    return join(appData, product, "User");
+  }
+  if (process.platform === "darwin") {
+    return join(homedir(), "Library", "Application Support", product, "User");
+  }
+  const configHome = environment["XDG_CONFIG_HOME"]?.trim();
+  return join(
+    configHome !== undefined && isAbsolute(configHome)
+      ? configHome
+      : join(homedir(), ".config"),
+    product,
+    "User",
+  );
 }
 
 function parseDirectoryList(
