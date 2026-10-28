@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -14,7 +14,10 @@ import { genericAdapter } from "../src/discovery/adapters/generic.js";
 import { hermesAdapter } from "../src/discovery/adapters/hermes.js";
 import { openClawAdapter } from "../src/discovery/adapters/openclaw.js";
 import { DiscoveryEngine } from "../src/discovery/engine.js";
-import { SystemEvidenceProvider } from "../src/discovery/system-evidence.js";
+import {
+  ExecutableProbeCache,
+  SystemEvidenceProvider,
+} from "../src/discovery/system-evidence.js";
 import {
   observedProcessKey,
   processKeyCapability,
@@ -43,6 +46,72 @@ test("Windows version probes close pipeline input and honor mixed-case environme
     assert.equal(result.status, "ok");
     if (result.status !== "ok") return;
     assert.equal(result.value?.version, "1.2.3");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("installed CLI probes are reused between discoveries until the executable changes or expires", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-probe-cache-"));
+  const counter = join(directory, "invocations.txt");
+  const windows = process.platform === "win32";
+  // A tiny CLI that records each `--version` launch and prints a version.
+  const install = async (name: string, version: string) => {
+    if (windows) {
+      await writeFile(join(directory, `${name}.cmd`), `@echo off\r\nrem ${version}\r\n`);
+      await writeFile(
+        join(directory, `${name}.ps1`),
+        `Add-Content -LiteralPath '${counter}' -Value 'x'\r\nWrite-Output '${name} ${version}'\r\n`,
+      );
+    } else {
+      await writeFile(
+        join(directory, name),
+        `#!/bin/sh\necho x >> '${counter}'\necho '${name} ${version}'\n`,
+        { mode: 0o755 },
+      );
+    }
+  };
+  const launches = async () => {
+    try {
+      return (await readFile(counter, "utf8")).split(/\r?\n/u).filter(Boolean).length;
+    } catch {
+      return 0;
+    }
+  };
+  let now = 1_000_000;
+  const cache = new ExecutableProbeCache({ clock: () => now });
+  const environment = windows
+    ? { Path: directory, PathExt: ".CMD" }
+    : { PATH: directory };
+  const inspect = async (name: string) => {
+    const result = await new SystemEvidenceProvider(
+      process.platform,
+      environment,
+      cache,
+    ).inspectExecutable([name]);
+    assert.equal(result.status, "ok");
+    return result.status === "ok" ? result.value : undefined;
+  };
+  try {
+    await install("phigon-probe", "1.2.3");
+    assert.equal((await inspect("phigon-probe"))?.version, "1.2.3");
+    assert.equal((await inspect("phigon-probe"))?.version, "1.2.3");
+    assert.equal(await launches(), 1);
+
+    await install("phigon-probe", "1.2.40");
+    assert.equal((await inspect("phigon-probe"))?.version, "1.2.40");
+    assert.equal(await launches(), 2);
+
+    now += 5 * 60_000;
+    assert.equal((await inspect("phigon-probe"))?.version, "1.2.40");
+    assert.equal(await launches(), 3);
+
+    assert.equal(await inspect("phigon-later"), null);
+    await install("phigon-later", "2.0.0");
+    assert.equal(await inspect("phigon-later"), null);
+    now += 60_000;
+    assert.equal((await inspect("phigon-later"))?.version, "2.0.0");
+    assert.equal(await launches(), 4);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

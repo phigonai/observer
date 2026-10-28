@@ -65,6 +65,55 @@ test("bounded queue selects a limited window after a sequence", () => {
   assert.equal(queue.latestSequence(), 3n);
 });
 
+test("bounded queue keeps sequence order for late inserts and prefix acknowledgements", () => {
+  const queue = new BoundedEventQueue<string>(8);
+  queue.enqueue("five", 5n);
+  queue.enqueue("two", 2n);
+  queue.enqueue("seven", 7n);
+  queue.enqueue("three", 3n);
+  queue.enqueue("status", 4n, "status");
+  queue.enqueue("status again", 8n, "status");
+
+  assert.deepEqual(queue.pending(), ["two", "three", "five", "seven", "status again"]);
+  assert.deepEqual(queue.pendingAfter(2n, 2), ["three", "five"]);
+  assert.deepEqual(queue.pendingAfter(4n), ["five", "seven", "status again"]);
+  assert.deepEqual(queue.pendingAfter(8n), []);
+  assert.equal(queue.latestSequence(), 8n);
+  assert.equal(queue.metrics().oldestSequence, 2n);
+
+  queue.acknowledge(5n);
+  assert.deepEqual(queue.pending(), ["seven", "status again"]);
+  assert.equal(queue.metrics().oldestSequence, 7n);
+  queue.acknowledge(7n);
+  assert.deepEqual(queue.pending(), ["status again"]);
+  queue.reconcileAcknowledged(1n);
+  assert.deepEqual(queue.pending(), ["status again"]);
+  assert.equal(queue.metrics().acknowledged, 1n);
+  queue.acknowledge(8n);
+  assert.deepEqual(queue.pending(), []);
+  assert.equal(queue.latestSequence(), undefined);
+});
+
+test("a full queue drains with per-event acknowledgements in linear time", () => {
+  const capacity = 65_536;
+  const queue = new BoundedEventQueue<number>(capacity);
+  for (let index = 1; index <= capacity; index++) {
+    queue.enqueue(index, BigInt(index));
+  }
+  const started = performance.now();
+  // The stream's per-acknowledgement work: acknowledge, read metrics for
+  // backpressure and heartbeats, then pump the next window.
+  for (let index = 1; index <= capacity; index++) {
+    const sequence = BigInt(index);
+    queue.acknowledge(sequence);
+    queue.metrics();
+    assert.equal(queue.pendingAfter(sequence, 64)[0], index < capacity ? index + 1 : undefined);
+  }
+  assert.equal(queue.metrics().depth, 0);
+  // Quadratic scans took over a minute here; linear work takes well under.
+  assert.ok(performance.now() - started < 10_000);
+});
+
 test("bounded queue replaces pending values without changing delivery order", () => {
   const queue = new BoundedEventQueue<string>(4);
   queue.enqueue("private one", 1n);

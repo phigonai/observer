@@ -18,10 +18,101 @@ const execFileAsync = promisify(execFile);
 const executableNamePattern = /^[a-zA-Z0-9._+-]{1,128}$/;
 const versionPattern =
   /\bv?\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.-]+)?\b/;
+const maxCachedExecutableProbes = 64;
+
+type CachedExecutableProbe = Readonly<{
+  checkedAt: number;
+  ttlMs: number;
+  value: ExecutableEvidence | null;
+  executablePath?: string;
+  size?: number;
+  modifiedMs?: number;
+}>;
+
+/**
+ * Remembers which agent CLIs are installed between discovery passes.
+ * Finding one walks PATH and runs its `--version`, which starts the agent's
+ * own runtime; discovery runs every few seconds, while installs change
+ * rarely. A found CLI is probed again when its file changes or after
+ * `foundTtlMs` (npm shims stay unchanged across upgrades); an absent one, or
+ * one whose version could not be read, is probed again after `missingTtlMs`.
+ */
+export class ExecutableProbeCache {
+  readonly #entries = new Map<string, CachedExecutableProbe>();
+  readonly #foundTtlMs: number;
+  readonly #missingTtlMs: number;
+  readonly #clock: () => number;
+
+  constructor(
+    options: Readonly<{
+      foundTtlMs?: number;
+      missingTtlMs?: number;
+      clock?: () => number;
+    }> = {},
+  ) {
+    this.#foundTtlMs = options.foundTtlMs ?? 5 * 60_000;
+    this.#missingTtlMs = options.missingTtlMs ?? 60_000;
+    this.#clock = options.clock ?? Date.now;
+  }
+
+  async lookup(key: string): Promise<
+    Readonly<{ value: ExecutableEvidence | null }> | undefined
+  > {
+    const cached = this.#entries.get(key);
+    if (cached === undefined) return undefined;
+    const age = this.#clock() - cached.checkedAt;
+    if (age < 0 || age >= cached.ttlMs) return undefined;
+    if (cached.executablePath === undefined) return { value: cached.value };
+    try {
+      const metadata = await stat(cached.executablePath);
+      if (
+        metadata.size !== cached.size ||
+        metadata.mtimeMs !== cached.modifiedMs
+      ) {
+        return undefined;
+      }
+    } catch {
+      return undefined;
+    }
+    return { value: cached.value };
+  }
+
+  async remember(
+    key: string,
+    value: ExecutableEvidence | null,
+    executablePath: string | null,
+  ): Promise<void> {
+    const checkedAt = this.#clock();
+    const ttlMs = value === null || value.version === ""
+      ? this.#missingTtlMs
+      : this.#foundTtlMs;
+    let entry: CachedExecutableProbe = { checkedAt, ttlMs, value };
+    if (executablePath !== null) {
+      try {
+        const metadata = await stat(executablePath);
+        entry = {
+          ...entry,
+          executablePath,
+          size: metadata.size,
+          modifiedMs: metadata.mtimeMs,
+        };
+      } catch {
+        return;
+      }
+    }
+    this.#entries.delete(key);
+    this.#entries.set(key, entry);
+    if (this.#entries.size > maxCachedExecutableProbes) {
+      const oldest = this.#entries.keys().next().value;
+      if (oldest !== undefined) this.#entries.delete(oldest);
+    }
+  }
+}
 
 export class SystemEvidenceProvider implements HostEvidenceProvider {
   readonly #platform: NodeJS.Platform;
   readonly #environment: NodeJS.ProcessEnv;
+  readonly #executableCache: ExecutableProbeCache | undefined;
   #processes:
     | Promise<ProbeResult<readonly ProcessEvidence[]>>
     | undefined;
@@ -29,9 +120,11 @@ export class SystemEvidenceProvider implements HostEvidenceProvider {
   constructor(
     platform: NodeJS.Platform = process.platform,
     environment: NodeJS.ProcessEnv = process.env,
+    executableCache?: ExecutableProbeCache,
   ) {
     this.#platform = platform;
     this.#environment = environment;
+    this.#executableCache = executableCache;
   }
 
   listProcesses(): Promise<ProbeResult<readonly ProcessEvidence[]>> {
@@ -50,19 +143,27 @@ export class SystemEvidenceProvider implements HostEvidenceProvider {
         };
       }
     }
+    const cacheKey = JSON.stringify([
+      this.#platform,
+      this.#environmentValue("PATH") ?? "",
+      this.#environmentValue("PATHEXT") ?? "",
+      candidates,
+    ]);
     try {
+      const cached = await this.#executableCache?.lookup(cacheKey);
+      if (cached !== undefined) return { status: "ok", value: cached.value };
       for (const candidate of candidates) {
         const executablePath = await this.#findExecutable(candidate);
         if (executablePath === null) continue;
-        return {
-          status: "ok",
-          value: {
-            executableName: normalizedExecutableName(candidate),
-            executablePathDigest: digest(executablePath),
-            version: await readVersion(executablePath),
-          },
+        const value = {
+          executableName: normalizedExecutableName(candidate),
+          executablePathDigest: digest(executablePath),
+          version: await readVersion(executablePath),
         };
+        await this.#executableCache?.remember(cacheKey, value, executablePath);
+        return { status: "ok", value };
       }
+      await this.#executableCache?.remember(cacheKey, null, null);
       return { status: "ok", value: null };
     } catch (error) {
       return probeFailure(error, "Executable inspection");
@@ -158,16 +259,19 @@ export class SystemEvidenceProvider implements HostEvidenceProvider {
     }
   }
 
-  async #findExecutable(candidate: string): Promise<string | null> {
-    const environmentValue = (name: string) => this.#environment[name] ?? (
+  #environmentValue(name: string): string | undefined {
+    return this.#environment[name] ?? (
       this.#platform === "win32"
         ? Object.entries(this.#environment).find(([key]) => key.toUpperCase() === name)?.[1]
         : undefined
     );
-    const pathValue = environmentValue("PATH") ?? "";
+  }
+
+  async #findExecutable(candidate: string): Promise<string | null> {
+    const pathValue = this.#environmentValue("PATH") ?? "";
     const extensions =
       this.#platform === "win32"
-        ? (environmentValue("PATHEXT") ?? ".EXE;.CMD;.BAT")
+        ? (this.#environmentValue("PATHEXT") ?? ".EXE;.CMD;.BAT")
             .split(";")
             .filter(Boolean)
         : [""];

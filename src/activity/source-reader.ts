@@ -72,13 +72,64 @@ export type ActivitySourceCheckpoint = Readonly<{
   cursors: ReadonlyMap<string, number>;
 }>;
 
+type FileIdentity = Readonly<{
+  size: number;
+  dev: number;
+  ino: number;
+  birthtimeMs: number;
+}>;
+
 type SourceFile = Readonly<{
   adapterId: string;
   sourceDisplayName?: string;
   root: string;
   path: string;
   modifiedMs: number;
+  /** Listing-time metadata; lets an unchanged live file be skipped. */
+  identity?: FileIdentity;
 }>;
+
+type CanonicalSourcePath = Readonly<{
+  path: string;
+  identity: string;
+}>;
+
+/**
+ * Source cursors in least-recently-used order, so a full store evicts the
+ * cursors of sessions nobody reads any more instead of live ones (an
+ * evicted live cursor is re-baselined after a restart, which skips what
+ * was written while the observer was stopped). Reads are only recorded and
+ * applied by `settle`, so iterating the map never observes reordering.
+ */
+class RecentCursors extends Map<string, number> {
+  readonly #used = new Set<string>();
+
+  override get(key: string): number | undefined {
+    const value = super.get(key);
+    if (value !== undefined) this.#used.add(key);
+    return value;
+  }
+
+  override set(key: string, value: number): this {
+    super.delete(key);
+    return super.set(key, value);
+  }
+
+  /** Move cursors read since the last call to the recent end, then bound. */
+  settle(limit: number): void {
+    for (const key of this.#used) {
+      const value = super.get(key);
+      if (value === undefined) continue;
+      super.delete(key);
+      super.set(key, value);
+    }
+    this.#used.clear();
+    for (const key of super.keys()) {
+      if (this.size <= limit) break;
+      super.delete(key);
+    }
+  }
+}
 
 export class ActivityCursorStore {
   readonly #dataDirectory: string;
@@ -123,7 +174,8 @@ export class ActivityCursorStore {
     ) {
       throw new Error("Activity cursor state is invalid.");
     }
-    const entries = Object.entries(value.files).slice(0, maxCursorEntries);
+    // Saved oldest-first (see save); keep the most recently used cursors.
+    const entries = Object.entries(value.files).slice(-maxCursorEntries);
     const result = new Map<string, number>();
     for (const [key, offset] of entries) {
       if (
@@ -141,10 +193,10 @@ export class ActivityCursorStore {
   async save(cursors: ReadonlyMap<string, number>): Promise<void> {
     await mkdir(this.#dataDirectory, { recursive: true, mode: 0o700 });
     await makeDirectoryPrivate(this.#dataDirectory);
+    // Keep the map's order (least recently used first) so a restarted
+    // reader still knows which cursors are stale.
     const files = Object.fromEntries(
-      [...cursors.entries()]
-        .slice(-maxCursorEntries)
-        .sort(([left], [right]) => left.localeCompare(right)),
+      [...cursors.entries()].slice(-maxCursorEntries),
     );
     const state: CursorState = { version: 1, files };
     const temporary = `${this.#path}.${process.pid}.${randomUUID()}.tmp`;
@@ -174,11 +226,18 @@ export class JSONLSourceReader {
   readonly #initialReplayBytes: number;
   readonly #initialReplaySessions: number;
   readonly #mode: SourceReaderMode;
-  #cursors: Map<string, number> | undefined;
+  #cursors: RecentCursors | undefined;
+  // The cursor state that is already durable. An idle scan produces an
+  // identical checkpoint every tick; rewriting and flushing it would cost a
+  // synchronous disk write per scan interval without changing anything.
+  #savedCursors: ReadonlyMap<string, number> | undefined;
   #initialScanComplete = false;
   #generation = 0;
   #committedGeneration = 0;
   #sourceCache: { key: string; at: number; files: SourceFile[] } | undefined;
+  // Canonical paths from the previous listing, keyed by resolved root and
+  // listed path. Holds only files seen in the latest listing.
+  #canonicalPaths = new Map<string, CanonicalSourcePath>();
   readonly #completedHistoryFiles = new Map<string, number>();
   // Cursors that stopped inside a record above the line limit. The next read
   // skips to that record's end instead of parsing its tail as a new record.
@@ -212,7 +271,12 @@ export class JSONLSourceReader {
       complete: boolean;
     }>
   > {
-    this.#cursors ??= await this.#cursorStore.load();
+    if (this.#cursors === undefined) {
+      const loaded = await this.#cursorStore.load();
+      this.#cursors = new RecentCursors();
+      for (const [key, offset] of loaded) this.#cursors.set(key, offset);
+      this.#savedCursors = loaded;
+    }
     const records: SourceRecord[] = [];
     let fileCount = 0;
     let malformed = 0;
@@ -222,6 +286,7 @@ export class JSONLSourceReader {
     if (this.#mode === "history" && this.#sourceCache?.key === cacheKey && Date.now() - this.#sourceCache.at < 5_000) {
       candidates = this.#sourceCache.files;
     } else {
+    const canonicalPaths = new Map<string, CanonicalSourcePath>();
     for (const source of sources) {
       if (source.format !== undefined && source.format !== "jsonl") continue;
       const pathPattern = source.pathPattern === undefined
@@ -230,6 +295,7 @@ export class JSONLSourceReader {
       for (const configuredRoot of source.roots) {
         const root = expandedActivityRoot(configuredRoot);
         const rootFiles = await listJSONLFiles(root);
+        let rootReal: string | undefined;
         for (const file of rootFiles) {
           if (
             pathPattern !== undefined &&
@@ -239,7 +305,21 @@ export class JSONLSourceReader {
           }
           let canonicalPath: string;
           try {
-            canonicalPath = await realpath(file.path);
+            // The listing never follows links, so a listed file keeps its
+            // canonical path while its root resolves to the same place and
+            // the file keeps its identity. Resolve each file only once.
+            rootReal ??= await realpath(root);
+            const key = `${rootReal}\u0000${file.path}`;
+            const identity = fileIdentityKey(file.identity);
+            const known = this.#canonicalPaths.get(key);
+            canonicalPath =
+              known !== undefined && identity !== undefined &&
+                known.identity === identity
+                ? known.path
+                : await realpath(file.path);
+            if (identity !== undefined) {
+              canonicalPaths.set(key, { path: canonicalPath, identity });
+            }
           } catch (error) {
             if (isTransientSourceError(error)) continue;
             throw error;
@@ -252,6 +332,7 @@ export class JSONLSourceReader {
             root,
             path: canonicalPath,
             modifiedMs: file.modifiedMs,
+            identity: file.identity,
           });
           if (candidates.length > maxCursorEntries * 2) {
             candidates = reconciledSourceFiles(candidates);
@@ -262,6 +343,7 @@ export class JSONLSourceReader {
       }
     }
     this.#sourceCache = { key: cacheKey, at: Date.now(), files: candidates };
+    this.#canonicalPaths = canonicalPaths;
     }
     const recentCandidates = reconciledSourceFiles(candidates)
       .sort(recentFileFirst)
@@ -291,13 +373,21 @@ export class JSONLSourceReader {
     const reservedDatabaseRecords = sources.some((source) => source.format === "opencode-sqlite")
       ? Math.floor(remainingRecords / 2)
       : 0;
+    const rootRealPaths = new Map<string, string>();
     for (const file of selected) {
       if (remainingRecords <= reservedDatabaseRecords) break;
+      if (this.#unchangedLiveFile(file)) {
+        fileCount++;
+        continue;
+      }
       let result;
       try {
+        const rootReal = rootRealPaths.get(file.root) ??
+          await realpath(file.root);
+        rootRealPaths.set(file.root, rootReal);
         result = await this.#readFile(
           file.adapterId,
-          file.root,
+          rootReal,
           file.path,
           replayFiles.has(file.path),
           file.sourceDisplayName,
@@ -416,6 +506,7 @@ export class JSONLSourceReader {
       sqliteComplete = sqliteComplete && sqlite.complete;
     }
     this.#initialScanComplete = true;
+    this.#cursors.settle(maxCursorEntries);
     const checkpoint = Object.freeze({
       generation: ++this.#generation,
       cursors: new Map(this.#cursors),
@@ -440,13 +531,33 @@ export class JSONLSourceReader {
     if (checkpoint.generation > this.#generation) {
       throw new Error("Activity source checkpoint is invalid.");
     }
-    await this.#cursorStore.save(checkpoint.cursors);
+    if (
+      this.#savedCursors === undefined ||
+      !sameCursors(checkpoint.cursors, this.#savedCursors)
+    ) {
+      await this.#cursorStore.save(checkpoint.cursors);
+      this.#savedCursors = checkpoint.cursors;
+    }
     this.#committedGeneration = checkpoint.generation;
+  }
+
+  /**
+   * A live file whose listed size equals its cursor has nothing to read:
+   * reading it would resolve, stat and find zero bytes. Its identity comes
+   * from the listing done in the same scan, so growth is never missed.
+   */
+  #unchangedLiveFile(file: SourceFile): boolean {
+    if (this.#mode !== "live" || file.identity === undefined) return false;
+    const cursorId = fileCursorId(file.path, file.identity);
+    return (
+      this.#cursors?.get(cursorId) === file.identity.size &&
+      !this.#oversizedContinuations.has(cursorId)
+    );
   }
 
   async #readFile(
     adapterId: string,
-    root: string,
+    rootReal: string,
     file: string,
     initialReplay: boolean,
     sourceDisplayName?: string,
@@ -459,7 +570,6 @@ export class JSONLSourceReader {
       processedRecords: number;
     }>
   > {
-    const rootReal = await realpath(root);
     const fileReal = await realpath(file);
     if (!isWithin(rootReal, fileReal)) {
       return { records: [], malformed: 0, oversized: 0, processedRecords: 0 };
@@ -658,9 +768,15 @@ export function expandedActivityRoot(root: string): string {
   return root;
 }
 
+type ListedFile = Readonly<{
+  path: string;
+  modifiedMs: number;
+  identity: FileIdentity;
+}>;
+
 async function listJSONLFiles(
   root: string,
-): Promise<Array<Readonly<{ path: string; modifiedMs: number }>>> {
+): Promise<ListedFile[]> {
   let metadata;
   try {
     metadata = await stat(root);
@@ -676,7 +792,7 @@ async function listJSONLFiles(
     throw error;
   }
   if (!metadata.isDirectory()) return [];
-  const result: Array<Readonly<{ path: string; modifiedMs: number }>> = [];
+  const result: ListedFile[] = [];
   const walk = async (directory: string, depth: number): Promise<void> => {
     if (depth > maxDirectoryDepth) return;
     let entries;
@@ -703,7 +819,16 @@ async function listJSONLFiles(
       ) {
         try {
           const metadata = await stat(path);
-          result.push({ path, modifiedMs: metadata.mtimeMs });
+          result.push({
+            path,
+            modifiedMs: metadata.mtimeMs,
+            identity: {
+              size: metadata.size,
+              dev: metadata.dev,
+              ino: metadata.ino,
+              birthtimeMs: metadata.birthtimeMs,
+            },
+          });
           if (result.length > maxCursorEntries * 2) {
             result.sort(recentFileFirst);
             result.length = maxCursorEntries;
@@ -810,6 +935,9 @@ function reconciledSourceFile(claims: readonly SourceFile[]): SourceFile {
     root: representative.root,
     path: representative.path,
     modifiedMs: Math.max(...ordered.map((claim) => claim.modifiedMs)),
+    ...(representative.identity === undefined
+      ? {}
+      : { identity: representative.identity }),
   };
 }
 
@@ -821,9 +949,18 @@ function compareSourceClaim(left: SourceFile, right: SourceFile): number {
     left.root.localeCompare(right.root);
 }
 
+function fileIdentityKey(
+  identity: FileIdentity | undefined,
+): string | undefined {
+  if (identity === undefined || (identity.ino <= 0 && identity.dev <= 0)) {
+    return undefined;
+  }
+  return `${identity.dev}:${identity.ino}:${identity.birthtimeMs}`;
+}
+
 function fileCursorId(
   path: string,
-  metadata: Awaited<ReturnType<typeof stat>>,
+  metadata: Readonly<{ dev: number; ino: number; birthtimeMs: number }>,
 ): string {
   const identity =
     metadata.ino > 0 || metadata.dev > 0
@@ -847,6 +984,17 @@ function newestFilesPerAdapter(
     selected.add(file.path);
   }
   return selected;
+}
+
+function sameCursors(
+  left: ReadonlyMap<string, number>,
+  right: ReadonlyMap<string, number>,
+): boolean {
+  if (left.size !== right.size) return false;
+  for (const [key, offset] of left) {
+    if (right.get(key) !== offset) return false;
+  }
+  return true;
 }
 
 function isWithin(root: string, candidate: string): boolean {

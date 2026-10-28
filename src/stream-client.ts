@@ -134,6 +134,7 @@ export class ObserverStreamClient {
   #latestInventory: AgentInventory | undefined;
   #sendInventory: ((inventory: AgentInventory) => void) | undefined;
   #readySequence: bigint | undefined;
+  #establishedSinceConnect = false;
   readonly #readyWaiters = new Set<(sequence: bigint) => void>();
   readonly #handshakeTimeoutMs: number;
   readonly #responseTimeoutMs: number;
@@ -202,8 +203,10 @@ export class ObserverStreamClient {
   }
 
   async run(signal: AbortSignal): Promise<void> {
-    let backoffMs = 250;
+    const initialBackoffMs = 250;
+    let backoffMs = initialBackoffMs;
     while (!signal.aborted) {
+      this.#establishedSinceConnect = false;
       try {
         await this.#connectOnce(signal);
         if (!signal.aborted) throw new Error("The telemetry server closed the connection.");
@@ -213,6 +216,10 @@ export class ObserverStreamClient {
           throw new Error("Machine credential was rejected. Generate a new pairing code in your workspace and pair again; keep the existing data directory.");
         }
         if (error instanceof PermanentTelemetryError) throw error;
+        // A connection that completed its handshake ends the outage; the
+        // next disconnect (for example a server restart) retries promptly
+        // instead of inheriting the longest delay of an earlier outage.
+        if (this.#establishedSinceConnect) backoffMs = initialBackoffMs;
         this.#reconnects++;
         this.#onStatus(
           `Telemetry disconnected (${telemetryErrorSummary(error)}); ` +
@@ -481,15 +488,33 @@ export class ObserverStreamClient {
           reject(new Error("Telemetry handshake timed out. Check the workspace gRPC endpoint, HTTP/2 proxy support, and firewall."));
           stream.cancel();
         }, this.#handshakeTimeoutMs);
+        // The server acknowledges every event. Persisting each one would
+        // queue a flushed file replace per event behind the previous one;
+        // only the newest acknowledgement matters, so while one save runs
+        // later acknowledgements collapse into a single follow-up save.
+        let queuedAcknowledgement:
+          | Readonly<{ sequence: bigint; commitSourceCheckpoint: boolean }>
+          | undefined;
         const persistAcknowledgement = (
           sequence: bigint,
           commitSourceCheckpoint: boolean,
         ) => {
+          const alreadyQueued = queuedAcknowledgement !== undefined;
+          queuedAcknowledgement = {
+            sequence,
+            commitSourceCheckpoint:
+              commitSourceCheckpoint ||
+              (queuedAcknowledgement?.commitSourceCheckpoint ?? false),
+          };
+          if (alreadyQueued) return;
           const pendingSave = saveState.then(async () => {
-            if (commitSourceCheckpoint) {
-              await this.#onAcknowledgement(sequence);
+            const next = queuedAcknowledgement;
+            queuedAcknowledgement = undefined;
+            if (next === undefined) return;
+            if (next.commitSourceCheckpoint) {
+              await this.#onAcknowledgement(next.sequence);
             }
-            await this.#stateStore.save(credential.machineId, sequence);
+            await this.#stateStore.save(credential.machineId, next.sequence);
           });
           saveState = pendingSave;
           void pendingSave.catch((error: unknown) => {
@@ -796,6 +821,7 @@ export class ObserverStreamClient {
   }
 
   #markReady(sequence: bigint): void {
+    this.#establishedSinceConnect = true;
     this.#readySequence = sequence;
     for (const ready of this.#readyWaiters) ready(sequence);
     this.#readyWaiters.clear();

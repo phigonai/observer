@@ -968,6 +968,97 @@ test("observer persists a terminally quarantined last event", async () => {
   }
 });
 
+test("per-event acknowledgements are persisted in coalesced order without a write per event", async () => {
+  const dataDirectory = await mkdtemp(join(tmpdir(), "phigon-stream-"));
+  const machineId = "5f1b4cb4-a77d-4f53-af66-197e184683f4";
+  const server = new Server();
+  const controller = new AbortController();
+  const total = 200;
+  const committed: bigint[] = [];
+  const saved: bigint[] = [];
+  const order: string[] = [];
+  let concurrentSaves = 0;
+  let maxConcurrentSaves = 0;
+  const queue = new BoundedEventQueue<EventEnvelope>(total);
+  for (let index = 1; index <= total; index++) {
+    queue.enqueue(lifecycleEvent(machineId, BigInt(index)), BigInt(index));
+  }
+  server.addService(observerServiceDefinition, {
+    streamTelemetry(
+      call: ServerDuplexStream<StreamTelemetryRequest, StreamTelemetryResponse>,
+    ) {
+      call.on("data", (request: StreamTelemetryRequest) => {
+        if (request.payload.case === "resume") {
+          call.write(policySnapshot(machineId));
+          call.write(acknowledgement(machineId, 0n));
+          return;
+        }
+        // The control plane acknowledges every accepted event.
+        if (request.payload.case === "event") {
+          call.write(acknowledgement(machineId, request.payload.value.sequence));
+        }
+      });
+      call.on("end", () => call.end());
+    },
+  });
+  const port = await bindServer(server);
+  const client = new ObserverStreamClient({
+    config: streamConfig(dataDirectory, port),
+    credentialStore: testCredentialStore(machineId),
+    stateStore: {
+      load: async () => ({
+        machineId,
+        acknowledgedSequence: 0n,
+        updatedAt: new Date(0).toISOString(),
+      }),
+      save: async (_machineId, sequence) => {
+        concurrentSaves++;
+        maxConcurrentSaves = Math.max(maxConcurrentSaves, concurrentSaves);
+        // A flushed atomic replace takes milliseconds on a real disk.
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        concurrentSaves--;
+        saved.push(sequence);
+        order.push(`save ${sequence}`);
+        if (sequence === BigInt(total)) controller.abort();
+      },
+    },
+    queue,
+    onAcknowledgement: (sequence) => {
+      committed.push(sequence);
+      order.push(`commit ${sequence}`);
+    },
+  });
+  const deadline = setTimeout(() => controller.abort(), 10_000);
+  try {
+    await client.run(controller.signal);
+    assert.equal(client.metrics().lastAcknowledgedSequence, BigInt(total));
+    assert.equal(queue.metrics().depth, 0);
+    assert.equal(saved.at(-1), BigInt(total));
+    assert.equal(committed.at(-1), BigInt(total));
+    assert.equal(maxConcurrentSaves, 1);
+    for (const values of [saved, committed]) {
+      for (let index = 1; index < values.length; index++) {
+        assert.ok((values[index] ?? 0n) > (values[index - 1] ?? 0n));
+      }
+    }
+    // Each saved cursor follows its source checkpoint commit.
+    for (const sequence of saved) {
+      assert.ok(
+        order.indexOf(`commit ${sequence}`) < order.indexOf(`save ${sequence}`),
+      );
+    }
+    assert.ok(
+      saved.length < total / 4,
+      `expected coalesced cursor writes, saw ${saved.length} for ${total} acknowledgements`,
+    );
+  } finally {
+    clearTimeout(deadline);
+    controller.abort();
+    await shutdownServer(server);
+    await rm(dataDirectory, { recursive: true, force: true });
+  }
+});
+
 test("observer bounds in-flight events by count when sequences contain gaps", async () => {
   const dataDirectory = await mkdtemp(join(tmpdir(), "phigon-stream-"));
   const machineId = "5f1b4cb4-a77d-4f53-af66-197e184683f4";
@@ -1293,6 +1384,37 @@ test("a clean server disconnect uses reconnect backoff instead of a busy loop", 
     await client.run(controller.signal);
     assert.ok(connections >= 1 && connections <= 3, `unexpected reconnect count ${connections}`);
     assert.ok(messages.some(message => message.includes("retrying in")));
+  } finally { clearTimeout(deadline); controller.abort(); server.forceShutdown(); await rm(directory, { recursive:true, force:true }); }
+});
+
+test("reconnect backoff starts over after a connection completed its handshake", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-backoff-reset-"));
+  const machineId = "5f1b4cb4-a77d-4f53-af66-197e184683f4";
+  const server = new Server(); const controller = new AbortController();
+  let connections = 0; const retries: number[] = [];
+  server.addService(observerServiceDefinition, { streamTelemetry(call: ServerDuplexStream<StreamTelemetryRequest, StreamTelemetryResponse>) {
+    connections++;
+    // Two failed attempts grow the backoff; the third connection is healthy
+    // and then closes, as a restarting control plane would.
+    if (connections <= 2) { call.resume(); call.end(); return; }
+    call.on("data", (request: StreamTelemetryRequest) => {
+      if (request.payload.case !== "resume") return;
+      call.write(policySnapshot(machineId)); call.write(acknowledgement(machineId, 0n));
+      setTimeout(() => call.end(), 50);
+    });
+  } });
+  const port = await bindServer(server);
+  const client = new ObserverStreamClient({ config:streamConfig(directory, port), credentialStore:testCredentialStore(machineId), queue:new BoundedEventQueue<EventEnvelope>(8),
+    onStatus: message => {
+      const delay = /retrying in (\d+)ms/u.exec(message)?.[1];
+      if (delay === undefined) return;
+      retries.push(Number(delay));
+      if (retries.length === 3) controller.abort();
+    } });
+  const deadline = setTimeout(() => controller.abort(), 8_000);
+  try {
+    await client.run(controller.signal);
+    assert.deepEqual(retries, [250, 500, 250]);
   } finally { clearTimeout(deadline); controller.abort(); server.forceShutdown(); await rm(directory, { recursive:true, force:true }); }
 });
 
