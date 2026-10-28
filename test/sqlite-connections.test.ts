@@ -6,15 +6,20 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { scanGooseSQLiteSources } from "../src/activity/goose-sqlite-source.js";
+import { settleMilliseconds } from "../src/activity/opencode-message-tables.js";
 import { scanOpenCodeSQLiteSources } from "../src/activity/opencode-sqlite-source.js";
 import { JSONLSourceReader } from "../src/activity/source-reader.js";
 import { SQLiteConnections } from "../src/activity/sqlite-connections.js";
 
 const baseTime = 1_785_686_000_000;
 
-/** Connections that count opens and record every statement prepared. */
+/**
+ * Connections that count opens, record every statement prepared and count
+ * the rows each `all()` returns.
+ */
 class CountingConnections extends SQLiteConnections {
   readonly #prepared: string[] = [];
+  readonly #results: Array<readonly [string, number]> = [];
   opened = 0;
 
   override check(
@@ -25,6 +30,7 @@ class CountingConnections extends SQLiteConnections {
     open: (path: string) => DatabaseSync,
   ) {
     const prepared = this.#prepared;
+    const results = this.#results;
     return super.check(root, path, metadata, cursors, (databasePath) => {
       this.opened++;
       return new Proxy(open(databasePath), {
@@ -32,7 +38,20 @@ class CountingConnections extends SQLiteConnections {
           if (property === "prepare") {
             return (sql: string) => {
               prepared.push(sql);
-              return target.prepare(sql);
+              const statement = target.prepare(sql);
+              return new Proxy(statement, {
+                get(inner, key) {
+                  const value: unknown = Reflect.get(inner, key);
+                  if (key === "all" && typeof value === "function") {
+                    return (...parameters: unknown[]) => {
+                      const rows = value.apply(inner, parameters) as unknown[];
+                      results.push([sql, rows.length]);
+                      return rows;
+                    };
+                  }
+                  return typeof value === "function" ? value.bind(inner) : value;
+                },
+              });
             };
           }
           const value: unknown = Reflect.get(target, property);
@@ -45,6 +64,13 @@ class CountingConnections extends SQLiteConnections {
   /** The statements prepared since the previous call. */
   take(): string[] {
     return this.#prepared.splice(0);
+  }
+
+  /** Rows returned since the previous call by queries matching `pattern`. */
+  takeRows(pattern: RegExp): number {
+    return this.#results.splice(0)
+      .filter(([sql]) => pattern.test(sql))
+      .reduce((total, [, rows]) => total + rows, 0);
   }
 }
 
@@ -83,6 +109,18 @@ function addOpenCodeEvent(database: DatabaseSync, session: string): number {
     .run(baseTime + sequence, session);
   database.exec("COMMIT");
   return sequence;
+}
+
+/** OpenCode's message and part tables, with a session that has no event rows. */
+function addOpenCodeTables(database: DatabaseSync, session: string): void {
+  database.exec(
+    "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, " +
+    "time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);" +
+    "CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL, " +
+    "time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);",
+  );
+  database.prepare("INSERT INTO session (id, time_updated) VALUES (?, ?)").run(session, baseTime);
+  database.prepare("INSERT INTO event_sequence (aggregate_id, seq) VALUES (?, 40)").run(session);
 }
 
 function gooseDatabase(path: string): DatabaseSync {
@@ -452,6 +490,74 @@ test("a live reader closes the connection of a database it no longer reads", asy
     await reader.scan([source]);
   } finally {
     reader.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("an idle OpenCode tick reads no message or part rows, even while it waits for one", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-sqlite-tables-idle-"));
+  const root = join(directory, "opencode");
+  await mkdir(root);
+  const path = join(root, "opencode.db");
+  const writer = openCodeDatabase(path);
+  addOpenCodeTables(writer, "ses_rows");
+  // One clock for the scan and its connections, moved by hand below.
+  let now = Date.now();
+  const clock = () => now;
+  const connections = new CountingConnections({ clock });
+  const cursors = new Map<string, number>();
+  const scan = (initialScan = false) => scanOpenCodeSQLiteSources({
+    adapterId: "opencode",
+    roots: [root],
+    cursors,
+    initialScan,
+    replayOnFirstStart: false,
+    maxReplayRecords: 64,
+    connections,
+    clock,
+  });
+  const tableRows = /FROM (message|part) t\b/u;
+  try {
+    assert.deepEqual((await scan(true)).records, []);
+    assert.deepEqual((await scan()).records, []);
+    connections.take();
+    connections.takeRows(tableRows);
+
+    // Unchanged: answered by data_version alone.
+    assert.deepEqual((await scan()).records, []);
+    assert.deepEqual(connections.take(), ["PRAGMA data_version"]);
+
+    // A commit that adds no message or part row (OpenCode 2 writes other
+    // tables) runs one full scan that reads no row, then is idle again.
+    writer.prepare("UPDATE session SET time_updated = time_updated + 1").run();
+    assert.deepEqual((await scan()).records, []);
+    assert.equal(connections.takeRows(tableRows), 0);
+    assert.ok(connections.take().length <= 12, "a full scan prepares a bounded set of statements");
+    assert.deepEqual((await scan()).records, []);
+    assert.deepEqual(connections.take(), ["PRAGMA data_version"]);
+
+    // An unfinished reply is waited for without rescanning an unchanged
+    // database, until its rows settle.
+    const updated = now - settleMilliseconds + 1_000;
+    writer.prepare("INSERT INTO message VALUES ('msg_wait', 'ses_rows', ?, ?, ?)")
+      .run(updated, updated, JSON.stringify({ role: "assistant", time: { created: updated } }));
+    writer.prepare("INSERT INTO part VALUES ('part_wait', 'msg_wait', 'ses_rows', ?, ?, ?)")
+      .run(updated, updated, JSON.stringify({ type: "text", text: "Working", time: { start: updated } }));
+    assert.deepEqual((await scan()).records, []);
+    assert.deepEqual((await scan()).records, []);
+    connections.take();
+    assert.deepEqual((await scan()).records, []);
+    assert.deepEqual(connections.take(), ["PRAGMA data_version"]);
+    now = updated + settleMilliseconds;
+    const settled = await scan();
+    assert.deepEqual(
+      settled.records.map((record) => (record.value as { type: string }).type),
+      ["message.updated.1", "message.part.updated.1"],
+    );
+    assert.deepEqual((await scan()).records, []);
+  } finally {
+    connections.closeAll();
+    writer.close();
     await rm(directory, { recursive: true, force: true });
   }
 });

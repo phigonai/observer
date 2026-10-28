@@ -2,6 +2,12 @@ import { createHash } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
 import { join, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import {
+  historyTableRows,
+  liveTableRows,
+  type TableScan,
+  tableColumns,
+} from "./opencode-message-tables.js";
 import type { SourceRecord } from "./source-reader.js";
 import { type CompletedHistory, databaseSignature, type IdleCursors, type SQLiteConnections } from "./sqlite-connections.js";
 
@@ -24,6 +30,8 @@ type ScanOptions = Readonly<{
   connections?: SQLiteConnections;
   /** History only: databases already read to the end. */
   completedHistory?: CompletedHistory;
+  /** The time in milliseconds, for deciding when a row has settled. */
+  clock?: () => number;
 }>;
 
 type SessionSequence = Readonly<{
@@ -111,17 +119,43 @@ async function scanDatabase(
     const sessions = readSessionSequences(database, options.historical ? -1 : maxTrackedSessions);
     const marker = cursorID(databaseReal, "initialized");
     const firstDatabaseScan = options.cursors.get(marker) !== 1;
+    // Sessions without event rows exist only in the message and part tables
+    // (see opencode-message-tables.ts). Each row is read from one place: its
+    // session's events when it has any, else the tables.
+    const columns = tableColumns(database);
+    const tableContext = (found: NonNullable<typeof columns>, limit: number) => ({
+      database,
+      columns: found,
+      cursors: options.cursors,
+      key: (scope: string) => cursorID(databaseReal, scope),
+      now: (options.clock ?? Date.now)(),
+      limit: Math.max(0, limit),
+    });
     let rows: Array<Readonly<{ sessionID: string; row: EventRow }>> = [];
+    let tables: TableScan | undefined;
+    let eventsComplete = true;
     let idle: IdleCursors | undefined;
 
     if (options.historical) {
-      rows = unreadRows(
+      const unread = unreadEvents(
         database,
         databaseReal,
         sessions,
         options.cursors,
         options.maxReplayRecords,
       );
+      rows = unread.rows;
+      eventsComplete = unread.exhausted;
+      if (columns !== undefined) {
+        tables = historyTableRows({
+          ...tableContext(columns, options.maxReplayRecords - rows.length),
+          // A history cursor is set only by delivering events, so a session
+          // stays with its event log even once OpenCode deletes those events.
+          deliveredByEvents: (sessionID) =>
+            options.cursors.get(cursorID(databaseReal, sessionID)) !== undefined,
+          importedParts: options.cursors.get(cursorID(databaseReal, "legacy-parts")) ?? 0,
+        });
+      }
       options.cursors.set(marker, 1);
     } else if (firstDatabaseScan) {
       if (options.initialScan && options.replayOnFirstStart) {
@@ -140,38 +174,66 @@ async function scanDatabase(
           session.maxSequence,
         );
       }
+      if (columns !== undefined) {
+        const limit = options.maxReplayRecords - rows.length;
+        tables = liveTableRows({
+          ...tableContext(columns, limit),
+          replay: options.initialScan && options.replayOnFirstStart ? limit : 0,
+        });
+      }
       options.cursors.set(marker, 1);
     } else {
+      const limit = Math.min(maxDatabaseEventsPerScan, options.maxReplayRecords);
       const unread = unreadEvents(
         database,
         databaseReal,
         sessions.slice(0, maxLiveSessionsPerScan),
         options.cursors,
-        Math.min(maxDatabaseEventsPerScan, options.maxReplayRecords),
+        limit,
       );
       rows = unread.rows;
-      if (unread.selected === 0) {
+      if (columns !== undefined) {
+        tables = liveTableRows({ ...tableContext(columns, limit - rows.length), replay: 0 });
+      }
+      if (unread.selected === 0 && (columns === undefined || tables?.idle !== undefined)) {
         // No session had any row past its cursor, so the row limit did not
-        // matter: the same database and cursors give the same empty scan.
-        idle = [[marker, 1], ...unread.cursors];
+        // matter: the same database and cursors give the same empty scan,
+        // until a row the tables wait for settles.
+        idle = [[marker, 1], ...unread.cursors, ...tables?.idle ?? []];
       }
     }
 
     const sourceID = `ses_${digest(databaseReal).slice(0, 32)}`;
-    // Older OpenCode conversations can exist only in message/part tables.
-    // Import those snapshots as well; event-backed sessions retain their
-    // original event log and are deliberately excluded from this fallback.
-    const legacy = options.historical
-      ? legacyRows(database, databaseReal, options.cursors, Math.max(0, options.maxReplayRecords - rows.length))
-      : { rows: [], complete: true };
-    rows.push(...legacy.rows);
-    const hasMessages = database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='message'").get() !== undefined;
+    const hasMessages = columns !== undefined ||
+      database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='message'").get() !== undefined;
     const messageLookup = hasMessages
       ? database.prepare("SELECT id, session_id, data FROM message WHERE id = ? AND session_id = ?")
       : undefined;
     const records: SourceRecord[] = [];
-    let malformed = 0;
-    let oversized = 0;
+    let malformed = tables?.malformed ?? 0;
+    let oversized = tables?.oversized ?? 0;
+    const record = (
+      sessionID: string,
+      key: string,
+      type: string,
+      parsed: Record<string, unknown>,
+      messageInfo: Readonly<Record<string, string>> | undefined,
+    ): SourceRecord => {
+      const observedAt = eventObservedAt(parsed, metadata.mtime);
+      return {
+        adapterId: options.adapterId,
+        sourceId: sourceID,
+        sourceRecordId: digest(`${databaseReal}\u0000${sessionID}\u0000${key}`),
+        observedAt,
+        initialReplay: options.historical === true,
+        value: {
+          ...parsed,
+          ...(messageInfo === undefined ? {} : { message_info: messageInfo }),
+          type,
+          timestamp: observedAt.getTime(),
+        },
+      };
+    };
     for (const item of rows) {
       if (Buffer.byteLength(item.row.data, "utf8") > maxRecordBytes) {
         oversized++;
@@ -183,7 +245,6 @@ async function scanDatabase(
           malformed++;
           continue;
         }
-        const observedAt = eventObservedAt(parsed, metadata.mtime);
         const part = isRecord(parsed["part"]) ? parsed["part"] : undefined;
         const messageID = part?.["messageID"];
         let messageInfo: Record<string, string> | undefined;
@@ -196,30 +257,17 @@ async function scanDatabase(
             }
           }
         }
-        records.push({
-          adapterId: options.adapterId,
-          sourceId: sourceID,
-          sourceRecordId: digest(
-            `${databaseReal}\u0000${item.sessionID}\u0000${item.row.sequence}`,
-          ),
-          observedAt,
-          initialReplay: options.historical === true,
-          value: {
-            ...parsed,
-            ...(messageInfo === undefined ? {} : { message_info: messageInfo }),
-            type: item.row.type,
-            timestamp: observedAt.getTime(),
-          },
-        });
+        records.push(record(item.sessionID, String(item.row.sequence), item.row.type, parsed, messageInfo));
       } catch {
         malformed++;
       }
     }
-    const complete = !options.historical || legacy.complete && sessions.every((session) =>
-      (options.cursors.get(cursorID(databaseReal, session.aggregateID)) ?? 0) >=
-        session.maxSequence
-    );
-    scan?.finish(idle);
+    // Table records carry the role their query joined, so no lookup.
+    for (const item of tables?.items ?? []) {
+      records.push(record(item.sessionID, item.key, item.type, item.value, item.messageInfo));
+    }
+    const complete = !options.historical || eventsComplete && (tables?.complete ?? true);
+    scan?.finish(idle, tables?.recheckAt);
     if (signature !== undefined && complete && records.length === 0) {
       options.completedHistory?.set(databaseReal, signature);
     }
@@ -243,36 +291,6 @@ function openDatabase(path: string): DatabaseSync {
   return database;
 }
 
-function legacyRows(
-  database: DatabaseSync,
-  databasePath: string,
-  cursors: Map<string, number>,
-  limit: number,
-): { rows: Array<{ sessionID: string; row: EventRow }>; complete: boolean } {
-  const tables = database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('message','part')").all();
-  if (tables.length !== 2) return { rows: [], complete: true };
-  const key = cursorID(databasePath, "legacy-parts");
-  const values = database.prepare(
-    "SELECT p.rowid AS row_id, p.id, p.session_id, p.message_id, p.data, p.time_updated " +
-    "FROM part p JOIN message m ON m.id=p.message_id AND m.session_id=p.session_id " +
-    "WHERE p.rowid > ? AND NOT EXISTS (SELECT 1 FROM event_sequence e WHERE e.aggregate_id=p.session_id) " +
-    "ORDER BY p.rowid LIMIT ?",
-  ).all(cursors.get(key) ?? 0, limit + 1);
-  const rows: Array<{ sessionID: string; row: EventRow }> = [];
-  for (const value of values.slice(0, limit)) {
-    if (typeof value["row_id"] !== "number" || typeof value["session_id"] !== "string") continue;
-    const part = typeof value["data"] === "string" ? parseObject(value["data"]) : undefined;
-    if (part !== undefined) rows.push({ sessionID: value["session_id"], row: {
-      sequence: -value["row_id"], type: "message.part.updated.1",
-      data: JSON.stringify({ sessionID: value["session_id"], time: value["time_updated"], part: {
-        ...part, id: value["id"], messageID: value["message_id"], sessionID: value["session_id"],
-      } }),
-    } });
-    cursors.set(key, value["row_id"]);
-  }
-  return { rows, complete: values.length <= limit };
-}
-
 function parseObject(value: string): Record<string, unknown> | undefined {
   try {
     const parsed: unknown = JSON.parse(value);
@@ -281,25 +299,15 @@ function parseObject(value: string): Record<string, unknown> | undefined {
 }
 
 /**
- * History rows past each session's cursor. A session with no event row past
- * its cursor is caught up: its cursor moves to the session's sequence
- * counter. OpenCode deletes events once it has applied them to its message
- * tables, so a counter can be far ahead of the newest event row, and without
- * this the import would never count that session as complete.
- */
-function unreadRows(
-  database: DatabaseSync,
-  databasePath: string,
-  sessions: readonly SessionSequence[],
-  cursors: Map<string, number>,
-  limit: number,
-): Array<Readonly<{ sessionID: string; row: EventRow }>> {
-  return unreadEvents(database, databasePath, sessions, cursors, limit, true).rows;
-}
-
-/**
  * Rows past each session's cursor, with what an idle check needs: how many
  * rows the queries selected, valid or not, and each cursor read in order.
+ * `exhausted` is true when every session was read to its last row.
+ *
+ * A cursor moves only past rows its query returned. A session's counter can
+ * be far ahead of its newest event row (OpenCode 2 deletes every event row
+ * when it first starts, and later bumps the counter without keeping rows),
+ * so a history import counts a session as read once its query comes back
+ * short, not once its cursor reaches the counter.
  */
 function unreadEvents(
   database: DatabaseSync,
@@ -307,21 +315,23 @@ function unreadEvents(
   sessions: readonly SessionSequence[],
   cursors: Map<string, number>,
   limit: number,
-  catchUp = false,
 ): Readonly<{
   rows: Array<Readonly<{ sessionID: string; row: EventRow }>>;
   selected: number;
   cursors: Array<readonly [string, number | undefined]>;
+  exhausted: boolean;
 }> {
   const result: Array<Readonly<{ sessionID: string; row: EventRow }>> = [];
   const read: Array<readonly [string, number | undefined]> = [];
   let selected = 0;
+  let visited = 0;
   const statement = database.prepare(
     "SELECT seq, type, data FROM event " +
       "WHERE aggregate_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
   );
   for (const session of sessions) {
     if (result.length >= limit) break;
+    visited++;
     const key = cursorID(databasePath, session.aggregateID);
     const saved = cursors.get(key);
     read.push([key, saved]);
@@ -340,9 +350,15 @@ function unreadEvents(
       result.push({ sessionID: session.aggregateID, row });
     }
     if (newestSequence > cursor) cursors.set(key, newestSequence);
-    else if (catchUp && rows.length === 0 && session.maxSequence > cursor) cursors.set(key, session.maxSequence);
   }
-  return { rows: result, selected, cursors: read };
+  return {
+    rows: result,
+    selected,
+    cursors: read,
+    // Each query asked for every row left in the limit, so a total below
+    // the limit means each one returned all it had.
+    exhausted: visited === sessions.length && selected < limit,
+  };
 }
 
 function replayRows(
