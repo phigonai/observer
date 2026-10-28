@@ -3,7 +3,7 @@ import { realpath, stat } from "node:fs/promises";
 import { join, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { SourceRecord } from "./source-reader.js";
-import type { IdleCursors, SQLiteConnections } from "./sqlite-connections.js";
+import { type CompletedHistory, databaseSignature, type IdleCursors, type SQLiteConnections } from "./sqlite-connections.js";
 
 const databaseName = "sessions.db";
 const maxRowsPerScan = 4_096;
@@ -20,6 +20,8 @@ type ScanOptions = Readonly<{
   historical: boolean;
   /** Connections a live reader keeps open between scans. */
   connections?: SQLiteConnections;
+  /** History only: databases already read to the end. */
+  completedHistory?: CompletedHistory;
 }>;
 
 type MessageRow = Readonly<{
@@ -92,6 +94,13 @@ async function scanDatabase(
   if (metadata?.isFile() !== true) {
     options.connections?.release(root);
     return empty;
+  }
+  // A history import skips a database it already read to the end.
+  const signature = options.historical && options.completedHistory !== undefined
+    ? await databaseSignature(databaseReal, metadata)
+    : undefined;
+  if (signature !== undefined && options.completedHistory?.get(databaseReal) === signature) {
+    return { ...empty, files: 1 };
   }
   // Only a live reader skips unchanged databases; see SQLiteConnections.
   const scan = options.historical
@@ -179,6 +188,9 @@ async function scanDatabase(
     }
     const delivered = options.cursors.get(cursorKey) ?? 0;
     scan?.finish(idle);
+    if (signature !== undefined && options.historical && delivered >= newest && records.length === 0) {
+      options.completedHistory?.set(databaseReal, signature);
+    }
     return {
       records,
       files: 1,

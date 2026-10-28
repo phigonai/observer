@@ -3,7 +3,7 @@ import { realpath, stat } from "node:fs/promises";
 import { join, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { SourceRecord } from "./source-reader.js";
-import type { IdleCursors, SQLiteConnections } from "./sqlite-connections.js";
+import { type CompletedHistory, databaseSignature, type IdleCursors, type SQLiteConnections } from "./sqlite-connections.js";
 
 const databaseName = "opencode.db";
 const maxDatabaseEventsPerScan = 4_096;
@@ -22,6 +22,8 @@ type ScanOptions = Readonly<{
   historical?: boolean;
   /** Connections a live reader keeps open between scans. */
   connections?: SQLiteConnections;
+  /** History only: databases already read to the end. */
+  completedHistory?: CompletedHistory;
 }>;
 
 type SessionSequence = Readonly<{
@@ -85,6 +87,13 @@ async function scanDatabase(
     return { records: [], files: 0, malformed: 0, oversized: 0, complete: true };
   }
 
+  // A history import skips a database it already read to the end.
+  const signature = options.historical === true && options.completedHistory !== undefined
+    ? await databaseSignature(databaseReal, metadata)
+    : undefined;
+  if (signature !== undefined && options.completedHistory?.get(databaseReal) === signature) {
+    return { records: [], files: 1, malformed: 0, oversized: 0, complete: true };
+  }
   // Only a live reader skips unchanged databases (see SQLiteConnections). A
   // history import opens one connection per bounded batch, as before.
   const scan = options.historical === true
@@ -211,6 +220,9 @@ async function scanDatabase(
         session.maxSequence
     );
     scan?.finish(idle);
+    if (signature !== undefined && complete && records.length === 0) {
+      options.completedHistory?.set(databaseReal, signature);
+    }
     return { records, files: 1, malformed, oversized, complete };
   } catch (error) {
     scan?.fail();
@@ -268,6 +280,13 @@ function parseObject(value: string): Record<string, unknown> | undefined {
   } catch { return undefined; }
 }
 
+/**
+ * History rows past each session's cursor. A session with no event row past
+ * its cursor is caught up: its cursor moves to the session's sequence
+ * counter. OpenCode deletes events once it has applied them to its message
+ * tables, so a counter can be far ahead of the newest event row, and without
+ * this the import would never count that session as complete.
+ */
 function unreadRows(
   database: DatabaseSync,
   databasePath: string,
@@ -275,7 +294,7 @@ function unreadRows(
   cursors: Map<string, number>,
   limit: number,
 ): Array<Readonly<{ sessionID: string; row: EventRow }>> {
-  return unreadEvents(database, databasePath, sessions, cursors, limit).rows;
+  return unreadEvents(database, databasePath, sessions, cursors, limit, true).rows;
 }
 
 /**
@@ -288,6 +307,7 @@ function unreadEvents(
   sessions: readonly SessionSequence[],
   cursors: Map<string, number>,
   limit: number,
+  catchUp = false,
 ): Readonly<{
   rows: Array<Readonly<{ sessionID: string; row: EventRow }>>;
   selected: number;
@@ -320,6 +340,7 @@ function unreadEvents(
       result.push({ sessionID: session.aggregateID, row });
     }
     if (newestSequence > cursor) cursors.set(key, newestSequence);
+    else if (catchUp && rows.length === 0 && session.maxSequence > cursor) cursors.set(key, session.maxSequence);
   }
   return { rows: result, selected, cursors: read };
 }
