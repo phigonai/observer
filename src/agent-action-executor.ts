@@ -187,10 +187,14 @@ export class AgentActionExecutor {
       RemoteActionResultState.EXPIRED,
     );
     let inventory: AgentInventory;
+    const untilExpiry = expiresAt - Date.now();
     try {
-      inventory = await withDeadline(this.#inventory(), Math.min(expiresAt - Date.now(), discoveryTimeoutMs));
-    } catch {
-      if (Date.now() >= expiresAt) return await expired();
+      inventory = await withDeadline(this.#inventory(), Math.min(untilExpiry, discoveryTimeoutMs));
+    } catch (error) {
+      // A timer can fire a millisecond before the clock reaches expiresAt, so
+      // a deadline set by the expiry counts as expiry even when Date.now() lags.
+      const expiryDeadline = untilExpiry <= discoveryTimeoutMs && error instanceof Error && error.message === "deadline_exceeded";
+      if (expiryDeadline || Date.now() >= expiresAt) return await expired();
       return await reject(
         "target_unverified",
         "The observer could not list running agents, so the target could not be verified. Nothing was signalled.",
