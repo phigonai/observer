@@ -3,6 +3,7 @@ import { realpath, stat } from "node:fs/promises";
 import { join, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { SourceRecord } from "./source-reader.js";
+import type { IdleCursors, SQLiteConnections } from "./sqlite-connections.js";
 
 const databaseName = "opencode.db";
 const maxDatabaseEventsPerScan = 4_096;
@@ -19,6 +20,8 @@ type ScanOptions = Readonly<{
   replayOnFirstStart: boolean;
   maxReplayRecords: number;
   historical?: boolean;
+  /** Connections a live reader keeps open between scans. */
+  connections?: SQLiteConnections;
 }>;
 
 type SessionSequence = Readonly<{
@@ -55,6 +58,7 @@ export async function scanOpenCodeSQLiteSources(
       oversized += result.oversized;
       complete = complete && result.complete;
     } catch (error) {
+      options.connections?.release(root);
       if (!isUnavailableDatabase(error)) throw error;
     }
   }
@@ -73,24 +77,33 @@ async function scanDatabase(
 }>> {
   const rootReal = await realpath(root);
   const databaseReal = await realpath(join(rootReal, databaseName));
-  if (!isWithin(rootReal, databaseReal)) {
-    return { records: [], files: 0, malformed: 0, oversized: 0, complete: true };
-  }
-  const metadata = await stat(databaseReal);
-  if (!metadata.isFile()) {
+  const metadata = isWithin(rootReal, databaseReal)
+    ? await stat(databaseReal)
+    : undefined;
+  if (metadata?.isFile() !== true) {
+    options.connections?.release(root);
     return { records: [], files: 0, malformed: 0, oversized: 0, complete: true };
   }
 
-  const database = new DatabaseSync(databaseReal, { readOnly: true });
+  // Only a live reader skips unchanged databases (see SQLiteConnections). A
+  // history import opens one connection per bounded batch, as before.
+  const scan = options.historical === true
+    ? undefined
+    : await options.connections?.check(root, databaseReal, metadata, options.cursors, openDatabase);
+  if (scan?.unchanged === true) {
+    return { records: [], files: 1, malformed: 0, oversized: 0, complete: true };
+  }
+  const database = scan?.database ?? openDatabase(databaseReal);
   try {
-    database.exec("PRAGMA query_only = ON; PRAGMA trusted_schema = OFF;");
     if (!hasSupportedSchema(database)) {
+      scan?.finish(undefined);
       return { records: [], files: 1, malformed: 1, oversized: 0, complete: true };
     }
     const sessions = readSessionSequences(database, options.historical ? -1 : maxTrackedSessions);
     const marker = cursorID(databaseReal, "initialized");
     const firstDatabaseScan = options.cursors.get(marker) !== 1;
     let rows: Array<Readonly<{ sessionID: string; row: EventRow }>> = [];
+    let idle: IdleCursors | undefined;
 
     if (options.historical) {
       rows = unreadRows(
@@ -120,13 +133,19 @@ async function scanDatabase(
       }
       options.cursors.set(marker, 1);
     } else {
-      rows = unreadRows(
+      const unread = unreadEvents(
         database,
         databaseReal,
         sessions.slice(0, maxLiveSessionsPerScan),
         options.cursors,
         Math.min(maxDatabaseEventsPerScan, options.maxReplayRecords),
       );
+      rows = unread.rows;
+      if (unread.selected === 0) {
+        // No session had any row past its cursor, so the row limit did not
+        // matter: the same database and cursors give the same empty scan.
+        idle = [[marker, 1], ...unread.cursors];
+      }
     }
 
     const sourceID = `ses_${digest(databaseReal).slice(0, 32)}`;
@@ -191,10 +210,25 @@ async function scanDatabase(
       (options.cursors.get(cursorID(databaseReal, session.aggregateID)) ?? 0) >=
         session.maxSequence
     );
+    scan?.finish(idle);
     return { records, files: 1, malformed, oversized, complete };
+  } catch (error) {
+    scan?.fail();
+    throw error;
   } finally {
-    database.close();
+    if (scan === undefined) database.close();
   }
+}
+
+function openDatabase(path: string): DatabaseSync {
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    database.exec("PRAGMA query_only = ON; PRAGMA trusted_schema = OFF;");
+  } catch (error) {
+    database.close();
+    throw error;
+  }
+  return database;
 }
 
 function legacyRows(
@@ -241,7 +275,27 @@ function unreadRows(
   cursors: Map<string, number>,
   limit: number,
 ): Array<Readonly<{ sessionID: string; row: EventRow }>> {
+  return unreadEvents(database, databasePath, sessions, cursors, limit).rows;
+}
+
+/**
+ * Rows past each session's cursor, with what an idle check needs: how many
+ * rows the queries selected, valid or not, and each cursor read in order.
+ */
+function unreadEvents(
+  database: DatabaseSync,
+  databasePath: string,
+  sessions: readonly SessionSequence[],
+  cursors: Map<string, number>,
+  limit: number,
+): Readonly<{
+  rows: Array<Readonly<{ sessionID: string; row: EventRow }>>;
+  selected: number;
+  cursors: Array<readonly [string, number | undefined]>;
+}> {
   const result: Array<Readonly<{ sessionID: string; row: EventRow }>> = [];
+  const read: Array<readonly [string, number | undefined]> = [];
+  let selected = 0;
   const statement = database.prepare(
     "SELECT seq, type, data FROM event " +
       "WHERE aggregate_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
@@ -249,12 +303,15 @@ function unreadRows(
   for (const session of sessions) {
     if (result.length >= limit) break;
     const key = cursorID(databasePath, session.aggregateID);
-    const cursor = cursors.get(key) ?? 0;
+    const saved = cursors.get(key);
+    read.push([key, saved]);
+    const cursor = saved ?? 0;
     const rows = statement.all(
       session.aggregateID,
       cursor,
       limit - result.length,
     );
+    selected += rows.length;
     let newestSequence = cursor;
     for (const value of rows) {
       const row = eventRow(value);
@@ -264,7 +321,7 @@ function unreadRows(
     }
     if (newestSequence > cursor) cursors.set(key, newestSequence);
   }
-  return result;
+  return { rows: result, selected, cursors: read };
 }
 
 function replayRows(

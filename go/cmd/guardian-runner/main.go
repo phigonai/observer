@@ -25,6 +25,10 @@ func run() int {
 	if len(os.Args) > 1 && os.Args[1] == "__relay" {
 		return runOutputRelay()
 	}
+	// Discovery's Windows process listing: read-only, and no arguments.
+	if len(os.Args) == 2 && os.Args[1] == "__processes" {
+		return listProcesses(os.Stdout)
+	}
 	// Capture the actual observer before authorization or file IO can block.
 	parentPID := os.Getppid()
 	if len(os.Args) > 1 && os.Args[1] == "__sandbox" {

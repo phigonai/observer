@@ -13,7 +13,7 @@ import { customAgentAdapter } from "../src/discovery/adapters/custom.js";
 import { genericAdapter } from "../src/discovery/adapters/generic.js";
 import { hermesAdapter } from "../src/discovery/adapters/hermes.js";
 import { openClawAdapter } from "../src/discovery/adapters/openclaw.js";
-import { DiscoveryEngine } from "../src/discovery/engine.js";
+import { DiscoveryEngine, runDiscoveryLoop } from "../src/discovery/engine.js";
 import {
   ExecutableProbeCache,
   SystemEvidenceProvider,
@@ -657,6 +657,40 @@ test("passive process snapshot completes before version execution", async () => 
   await codexAdapter.discover(evidence, observedAt);
 
   assert.equal(versionProbeOverlapped, false);
+});
+
+test("a failed discovery pass is reported and the loop keeps discovering", async () => {
+  const evidence = new FixtureEvidenceProvider({
+    processes: { status: "ok", value: [] },
+  });
+  let passes = 0;
+  const engine = new DiscoveryEngine({
+    evidenceFactory: () => {
+      passes++;
+      if (passes === 1) throw new Error("process listing crashed");
+      return evidence;
+    },
+    clock: () => observedAt,
+  });
+  const controller = new AbortController();
+  const published: number[] = [];
+  const errors: string[] = [];
+  await runDiscoveryLoop(
+    engine,
+    "",
+    1,
+    controller.signal,
+    () => {
+      published.push(passes);
+      if (published.length === 1) throw new Error("inventory could not be saved");
+      controller.abort();
+    },
+    (error) => errors.push(error instanceof Error ? error.message : String(error)),
+  );
+  // The first pass failed while discovering and the second while
+  // publishing; the third still ran.
+  assert.deepEqual(published, [2, 3]);
+  assert.deepEqual(errors, ["process listing crashed", "inventory could not be saved"]);
 });
 
 test("missing evidence yields an honest empty inventory", async () => {

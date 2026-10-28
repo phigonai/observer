@@ -18,6 +18,7 @@ import {
   type JSONDocumentOptions,
   scanJSONDocumentSource,
 } from "./json-document-source.js";
+import { SQLiteConnections } from "./sqlite-connections.js";
 
 const maxSourceFiles = 256;
 const historicalFilesPerScan = 16;
@@ -247,6 +248,10 @@ export class JSONLSourceReader {
   // Cursors that stopped inside a record above the line limit. The next read
   // skips to that record's end instead of parsing its tail as a new record.
   readonly #oversizedContinuations = new Set<string>();
+  // Live database connections kept between scans, so an unchanged database
+  // is recognized without reopening it and rerunning every session query.
+  readonly #openCodeConnections = new SQLiteConnections();
+  readonly #gooseConnections = new SQLiteConnections();
 
   constructor(
     dataDirectory: string,
@@ -465,6 +470,7 @@ export class JSONLSourceReader {
         ),
         maxRecords: remainingRecords - reservedDatabaseRecords,
         historical: this.#mode === "history",
+        ...(this.#mode === "live" ? { connections: this.#gooseConnections } : {}),
       });
       records.push(...goose.records);
       fileCount += goose.files;
@@ -502,6 +508,7 @@ export class JSONLSourceReader {
           ),
         ),
         historical: this.#mode === "history",
+        ...(this.#mode === "live" ? { connections: this.#openCodeConnections } : {}),
       });
       records.push(...sqlite.records);
       fileCount += sqlite.files;
@@ -511,6 +518,8 @@ export class JSONLSourceReader {
       remainingRecords -= sqlite.records.length;
       sqliteComplete = sqliteComplete && sqlite.complete;
     }
+    this.#openCodeConnections.retain(configuredRoots(sources, "opencode-sqlite"));
+    this.#gooseConnections.retain(configuredRoots(sources, "goose-sqlite"));
     this.#initialScanComplete = true;
     this.#cursors.settle(maxCursorEntries);
     const checkpoint = Object.freeze({
@@ -545,6 +554,15 @@ export class JSONLSourceReader {
       this.#savedCursors = checkpoint.cursors;
     }
     this.#committedGeneration = checkpoint.generation;
+  }
+
+  /**
+   * Close the database connections kept between scans. A later scan opens
+   * them again, so this only releases files, for example before shutdown.
+   */
+  close(): void {
+    this.#openCodeConnections.closeAll();
+    this.#gooseConnections.closeAll();
   }
 
   /**
@@ -990,6 +1008,15 @@ function newestFilesPerAdapter(
     selected.add(file.path);
   }
   return selected;
+}
+
+function configuredRoots(
+  sources: readonly ActivitySource[],
+  format: NonNullable<ActivitySource["format"]>,
+): Set<string> {
+  return new Set(sources.flatMap((source) =>
+    source.format === format ? source.roots.map(expandedActivityRoot) : []
+  ));
 }
 
 function sameCursors(

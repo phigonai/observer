@@ -446,12 +446,17 @@ export class ActivityCollector {
   }
 
   async run(signal: AbortSignal): Promise<void> {
-    while (!signal.aborted) {
-      await this.scanOnce();
-      await abortableDelay(
-        this.#config.activityScanIntervalMs,
-        signal,
-      );
+    try {
+      while (!signal.aborted) {
+        await this.scanOnce();
+        await abortableDelay(
+          this.#config.activityScanIntervalMs,
+          signal,
+        );
+      }
+    } finally {
+      // Release the database connections the live reader kept open.
+      this.#reader.close();
     }
   }
 
