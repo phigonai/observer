@@ -29,14 +29,23 @@ test("OpenCode imports pre-event-log conversations and restores speaker evidence
   assert.equal(liveLog.records.length,1);
   assert.equal((liveLog.records[0]?.value as {message_info:{role:string}}).message_info.role,"assistant");
   assert.equal(liveLog.complete,false);
-  const archive = await scanOpenCodeSQLiteSources({...options,cursors:new Map(cursors)});
-  assert.equal(archive.records.length,1);
-  const value = archive.records[0]?.value as {message_info:{role:string};part:{id:string;text:string}};
+  // The archived session's message, then its part, one record per batch.
+  const archiveCursors = new Map(cursors);
+  const archived = [];
+  let complete = false;
+  for (let pass = 0; pass < 5 && !complete; pass++) {
+    const scan = await scanOpenCodeSQLiteSources({...options,cursors:archiveCursors});
+    archived.push(...scan.records);
+    complete = scan.complete;
+  }
+  assert.deepEqual(archived.map((record) => (record.value as {type:string}).type),["message.updated.1","message.part.updated.1"]);
+  assert.equal((archived[0]?.value as {info:{id:string;role:string}}).info.role,"user");
+  const value = archived[1]?.value as {message_info:{role:string};part:{id:string;text:string}};
   assert.equal(value.message_info.role,"user");
   assert.equal(value.part.id,"old-part");
   assert.equal(value.part.text,"Previous conversation");
-  assert.notEqual(archive.records[0]?.sourceRecordId,liveLog.records[0]?.sourceRecordId);
-  assert.equal(archive.complete,true);
+  assert.notEqual(archived[1]?.sourceRecordId,liveLog.records[0]?.sourceRecordId);
+  assert.equal(complete,true);
   db.prepare("UPDATE message SET data=? WHERE id=?").run("invalid JSON","agent-new");
   const withoutRole = await scanOpenCodeSQLiteSources({...options,cursors:new Map()});
   assert.equal(withoutRole.records.length,1,"optional role hydration must not discard a valid source record");

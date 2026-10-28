@@ -37,8 +37,12 @@ export type SQLiteScan =
   | Readonly<{
     unchanged: false;
     database: DatabaseSync;
-    /** Record a successful scan; `idle` when it selected no row. */
-    finish(idle: IdleCursors | undefined): void;
+    /**
+     * Record a successful scan; `idle` when it selected no row. `recheckAt`
+     * is when a scan of the same data would find something new (a row it
+     * waits for has settled), so the idle state expires then.
+     */
+    finish(idle: IdleCursors | undefined, recheckAt?: number): void;
     /** Drop the connection after a failed scan. */
     fail(): void;
   }>;
@@ -56,7 +60,12 @@ type DatabaseState = {
   /** When a closed database was last confirmed unchanged by a scan. */
   checkedAt: number;
   /** The last full scan selected no row: its data version and cursors. */
-  idle: Readonly<{ version: number; cursors: IdleCursors }> | undefined;
+  idle: Readonly<{
+    version: number;
+    cursors: IdleCursors;
+    /** When the idle state expires, if it does. */
+    until: number | undefined;
+  }> | undefined;
 };
 
 const unchanged = Object.freeze({ unchanged: true as const });
@@ -79,7 +88,8 @@ const unchanged = Object.freeze({ unchanged: true as const });
  *
  * A scan is skipped only when the last full scan selected no row and every
  * cursor it read still holds the same value, so a full scan would again find
- * nothing. Statements finish within a scan (node:sqlite resets each one), so
+ * nothing. A scan that waits for a row to settle sets when that happens, and
+ * its idle state expires then. Statements finish within a scan (node:sqlite resets each one), so
  * no read transaction stays open between ticks to hold back checkpoints.
  */
 export class SQLiteConnections {
@@ -138,6 +148,7 @@ export class SQLiteConnections {
         state.idle !== undefined &&
         state.signature === signature &&
         now - state.checkedAt < this.#recheckMs &&
+        unexpired(state.idle, now) &&
         sameCursors(state.idle.cursors, cursors)
       ) {
         return unchanged;
@@ -166,6 +177,7 @@ export class SQLiteConnections {
     if (
       current.idle !== undefined &&
       current.idle.version === version &&
+      unexpired(current.idle, now) &&
       sameCursors(current.idle.cursors, cursors)
     ) {
       if (now - current.changedAt >= this.#idleCloseMs) this.#close(current, now);
@@ -175,9 +187,9 @@ export class SQLiteConnections {
     return {
       unchanged: false,
       database,
-      finish: (idle) => {
+      finish: (idle, recheckAt) => {
         if (this.#states.get(root) !== current) return;
-        if (idle !== undefined) current.idle = { version, cursors: idle };
+        if (idle !== undefined) current.idle = { version, cursors: idle, until: recheckAt };
         if (now - current.changedAt >= this.#idleCloseMs) this.#close(current, now);
       },
       fail: () => {
@@ -248,6 +260,11 @@ async function fileSignature(path: string, main: Stats): Promise<string> {
       : `unreadable:${++unreadableWal}`;
   }
   return `${main.size}:${main.mtimeMs}\u0000${wal}`;
+}
+
+/** True until the idle state's expiry, if it has one. */
+function unexpired(idle: Readonly<{ until: number | undefined }>, now: number): boolean {
+  return idle.until === undefined || now < idle.until;
 }
 
 /**
