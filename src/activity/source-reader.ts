@@ -15,10 +15,11 @@ import { homedir } from "node:os";
 import { basename, join, relative, resolve, sep } from "node:path";
 import { atomicReplace } from "../atomic-replace.js";
 import {
+  DirectoryListingCache,
   type JSONDocumentOptions,
   scanJSONDocumentSource,
 } from "./json-document-source.js";
-import { SQLiteConnections } from "./sqlite-connections.js";
+import { type CompletedHistory, SQLiteConnections } from "./sqlite-connections.js";
 
 const maxSourceFiles = 256;
 const historicalFilesPerScan = 16;
@@ -245,12 +246,15 @@ export class JSONLSourceReader {
   // listed path. Holds only files seen in the latest listing.
   #canonicalPaths = new Map<string, CanonicalSourcePath>();
   readonly #completedHistoryFiles = new Map<string, number>();
+  readonly #completedHistoryDatabases: CompletedHistory = new Map();
   // Cursors that stopped inside a record above the line limit. The next read
   // skips to that record's end instead of parsing its tail as a new record.
   readonly #oversizedContinuations = new Set<string>();
   // Live database connections kept between scans, so an unchanged database
   // is recognized without reopening it and rerunning every session query.
   readonly #openCodeConnections = new SQLiteConnections();
+  // Folder listings for JSON-document agents, reused while folders are unchanged.
+  readonly #documentListings = new DirectoryListingCache();
   readonly #gooseConnections = new SQLiteConnections();
 
   constructor(
@@ -430,6 +434,7 @@ export class JSONLSourceReader {
         ...source.document,
       }, {
         cursors: this.#cursors,
+        listings: this.#documentListings,
         initialScan,
         replayOnFirstStart: this.#replayOnFirstStart,
         replaySessions: this.#initialReplaySessions,
@@ -470,7 +475,7 @@ export class JSONLSourceReader {
         ),
         maxRecords: remainingRecords - reservedDatabaseRecords,
         historical: this.#mode === "history",
-        ...(this.#mode === "live" ? { connections: this.#gooseConnections } : {}),
+        ...(this.#mode === "live" ? { connections: this.#gooseConnections } : { completedHistory: this.#completedHistoryDatabases }),
       });
       records.push(...goose.records);
       fileCount += goose.files;
@@ -508,7 +513,7 @@ export class JSONLSourceReader {
           ),
         ),
         historical: this.#mode === "history",
-        ...(this.#mode === "live" ? { connections: this.#openCodeConnections } : {}),
+        ...(this.#mode === "live" ? { connections: this.#openCodeConnections } : { completedHistory: this.#completedHistoryDatabases }),
       });
       records.push(...sqlite.records);
       fileCount += sqlite.files;

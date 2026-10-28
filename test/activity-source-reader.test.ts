@@ -20,6 +20,10 @@ import {
   JSONLSourceReader,
 } from "../src/activity/source-reader.js";
 
+// Seconds a few minutes ago plus an offset. Documents untouched for ten
+// minutes are only re-checked every ten seconds, so live tests use recent times.
+const recentSeconds = (offset: number) => Math.floor(Date.now() / 1000) - 300 + offset;
+
 test("corrupt source checkpoints rescan stable record identities and retain the damaged file", async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-source-recovery-"));
   const root = join(directory, "sessions");
@@ -916,7 +920,7 @@ test("JSON document sources deliver each rewritten message once", async () => {
       sessionId: "1789500000000_abcde",
       messages: ids.map(message),
     }, null, 2));
-    await utimes(file, mtimeSeconds, mtimeSeconds);
+    await utimes(file, recentSeconds(mtimeSeconds - 1_000), recentSeconds(mtimeSeconds - 1_000));
   };
   const ids = (scan: Awaited<ReturnType<JSONLSourceReader["scan"]>>) =>
     scan.records.map((record) => (record.value as { id: string }).id);
@@ -936,7 +940,7 @@ test("JSON document sources deliver each rewritten message once", async () => {
 
     // A partially written document is retried, not treated as history.
     await writeFile(file, '{"version":1,"messages":[{"id":"m1"');
-    await utimes(file, 1_020, 1_020);
+    await utimes(file, recentSeconds(20), recentSeconds(20));
     assert.deepEqual(ids(await reader.scan(sources, 32)), []);
 
     // Compaction drops old messages; delivery resumes after the last one.
@@ -1029,7 +1033,7 @@ test("JSONL document sources read a final line without its newline and skip unre
     );
   try {
     await writeFile(file, line("one"));
-    await utimes(file, 1_000, 1_000);
+    await utimes(file, recentSeconds(0), recentSeconds(0));
     const reader = new JSONLSourceReader(data, true, 262_144, 4);
     const first = await reader.scan(sources, 32);
     assert.deepEqual(texts(first), ["one"]);
@@ -1038,13 +1042,13 @@ test("JSONL document sources read a final line without its newline and skip unre
     // The writer puts the separator before each record; a half-written
     // record waits for the rest of its line.
     await writeFile(file, `${line("one")}\n${line("two")}\n{"role":"assis`);
-    await utimes(file, 1_010, 1_010);
+    await utimes(file, recentSeconds(10), recentSeconds(10));
     const partial = await reader.scan(sources, 32);
     assert.deepEqual(texts(partial), ["two"]);
     await reader.commit(partial.checkpoint);
 
     await writeFile(file, `${line("one")}\n${line("two")}\n${line("three")}`);
-    await utimes(file, 1_020, 1_020);
+    await utimes(file, recentSeconds(20), recentSeconds(20));
     assert.deepEqual(texts(await reader.scan(sources, 32)), ["three"]);
 
     await writeFile(join(transcripts, "subagents", "sub-1.jsonl"), line("delegated"));
@@ -1387,6 +1391,85 @@ test("JSONL source reader skips a record above the line limit and resumes after 
     assert.deepEqual(values, ["after"]);
     assert.equal(oversized, 1);
   } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a history import skips a database it already read to the end until a commit changes it", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-opencode-history-done-"));
+  const sourceRoot = join(directory, "opencode");
+  await mkdir(sourceRoot, { recursive: true });
+  const databasePath = join(sourceRoot, "opencode.db");
+  const database = createOpenCodeDatabase(databasePath);
+  insertOpenCodeConversation(database, {
+    sessionID: "ses_opencode_history_done",
+    prompt: "Summarize the release notes.",
+    response: "The release notes are summarized.",
+    updatedAt: 1_785_686_000_000,
+  });
+  database.close();
+  const sources = [{ adapterId: "opencode", roots: [sourceRoot], format: "opencode-sqlite" as const }];
+  const reader = new JSONLSourceReader(join(directory, "history"), true, 4096, 1, "history");
+  const fixedSeconds = Math.floor(Date.now() / 1000) - 3_600;
+  try {
+    await utimes(databasePath, fixedSeconds, fixedSeconds);
+    const first = await reader.scan(sources);
+    assert.equal(first.records.length, 4);
+    await reader.commit(first.checkpoint);
+    // Nothing new: this batch marks the database as read to the end.
+    const second = await reader.scan(sources);
+    assert.deepEqual([second.records.length, second.complete], [0, true]);
+    await reader.commit(second.checkpoint);
+
+    // Same size and time, different bytes: a skipped database is never opened.
+    const size = (await stat(databasePath)).size;
+    await writeFile(databasePath, Buffer.alloc(size, 0x5a));
+    await utimes(databasePath, fixedSeconds, fixedSeconds);
+    const skipped = await reader.scan(sources);
+    assert.deepEqual([skipped.records.length, skipped.complete, skipped.metrics.malformed], [0, true, 0]);
+
+    // A changed time means a commit may have landed: it is read again.
+    await utimes(databasePath, fixedSeconds + 60, fixedSeconds + 60);
+    const reread = await reader.scan(sources).then(
+      (scan) => scan.metrics.malformed > 0 ? "rejected" : "read",
+      () => "rejected",
+    );
+    assert.equal(reread, "rejected");
+  } finally {
+    reader.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("an OpenCode history import completes when events were deleted after OpenCode applied them", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-opencode-history-pruned-"));
+  const sourceRoot = join(directory, "opencode");
+  await mkdir(sourceRoot, { recursive: true });
+  const database = createOpenCodeDatabase(join(sourceRoot, "opencode.db"));
+  insertOpenCodeConversation(database, {
+    sessionID: "ses_opencode_pruned",
+    prompt: "Check the deploy script.",
+    response: "The deploy script is fine.",
+    updatedAt: 1_785_686_000_000,
+  });
+  // OpenCode keeps counting in event_sequence after it deletes the events.
+  database.prepare("UPDATE event_sequence SET seq = 40 WHERE aggregate_id = ?").run("ses_opencode_pruned");
+  database.close();
+  const sources = [{ adapterId: "opencode", roots: [sourceRoot], format: "opencode-sqlite" as const }];
+  const reader = new JSONLSourceReader(join(directory, "history"), true, 4096, 1, "history");
+  try {
+    let complete = false;
+    let records = 0;
+    for (let pass = 0; pass < 5 && !complete; pass++) {
+      const scan = await reader.scan(sources);
+      records += scan.records.length;
+      await reader.commit(scan.checkpoint);
+      complete = scan.complete;
+    }
+    assert.equal(records, 4, "the rows that still exist are imported once");
+    assert.equal(complete, true, "the import finishes instead of retrying forever");
+  } finally {
+    reader.close();
     await rm(directory, { recursive: true, force: true });
   }
 });

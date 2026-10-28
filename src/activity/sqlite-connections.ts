@@ -3,6 +3,29 @@ import { stat } from "node:fs/promises";
 import type { DatabaseSync } from "node:sqlite";
 
 /**
+ * Sizes and times of a database and its write-ahead log. A commit changes at
+ * least the log's time, so an unchanged signature means nothing new landed.
+ */
+export async function databaseSignature(path: string, main: Pick<Stats, "size" | "mtimeMs">): Promise<string> {
+  let log = "-";
+  try {
+    const wal = await stat(`${path}-wal`);
+    log = `${wal.size}:${wal.mtimeMs}`;
+  } catch {
+    // No write-ahead log: the main file's size and time cover every commit.
+  }
+  return `${main.size}:${main.mtimeMs}:${log}`;
+}
+
+/**
+ * Databases a history import already read to the end, by signature. A batch
+ * that completes with nothing new marks its database; later batches skip it
+ * until a commit changes the signature. New work after that point is the
+ * live reader's, so this only spares re-reading finished history.
+ */
+export type CompletedHistory = Map<string, string>;
+
+/**
  * The cursors an idle scan read, in order, with the values it found (or
  * undefined). An idle scan selected no row, so it changed no cursor.
  */

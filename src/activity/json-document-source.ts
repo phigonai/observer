@@ -56,6 +56,8 @@ export type JSONDocumentSource = Readonly<{
 
 type ScanOptions = Readonly<{
   cursors: Map<string, number>;
+  /** Reused folder listings; without one every scan lists every folder. */
+  listings?: DirectoryListingCache;
   initialScan: boolean;
   replayOnFirstStart: boolean;
   replaySessions: number;
@@ -96,7 +98,7 @@ export async function scanJSONDocumentSource(
     : new RegExp(source.directoryPattern, "u");
   const files: DocumentFile[] = [];
   for (const root of source.roots) {
-    files.push(...await listDocuments(root, pattern, directoryPattern));
+    files.push(...await listDocuments(root, pattern, directoryPattern, options.listings, options.historical));
   }
   files.sort((left, right) =>
     right.modifiedMs - left.modifiedMs || left.path.localeCompare(right.path)
@@ -493,44 +495,169 @@ function safeJSON(value: unknown): string {
   }
 }
 
+type DirectoryEntry = Readonly<{ name: string; directory: boolean; file: boolean }>;
+type DirectoryListing = Readonly<{
+  entries: readonly DirectoryEntry[];
+  modifiedMs: number;
+  listedAt: number;
+  checkedAt: number;
+  /** False when the folder changed too recently for its time to be trusted. */
+  settled: boolean;
+}>;
+type FileMetadata = Readonly<{ modifiedMs: number; size: number; checkedAt: number }>;
+
+type ListingFileSystem = Readonly<{
+  readdir: (directory: string) => Promise<readonly DirectoryEntry[]>;
+  modifiedMs: (directory: string) => Promise<number>;
+  metadata: (file: string) => Promise<Readonly<{ modifiedMs: number; size: number }>>;
+  now: () => number;
+}>;
+
+const nodeListingFileSystem: ListingFileSystem = {
+  readdir: async (directory) => (await readdir(directory, { withFileTypes: true }))
+    .map((entry) => ({ name: entry.name, directory: entry.isDirectory(), file: entry.isFile() })),
+  modifiedMs: async (directory) => (await stat(directory)).mtimeMs,
+  metadata: async (file) => {
+    const metadata = await stat(file);
+    return { modifiedMs: metadata.mtimeMs, size: metadata.size };
+  },
+  now: () => Date.now(),
+};
+
+/**
+ * Folder listings reused across scans. Adding, removing or renaming an entry
+ * changes its folder's modified time, so a folder is listed again only when
+ * that time moved. Checking a folder costs about half of listing it, and
+ * most folders under an agent's session store never change. A folder that
+ * changed within the last two seconds is listed again on the next scan,
+ * because coarse file-system clocks can hide a second change in the same
+ * tick, and every folder is listed afresh at least every 30 seconds.
+ *
+ * Folders and documents untouched for ten minutes are cold: they are checked
+ * every ten seconds instead of on every scan, so a conversation resumed in a
+ * quiet project is noticed within ten seconds while active ones stay live.
+ */
+export class DirectoryListingCache {
+  static readonly relistAfterMs = 30_000;
+  static readonly settleMs = 2_000;
+  static readonly coldAfterMs = 10 * 60_000;
+  static readonly coldCheckMs = 10_000;
+  static readonly maxFolders = 8_192;
+  readonly #listings = new Map<string, DirectoryListing>();
+  readonly #files = new Map<string, FileMetadata>();
+  readonly #fs: ListingFileSystem;
+
+  constructor(fileSystem: ListingFileSystem = nodeListingFileSystem) {
+    this.#fs = fileSystem;
+  }
+
+  /**
+   * The folder's entries. `trustMs` skips even the folder check while the
+   * listing is younger than that; history imports use it, since live
+   * collection already follows new conversations.
+   */
+  async list(directory: string, trustMs = 0): Promise<readonly DirectoryEntry[]> {
+    const now = this.#fs.now();
+    const cached = this.#listings.get(directory);
+    const age = cached === undefined ? Number.POSITIVE_INFINITY : now - cached.listedAt;
+    if (cached !== undefined && age < DirectoryListingCache.relistAfterMs) {
+      if (age < trustMs) return cached.entries;
+      if (cached.settled && now - cached.modifiedMs >= DirectoryListingCache.coldAfterMs &&
+        now - cached.checkedAt < DirectoryListingCache.coldCheckMs) return cached.entries;
+    }
+    let modifiedMs: number;
+    try {
+      modifiedMs = await this.#fs.modifiedMs(directory);
+    } catch (error) {
+      this.#listings.delete(directory);
+      throw error;
+    }
+    if (cached !== undefined && cached.settled && cached.modifiedMs === modifiedMs &&
+      age < DirectoryListingCache.relistAfterMs) {
+      this.#listings.set(directory, { ...cached, checkedAt: now });
+      return cached.entries;
+    }
+    // Checked before listing: an entry added while listing moves the time on.
+    const entries = await this.#fs.readdir(directory);
+    this.#listings.delete(directory);
+    this.#listings.set(directory, {
+      entries,
+      modifiedMs,
+      listedAt: now,
+      checkedAt: now,
+      settled: now - modifiedMs >= DirectoryListingCache.settleMs,
+    });
+    evictOldest(this.#listings);
+    return entries;
+  }
+
+  /** A document's time and size; a cold document is checked every ten seconds. */
+  async metadata(file: string): Promise<Readonly<{ modifiedMs: number; size: number }>> {
+    const now = this.#fs.now();
+    const cached = this.#files.get(file);
+    if (cached !== undefined && now - cached.modifiedMs >= DirectoryListingCache.coldAfterMs &&
+      now - cached.checkedAt < DirectoryListingCache.coldCheckMs) return cached;
+    let metadata: Readonly<{ modifiedMs: number; size: number }>;
+    try {
+      metadata = await this.#fs.metadata(file);
+    } catch (error) {
+      this.#files.delete(file);
+      throw error;
+    }
+    this.#files.delete(file);
+    this.#files.set(file, { ...metadata, checkedAt: now });
+    evictOldest(this.#files);
+    return metadata;
+  }
+}
+
+function evictOldest(map: Map<string, unknown>): void {
+  if (map.size <= DirectoryListingCache.maxFolders) return;
+  const oldest = map.keys().next().value;
+  if (oldest !== undefined) map.delete(oldest);
+}
+
+const historyListingTrustMs = DirectoryListingCache.relistAfterMs;
+
 async function listDocuments(
   root: string,
   pattern: RegExp,
   directoryPattern: RegExp | undefined,
+  listings: DirectoryListingCache | undefined,
+  historical: boolean,
 ): Promise<DocumentFile[]> {
   const result: DocumentFile[] = [];
-  const walk = async (directory: string, depth: number): Promise<void> => {
+  // `inRoot` is the folder's `/`-separated path below root, built as the walk
+  // descends instead of with path.relative for every entry on every scan.
+  const walk = async (directory: string, inRoot: string, depth: number): Promise<void> => {
     if (depth > maxDirectoryDepth) return;
-    let entries;
+    let entries: readonly DirectoryEntry[];
     try {
-      entries = await readdir(directory, { withFileTypes: true });
+      entries = listings === undefined
+        ? await nodeListingFileSystem.readdir(directory)
+        : await listings.list(directory, historical ? historyListingTrustMs : 0);
     } catch (error) {
       if (isTransientError(error)) return;
       throw error;
     }
     for (const entry of entries) {
-      const path = join(directory, entry.name);
-      if (entry.isDirectory()) {
-        if (
-          directoryPattern === undefined ||
-          directoryPattern.test(relative(root, path).split(sep).join("/"))
-        ) {
-          await walk(path, depth + 1);
+      const relativePath = inRoot === "" ? entry.name : `${inRoot}/${entry.name}`;
+      if (entry.directory) {
+        if (directoryPattern === undefined || directoryPattern.test(relativePath)) {
+          await walk(join(directory, entry.name), relativePath, depth + 1);
         }
         continue;
       }
-      if (
-        !entry.isFile() ||
-        !pattern.test(relative(root, path).split(sep).join("/"))
-      ) {
-        continue;
-      }
+      if (!entry.file || !pattern.test(relativePath)) continue;
+      const path = join(directory, entry.name);
       try {
-        const metadata = await stat(path);
+        const metadata = listings === undefined
+          ? await nodeListingFileSystem.metadata(path)
+          : await listings.metadata(path);
         result.push({
           root,
           path,
-          modifiedMs: metadata.mtimeMs,
+          modifiedMs: metadata.modifiedMs,
           size: metadata.size,
         });
       } catch (error) {
@@ -538,7 +665,7 @@ async function listDocuments(
       }
     }
   };
-  await walk(root, 0);
+  await walk(root, "", 0);
   return result;
 }
 
