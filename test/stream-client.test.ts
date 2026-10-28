@@ -70,6 +70,12 @@ import {
   sanitizeEventForPolicy,
 } from "../src/stream-client.js";
 import { StreamStateStore } from "../src/stream-state.js";
+import {
+  AgentActionCommandSchema,
+  AgentActionResultSchema,
+  RemoteActionResultState,
+  RemoteActionType,
+} from "../src/generated/phigon/v1/action_pb.js";
 
 test("a corrupt local cursor resumes from the authenticated server before capturing new events", async () => {
   const dataDirectory = await mkdtemp(join(tmpdir(), "phigon-stream-recovery-"));
@@ -523,6 +529,60 @@ test("observer renews the owner action capability manifest on heartbeats", async
     await client.run(controller.signal);
     assert.equal(manifests, 2);
   } finally {
+    controller.abort();
+    await shutdownServer(server);
+    await rm(dataDirectory, { recursive: true, force: true });
+  }
+});
+
+test("a stop request is answered while an earlier long command is still running", async () => {
+  const dataDirectory = await mkdtemp(join(tmpdir(), "phigon-action-concurrency-"));
+  const machineId = "5f1b4cb4-a77d-4f53-af66-197e184683f4";
+  const server = new Server();
+  const controller = new AbortController();
+  const results: string[] = [];
+  let releaseCommand: (() => void) | undefined;
+  const actionCommand = (actionId: string, action: RemoteActionType) => create(StreamTelemetryResponseSchema, {
+    payload: { case: "actionCommand", value: create(AgentActionCommandSchema, { actionId, idempotencyKey: actionId, machineId, action }) },
+  });
+  const implementation: UntypedServiceImplementation = {
+    streamTelemetry(call: ServerDuplexStream<StreamTelemetryRequest, StreamTelemetryResponse>) {
+      call.on("data", (request: StreamTelemetryRequest) => {
+        if (request.payload.case === "resume") {
+          call.write(policySnapshot(machineId));
+          call.write(acknowledgement(machineId, 0n));
+          call.write(actionCommand("long-command", RemoteActionType.RUN_COMMAND));
+          call.write(actionCommand("urgent-stop", RemoteActionType.KILL_AGENT));
+        }
+        if (request.payload.case === "actionResult") {
+          results.push(request.payload.value.actionId);
+          if (request.payload.value.actionId === "urgent-stop") releaseCommand?.();
+          if (results.length === 2) controller.abort();
+        }
+      });
+      call.on("end", () => call.end());
+    },
+  };
+  server.addService(observerServiceDefinition, implementation);
+  const port = await bindServer(server);
+  const client = new ObserverStreamClient({
+    config: streamConfig(dataDirectory, port),
+    credentialStore: testCredentialStore(machineId),
+    actionExecutor: {
+      manifest: () => ({ enabled: true, executorVersion: "test", actions: [RemoteActionType.RUN_COMMAND, RemoteActionType.KILL_AGENT] }),
+      execute: async (command) => {
+        // The long command finishes only after the stop has been answered.
+        if (command.action === RemoteActionType.RUN_COMMAND) await new Promise<void>((resolve) => { releaseCommand = resolve; });
+        return create(AgentActionResultSchema, { actionId: command.actionId, idempotencyKey: command.idempotencyKey, machineId, state: RemoteActionResultState.SUCCEEDED });
+      },
+    },
+  });
+  const timeout = setTimeout(() => { releaseCommand?.(); controller.abort(); }, 10_000);
+  try {
+    await client.run(controller.signal);
+    assert.deepEqual(results, ["urgent-stop", "long-command"]);
+  } finally {
+    clearTimeout(timeout);
     controller.abort();
     await shutdownServer(server);
     await rm(dataDirectory, { recursive: true, force: true });

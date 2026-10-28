@@ -2,8 +2,12 @@ import { timestampDate } from "@bufbuild/protobuf/wkt";
 import { AgentState } from "./generated/phigon/v1/common_pb.js";
 import type { AgentInventory } from "./generated/phigon/v1/identity_pb.js";
 import type { GuardianIntervention } from "./action-policy.js";
-import { requestWindowsGracefulStop } from "./windows-process.js";
-import { killVerifiedWindowsProcess } from "./guardian-native.js";
+import {
+  defaultProcessTreeControl,
+  describeTreeOutcome,
+  type ProcessTreeControl,
+  type TreeStopOutcome,
+} from "./process-tree.js";
 
 export type GuardianContainmentRequest = Readonly<{
   intervention: GuardianIntervention;
@@ -19,38 +23,22 @@ export type GuardianContainmentResult = Readonly<{
   targetStillRunning?: boolean;
 }>;
 
-type ProcessSignal = "SIGTERM" | "SIGKILL";
-
 export class GuardianContainmentExecutor {
   readonly #enabled: boolean;
   readonly #inventory: () => Promise<AgentInventory>;
-  readonly #platform: NodeJS.Platform;
   readonly #observerProcessID: number;
-  readonly #signal: (processID: number, signal: ProcessSignal | 0) => void;
-  readonly #sleep: (milliseconds: number) => Promise<void>;
-  readonly #windowsGracefulStop: (processID: number, startedAt: string) => Promise<void>;
-  readonly #nativeKill: boolean;
+  readonly #processes: ProcessTreeControl;
 
   constructor(options: Readonly<{
     enabled: boolean;
     inventory: () => Promise<AgentInventory>;
-    platform?: NodeJS.Platform;
     observerProcessID?: number;
-    signal?: (processID: number, signal: ProcessSignal | 0) => void;
-    sleep?: (milliseconds: number) => Promise<void>;
-    windowsGracefulStop?: (processID: number, startedAt: string) => Promise<void>;
+    processControl?: ProcessTreeControl;
   }>) {
     this.#enabled = options.enabled;
-    this.#nativeKill = options.signal === undefined && options.platform === undefined;
     this.#inventory = options.inventory;
-    this.#platform = options.platform ?? process.platform;
     this.#observerProcessID = options.observerProcessID ?? process.pid;
-    this.#signal = options.signal ?? ((processID, signal) => process.kill(processID, signal));
-    this.#sleep = options.sleep ?? ((milliseconds) =>
-      new Promise((resolve) => setTimeout(resolve, milliseconds))
-    );
-    this.#windowsGracefulStop = options.windowsGracefulStop ??
-      requestWindowsGracefulStop;
+    this.#processes = options.processControl ?? defaultProcessTreeControl();
   }
 
   async execute(request: GuardianContainmentRequest): Promise<GuardianContainmentResult> {
@@ -89,52 +77,20 @@ export class GuardianContainmentExecutor {
     if (target === undefined) {
       return result("rejected", "stale_target", "The exact discovered agent process lifetime is no longer running.", false);
     }
-    if (!this.#processAlive(processID)) {
-      return result("rejected", "target_already_stopped", "The target process is no longer running.", false);
-    }
 
-    try {
-      if (request.intervention === "stop_agent" && this.#platform === "win32") {
-        await this.#windowsGracefulStop(processID, request.expectedStartedAt);
-      } else if (request.intervention === "kill_agent" && this.#platform === "win32" && this.#nativeKill) {
-        await killVerifiedWindowsProcess(processID, request.expectedStartedAt as string);
-        return result("succeeded", "process_stopped", "This agent was force-stopped by Phigon Guardian under administrator policy.", false);
-      } else {
-        const signal: ProcessSignal = request.intervention === "stop_agent"
-          ? "SIGTERM"
-          : "SIGKILL";
-        this.#signal(processID, signal);
-      }
-    } catch (error) {
-      return result("failed", "os_dispatch_failed", safeSignalFailure(error), this.#processAlive(processID));
+    // Same exact-lifetime, whole-tree controller as administrator actions.
+    const graceful = request.intervention === "stop_agent";
+    const outcome = await this.#processes.stop(
+      { processId: processID, startedAt: new Date(expectedStartedAt) },
+      graceful ? "stop" : "kill",
+    ).catch((): TreeStopOutcome => ({ outcome: "failed", code: "unknown" }));
+    const receipt = describeTreeOutcome(outcome, graceful);
+    if (receipt.code === "process_stopped") {
+      return result("succeeded", receipt.code, graceful
+        ? "This agent was stopped by Phigon Guardian under administrator policy."
+        : "This agent was force-stopped by Phigon Guardian under administrator policy.", false);
     }
-    const stopped = await this.#waitForExit(
-      processID,
-      request.intervention === "stop_agent" ? 5_000 : 2_000,
-    );
-    return stopped
-      ? result("succeeded", "process_stopped", request.intervention === "kill_agent"
-        ? "This agent was force-stopped by Phigon Guardian under administrator policy."
-        : "This agent was stopped by Phigon Guardian under administrator policy.", false)
-      : result("failed", "process_still_running", "The containment request was sent without escalation, but the exact process still reports running.", true);
-  }
-
-  #processAlive(processID: number): boolean {
-    try {
-      this.#signal(processID, 0);
-      return true;
-    } catch (error) {
-      return (error as NodeJS.ErrnoException).code === "EPERM";
-    }
-  }
-
-  async #waitForExit(processID: number, timeoutMs: number): Promise<boolean> {
-    const attempts = Math.ceil(timeoutMs / 100);
-    for (let attempt = 0; attempt < attempts; attempt += 1) {
-      if (!this.#processAlive(processID)) return true;
-      await this.#sleep(100);
-    }
-    return !this.#processAlive(processID);
+    return result(receipt.state, receipt.code, receipt.detail, receipt.targetStillRunning);
   }
 }
 
@@ -145,11 +101,4 @@ function result(
   targetStillRunning?: boolean,
 ): GuardianContainmentResult {
   return Object.freeze({ state, code, detail, ...(targetStillRunning === undefined ? {} : { targetStillRunning }) });
-}
-
-function safeSignalFailure(error: unknown): string {
-  const code = error instanceof Error && "code" in error
-    ? String((error as NodeJS.ErrnoException).code ?? "unknown")
-    : "unknown";
-  return `Operating system rejected the Guardian process signal (${code.slice(0, 32)}).`;
 }

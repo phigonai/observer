@@ -38,7 +38,23 @@ func run() int {
 	cgroupRoot := flag.String("cgroup-root", "", "administrator-delegated Linux cgroup-v2 root")
 	sandbox := flag.String("sandbox", "", "centrally assigned OS profiles")
 	leaseConfig := flag.String("lease-config", "", "private one-use hosted lease bootstrap")
+	tree := flag.Bool("tree", false, "include verified descendants and print a JSON report")
+	ownChild := flag.Bool("own-child", false, "with --tree: force-stop a direct child of the caller instead of a lifetime given by --started-at")
 	flag.Parse()
+	if *targetPID != 0 && *tree {
+		at, err := time.Parse(time.RFC3339Nano, *startedAt)
+		report := treeReport{Outcome: "invalid"}
+		switch {
+		case *targetPID <= 4:
+		case *targetPID == os.Getppid() || *targetPID == os.Getpid():
+			report = treeReport{Outcome: "self_target"}
+		case *ownChild && !*graceful:
+			report = dispatchOwnChildTree(*targetPID, os.Getppid(), treeWait)
+		case err == nil && !*ownChild:
+			report = dispatchExactTree(*targetPID, at, *graceful, treeWait)
+		}
+		return writeTreeReport(os.Stdout, report)
+	}
 	if *targetPID != 0 {
 		at, err := time.Parse(time.RFC3339Nano, *startedAt)
 		if err != nil || *targetPID <= 4 || *targetPID == os.Getppid() || *targetPID == os.Getpid() {

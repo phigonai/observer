@@ -13,13 +13,18 @@ import {
 } from "./generated/phigon/v1/action_pb.js";
 import { AgentState } from "./generated/phigon/v1/common_pb.js";
 import type { AgentInventory } from "./generated/phigon/v1/identity_pb.js";
-import { requestWindowsGracefulStop } from "./windows-process.js";
-import { killVerifiedWindowsProcess } from "./guardian-native.js";
+import { defaultProcessTreeControl, describeTreeOutcome, type ProcessTreeControl, type TreeStopOutcome } from "./process-tree.js";
 import { MachineCommandExecutor, machineActionTypes, pruneCommandReceipts } from "./machine-command-executor.js";
 import { atomicReplace } from "./atomic-replace.js";
+import type { RunningAgents } from "./system-inspection.js";
 
-const executorVersion = "observer-agent-actions-v2";
+const executorVersion = "observer-agent-actions-v3";
 const receiptLimit = 256;
+const discoveryTimeoutMs = 60_000;
+// Periodic discovery runs every 10 seconds by default.
+const recentInventoryMs = 60_000;
+// Matches the retention of process claims and machine-command receipts.
+const receiptRetentionMs = 30 * 86_400_000;
 
 export type ActionInventoryProvider = () => Promise<AgentInventory>;
 
@@ -32,6 +37,8 @@ export class AgentActionExecutor {
   readonly #commandsEnabled: boolean;
   #queue: Promise<unknown> = Promise.resolve();
   readonly #claimsDirectory: string;
+  readonly #processes: ProcessTreeControl;
+  #latestInventory: { inventory: AgentInventory; at: number } | undefined;
 
   constructor(options: {
     enabled: boolean;
@@ -39,16 +46,46 @@ export class AgentActionExecutor {
     machineID: string;
     dataDirectory: string;
     inventory: ActionInventoryProvider;
+    processControl?: ProcessTreeControl;
   }) {
     this.#enabled = options.enabled;
+    this.#processes = options.processControl ?? defaultProcessTreeControl();
     this.#machineID = options.machineID;
     this.#inventory = options.inventory;
     this.#commandsEnabled = options.commandsEnabled ?? false;
     this.#claimsDirectory = join(options.dataDirectory, "process-operation-claims");
-    this.#commands = new MachineCommandExecutor({ enabled: this.#commandsEnabled, machineID: options.machineID, dataDirectory: options.dataDirectory });
+    this.#commands = new MachineCommandExecutor({
+      enabled: this.#commandsEnabled, machineID: options.machineID, dataDirectory: options.dataDirectory,
+      agents: () => this.#runningAgents(),
+    });
     this.#receipts = new ActionReceiptStore(
       join(options.dataDirectory, "agent-action-receipts.json"),
     );
+  }
+
+  /**
+   * Records the observer's periodic discovery result. inspect_system reuses a
+   * recent one instead of scanning again; stop and kill always rescan.
+   */
+  observeInventory(inventory: AgentInventory): void {
+    this.#latestInventory = { inventory, at: Date.now() };
+  }
+
+  async #runningAgents(): Promise<RunningAgents> {
+    const latest = this.#latestInventory;
+    const inventory = latest !== undefined && Date.now() - latest.at < recentInventoryMs ? latest.inventory : await this.#inventory();
+    return {
+      complete: !inventory.partial,
+      agents: inventory.agents.filter((agent) =>
+        agent.state === AgentState.RUNNING && agent.startedAt !== undefined &&
+        agent.processId > 0n && agent.processId <= BigInt(Number.MAX_SAFE_INTEGER) &&
+        agent.capabilities.includes("process-instance"))
+        .map((agent) => ({
+          name: agent.displayName || agent.runtime || "Agent",
+          processId: Number(agent.processId),
+          startedAt: timestampDate(agent.startedAt!),
+        })),
+    };
   }
 
   capabilities(): readonly RemoteActionType[] {
@@ -117,6 +154,18 @@ export class AgentActionExecutor {
     }
     const cached = await this.#receipts.get(command.idempotencyKey, digest);
     if (cached !== null) return cached;
+    // A claim without a receipt means a signal may already have been sent.
+    // Report that honestly instead of an expiry or a second attempt.
+    const claim = await readClaim(join(this.#claimsDirectory, `${command.idempotencyKey}.claim`));
+    if (claim !== null) {
+      if (/^[0-9a-f]{64}$/u.test(claim) && claim !== digest) throw new Error("idempotency_conflict");
+      return await reject(
+        "execution_interrupted",
+        "A process signal was claimed without a completion receipt. It will not be repeated automatically.",
+        true,
+        RemoteActionResultState.FAILED,
+      );
+    }
     if (!this.#enabled) return await reject("executor_disabled", "Machine owner has not enabled remote agent actions.");
     if (!Number.isFinite(timestampDate(command.expiresAt).getTime()) || timestampDate(command.expiresAt).getTime() > Date.now() + 330_000) return await reject("invalid_command", "Command expiry is outside the approved execution window.");
     if (timestampDate(command.expiresAt).getTime() <= Date.now()) {
@@ -128,7 +177,28 @@ export class AgentActionExecutor {
       );
     }
 
-    const inventory = await this.#inventory();
+    // Discovery can be slow. The approval is only valid until expiresAt, so
+    // the wait is bounded by it and expiry is checked again before dispatch.
+    const expiresAt = timestampDate(command.expiresAt).getTime();
+    const expired = () => reject(
+      "command_expired",
+      "The approved command expired while the observer verified the target process. Nothing was signalled.",
+      true,
+      RemoteActionResultState.EXPIRED,
+    );
+    let inventory: AgentInventory;
+    try {
+      inventory = await withDeadline(this.#inventory(), Math.min(expiresAt - Date.now(), discoveryTimeoutMs));
+    } catch {
+      if (Date.now() >= expiresAt) return await expired();
+      return await reject(
+        "target_unverified",
+        "The observer could not list running agents, so the target could not be verified. Nothing was signalled.",
+        true,
+        RemoteActionResultState.FAILED,
+      );
+    }
+    if (Date.now() >= expiresAt) return await expired();
     const target = inventory.agents.find((agent) =>
       agent.agentId === command.agentId &&
       agent.processId === command.processId &&
@@ -145,9 +215,6 @@ export class AgentActionExecutor {
     if (pid === process.pid) {
       return await reject("self_target_rejected", "Observer refuses to terminate its own process.");
     }
-    if (!processAlive(pid)) {
-      return await reject("target_already_stopped", "The target process is no longer running.", false);
-    }
 
     await mkdir(this.#claimsDirectory, { recursive: true, mode: 0o700 });
     // Exclusive creation also prevents two observer processes from claiming
@@ -158,70 +225,45 @@ export class AgentActionExecutor {
       detail: "A process signal was claimed without a completion receipt. It will not be repeated automatically.",
       observedAt: timestampFromDate(new Date()), targetStillRunning: true,
     }), digest, timestampDate(command.expiresAt).toISOString());
-    try {
-      if (
-        command.action === RemoteActionType.STOP_AGENT &&
-        process.platform === "win32"
-      ) {
-        await requestWindowsGracefulStop(pid, timestampDate(command.expectedStartedAt).toISOString());
-      } else if (process.platform === "win32") {
-        await killVerifiedWindowsProcess(pid, timestampDate(command.expectedStartedAt).toISOString());
-      } else {
-        process.kill(
-          pid,
-          command.action === RemoteActionType.STOP_AGENT ? "SIGTERM" : "SIGKILL",
-        );
-      }
-    } catch (error) {
-      return await reject(
-        "os_dispatch_failed",
-        safeErrorDetail(error),
-        processAlive(pid),
-        RemoteActionResultState.FAILED,
-      );
-    }
-
-    const stopped = await waitForExit(pid, command.action === RemoteActionType.STOP_AGENT ? 5_000 : 2_000);
+    // The controller re-verifies the exact lifetime immediately before any
+    // signal and includes only verified descendants of that lifetime.
+    const outcome = await this.#processes.stop(
+      { processId: pid, startedAt: timestampDate(command.expectedStartedAt) },
+      command.action === RemoteActionType.STOP_AGENT ? "stop" : "kill",
+    ).catch((): TreeStopOutcome => ({ outcome: "failed", code: "unknown" }));
+    const [state, resultCode, detail, targetStillRunning] = describeOutcome(outcome, command.action === RemoteActionType.STOP_AGENT);
     const receipt = create(AgentActionResultSchema, {
-      ...base,
-      state: stopped
-        ? RemoteActionResultState.SUCCEEDED
-        : RemoteActionResultState.FAILED,
-      resultCode: stopped ? "process_stopped" : "process_still_running",
-      detail: stopped
-        ? "The exact observed process lifetime exited after the approved signal."
-        : "The approved stop request was sent without escalation, but the target still reports running.",
-      observedAt: timestampFromDate(new Date()),
-      targetStillRunning: !stopped,
+      ...base, state, resultCode, detail, targetStillRunning, observedAt: timestampFromDate(new Date()),
     });
     await this.#receipts.put(receipt, digest, timestampDate(command.expiresAt).toISOString());
     return receipt;
   }
 }
 
-function processAlive(pid: number): boolean {
+/** Maps a process-tree outcome to the wire receipt fields. */
+export function describeOutcome(outcome: TreeStopOutcome, graceful: boolean): [RemoteActionResultState, string, string, boolean] {
+  const receipt = describeTreeOutcome(outcome, graceful);
+  const state = { succeeded: RemoteActionResultState.SUCCEEDED, failed: RemoteActionResultState.FAILED, rejected: RemoteActionResultState.REJECTED }[receipt.state];
+  return [state, receipt.code, receipt.detail, receipt.targetStillRunning];
+}
+
+async function readClaim(path: string): Promise<string | null> {
   try {
-    process.kill(pid, 0);
-    return true;
+    return (await readFile(path, "utf8")).trim();
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
   }
 }
 
-async function waitForExit(pid: number, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (!processAlive(pid)) return true;
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  return !processAlive(pid);
-}
-
-function safeErrorDetail(error: unknown): string {
-  const code = error instanceof Error && "code" in error
-    ? String((error as NodeJS.ErrnoException).code ?? "unknown")
-    : "unknown";
-  return `Operating system rejected the approved process signal (${code.slice(0, 32)}).`;
+function withDeadline<T>(work: Promise<T>, milliseconds: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("deadline_exceeded")), Math.max(0, milliseconds));
+    work.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error: unknown) => { clearTimeout(timer); reject(error instanceof Error ? error : new Error("discovery_failed")); },
+    );
+  });
 }
 
 function validUUID(value: string): boolean {
@@ -263,10 +305,17 @@ class ActionReceiptStore {
     const observedAt = receipt.observedAt === undefined
       ? new Date().toISOString()
       : timestampDate(receipt.observedAt).toISOString();
+    // Receipts outlive their command: a replay after a long disconnect must
+    // return what happened, not a false "expired". Expired receipts make
+    // room first; the durable claim still blocks a second signal.
+    const now = Date.now();
     const receipts = (await this.#load())
-      .filter((entry) => entry.idempotencyKey !== receipt.idempotencyKey &&
-        (entry.expiresAt ? Date.parse(entry.expiresAt) : Date.parse(entry.observedAt) + 600_000) > Date.now());
-    if (receipts.length >= receiptLimit) throw new Error("Execution journal capacity reached");
+      .filter((entry) => entry.idempotencyKey !== receipt.idempotencyKey && receiptExpiry(entry) + receiptRetentionMs > now);
+    while (receipts.length >= receiptLimit) {
+      const oldestExpired = receipts.findIndex((entry) => receiptExpiry(entry) <= now);
+      if (oldestExpired < 0) throw new Error("Execution journal capacity reached");
+      receipts.splice(oldestExpired, 1);
+    }
     receipts.push({
       commandDigest, ...(expiresAt ? { expiresAt } : {}),
       actionId: receipt.actionId,
@@ -295,6 +344,10 @@ class ActionReceiptStore {
       throw error;
     }
   }
+}
+
+function receiptExpiry(entry: StoredReceipt): number {
+  return entry.expiresAt ? Date.parse(entry.expiresAt) : Date.parse(entry.observedAt) + 600_000;
 }
 
 function validStoredReceipt(value: unknown): value is StoredReceipt {

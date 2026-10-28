@@ -1,8 +1,11 @@
+import { atomicReplace } from "./atomic-replace.js";
 import { redactSecrets } from "./content-redaction.js";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, readdir, lstat, unlink, rename, writeFile } from "node:fs/promises";
-import { cpus, freemem, hostname, platform, release, totalmem, uptime } from "node:os";
+import { guardianRunnerPath } from "./guardian-native.js";
+import { parseTreeReport } from "./process-tree.js";
+import { mkdir, readFile, readdir, lstat, unlink, writeFile, type rename } from "node:fs/promises";
+import { formatInspection, inspectSystem, type RunningAgents } from "./system-inspection.js";
 import { join } from "node:path";
 import { create, fromJsonString, toJsonString } from "@bufbuild/protobuf";
 import { timestampDate, timestampFromDate } from "@bufbuild/protobuf/wkt";
@@ -11,6 +14,7 @@ import { AgentActionResultSchema, RemoteActionResultState as State, RemoteAction
 export const machineActionTypes: readonly Action[] = [Action.RUN_COMMAND, Action.INSPECT_SYSTEM, Action.SHUTDOWN_MACHINE, Action.RESTART_MACHINE];
 export type CommandSpec = { executable: string; arguments: string[]; working_directory?: string; timeout_seconds: number };
 const outputLimit = 32768;
+const outputDrainMs = 500;
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
 export function parseCommand(value: string): CommandSpec | null {
@@ -28,11 +32,20 @@ export function parseCommand(value: string): CommandSpec | null {
   return item as CommandSpec;
 }
 
+export type MachineCommandOptions = {
+  enabled: boolean;
+  machineID: string;
+  dataDirectory: string;
+  replace?: typeof rename;
+  /** Running agent processes for inspect_system; omitted means none are listed. */
+  agents?: () => Promise<RunningAgents>;
+};
+
 /** Separate machine-owner enrollment; durable claims prevent crash/retry execution. */
 export class MachineCommandExecutor {
-  readonly #options: { enabled: boolean; machineID: string; dataDirectory: string };
+  readonly #options: MachineCommandOptions;
   #queue: Promise<unknown> = Promise.resolve();
-  constructor(options: { enabled: boolean; machineID: string; dataDirectory: string }) {
+  constructor(options: MachineCommandOptions) {
     this.#options = options;
     this.#queue = pruneCommandReceipts(join(options.dataDirectory, "machine-operation-receipts"));
   }
@@ -83,20 +96,28 @@ export class MachineCommandExecutor {
     }
     let result: AgentActionResult;
     if (command.action === Action.INSPECT_SYSTEM) {
-      result = receipt(State.SUCCEEDED, "inspection_complete", "Current operating-system information collected.", { output: JSON.stringify({ hostname: hostname(), platform: platform(), release: release(), logical_cpus: cpus().length, memory_bytes: totalmem(), free_memory_bytes: freemem(), uptime_seconds: Math.floor(uptime()), observed_at: new Date().toISOString() }, null, 2), exitCode: 0 });
+      const report = await inspectSystem(this.#options.agents === undefined ? {} : { agents: this.#options.agents });
+      result = receipt(State.SUCCEEDED, "inspection_complete", report.agents_complete
+        ? "Current operating-system, disk and agent process information collected."
+        : "Current operating-system and disk information collected; the agent process list is incomplete.",
+      { output: formatInspection(report), exitCode: 0 });
     } else {
       const power = command.action === Action.SHUTDOWN_MACHINE || command.action === Action.RESTART_MACHINE;
       const operation = power ? powerCommand(command.action === Action.RESTART_MACHINE) : spec!;
       const execution = await runCommand(operation);
       const succeeded = execution.exitCode === 0 && !execution.timedOut;
-      result = receipt(succeeded ? State.SUCCEEDED : State.FAILED,
-        execution.timedOut ? "command_timeout" : succeeded ? (power ? "power_change_scheduled" : "command_completed") : "command_failed",
-        execution.timedOut ? "Command exceeded its time limit; termination was requested." : power && succeeded ? "Operating system accepted the power change scheduled for one minute from now." : succeeded ? "Command completed." : "Command did not complete successfully.",
-        { output: execution.output, outputTruncated: execution.truncated, ...(execution.exitCode === null ? {} : { exitCode: execution.exitCode }) });
+      result = !execution.launched
+        ? receipt(State.FAILED, "command_not_started", "The operating system could not start the executable. Nothing ran.", { output: execution.output })
+        : receipt(succeeded ? State.SUCCEEDED : State.FAILED,
+          execution.timedOut ? "command_timeout" : succeeded ? (power ? "power_change_scheduled" : "command_completed") : "command_failed",
+          execution.timedOut ? "Command exceeded its time limit; termination was requested." : power && succeeded ? "Operating system accepted the power change scheduled for one minute from now." : succeeded ? "Command completed." : "Command did not complete successfully.",
+          { output: execution.output, outputTruncated: execution.truncated, ...(execution.exitCode === null ? {} : { exitCode: execution.exitCode }) });
     }
     const temporary = `${path}.tmp`;
     await writeFile(temporary, JSON.stringify({ digest, receipt: toJsonString(AgentActionResultSchema, result) }), { mode: 0o600, flush: true });
-    await rename(temporary, path);
+    // A scanner briefly holding the receipt on Windows must not turn a
+    // completed command into "journal unavailable" with its output lost.
+    await atomicReplace(temporary, path, this.#options.replace);
     return result;
   }
 }
@@ -121,37 +142,87 @@ export function powerCommand(restart: boolean): CommandSpec {
     : { executable: "/sbin/shutdown", arguments: [restart ? "-r" : "-h", "+1"], timeout_seconds: 10 };
 }
 
+/** Names whose values are credentials, in environment variables and in NAME=value output. */
+export function credentialName(name: string): boolean {
+  const lower = name.toLowerCase();
+  if (lower === "key" || lower === "pwd" || lower === "oldpwd") return false;
+  return /token|secret|passw(?:or)?d|api[_-]?key|passphrase|credential|cookie|(?:key|pwd)$|(?:^|[_.-])auth$|dsn$|connection[_-]?string/u.test(lower);
+}
+
+// Command output only: well-known credential formats beyond the shared set.
+const commandTokenFormats = /\b(?:glpat-[A-Za-z0-9_-]{20,}|xapp-[A-Za-z0-9-]{10,}|hf_[A-Za-z0-9]{30,}|ya29\.[A-Za-z0-9_-]{20,}|rk_(?:live|test)_[A-Za-z0-9]{10,}|shpat_[a-fA-F0-9]{32}|dop_v1_[a-f0-9]{64}|pypi-[A-Za-z0-9_-]{50,})/gu;
+const assignment = /(^|[\s;,{(&?-])(["']?)([A-Za-z_][A-Za-z0-9_.-]{0,127})\2([ \t]*[:=][ \t]*)("[^"\n]*"|'[^'\n]*'|[^\s,;}&]+)/gmu;
+
 export function redactCommandOutput(value: string): string {
-  let safe = redactSecrets(value, "[REDACTED]");
-  for (const [key, secret] of Object.entries(process.env)) if (/TOKEN|SECRET|PASSWORD|API_KEY/iu.test(key) && secret && secret.length >= 8) safe = safe.split(secret).join("[REDACTED]");
+  let safe = redactSecrets(value, "[REDACTED]").replace(commandTokenFormats, "[REDACTED]");
+  // Short values such as ids and booleans stay readable.
+  safe = safe.replace(assignment, (match: string, lead: string, quote: string, name: string, separator: string, item: string) =>
+    credentialName(name) && item.replace(/^["']|["']$/gu, "").length >= 6 && !item.includes("[REDACTED")
+      ? `${lead}${quote}${name}${quote}${separator}[REDACTED]`
+      : match);
+  for (const [key, secret] of Object.entries(process.env)) if (credentialName(key) && secret && secret.length >= 8) safe = safe.split(secret).join("[REDACTED]");
   // The paired credential lives in the data directory, not the environment;
   // redactSecrets masks its phg_m_ prefix wherever it is printed.
   return safe;
 }
 
-export async function runCommand(spec: CommandSpec): Promise<{ output: string; exitCode: number | null; truncated: boolean; timedOut: boolean }> {
+export type CommandExecution = { output: string; exitCode: number | null; truncated: boolean; timedOut: boolean; launched: boolean };
+
+function launchFailure(executable: string): CommandExecution {
+  const batch = process.platform === "win32" && /\.(?:cmd|bat)$/iu.test(executable)
+    ? " Windows runs .cmd and .bat files only through cmd.exe; use cmd.exe with the arguments /d /c and the script path."
+    : "";
+  return { output: `The operating system could not start the requested executable.${batch}`, exitCode: null, truncated: false, timedOut: false, launched: false };
+}
+
+export async function runCommand(spec: CommandSpec): Promise<CommandExecution> {
   return new Promise((resolve) => {
-    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^PHIGON_|TOKEN|SECRET|PASSWORD|API_KEY/iu.test(key)));
-    const child = spawn(spec.executable, spec.arguments, { shell: false, windowsHide: true, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"], env, ...(spec.working_directory ? { cwd: spec.working_directory } : {}) });
+    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^PHIGON_/iu.test(key) && !credentialName(key)));
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(spec.executable, spec.arguments, { shell: false, windowsHide: true, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"], env, ...(spec.working_directory ? { cwd: spec.working_directory } : {}) });
+    } catch {
+      // Node refuses some launches synchronously (for example a Windows batch
+      // file without a shell). That must still produce a receipt.
+      resolve(launchFailure(spec.executable));
+      return;
+    }
+    const stdout = child.stdout!; const stderr = child.stderr!;
     let collected = Buffer.alloc(0); let truncated = false; let timedOut = false; let done = false;
     const consume = (chunk: Buffer) => { const remaining = outputLimit - collected.length; if (chunk.length > remaining) truncated = true; if (remaining > 0) collected = Buffer.concat([collected, chunk.subarray(0, remaining)]); };
     const finish = (exitCode: number | null) => {
-      if (done) return; done = true; clearTimeout(timeout); clearTimeout(hardDeadline);
+      if (done) return; done = true; clearTimeout(timeout); clearTimeout(hardDeadline); clearTimeout(drain);
       const safe = Buffer.from(redactCommandOutput(truncated ? collected.toString("utf8").replace(/[^\n]*$/u, "[TRUNCATED]") : collected.toString("utf8")));
       // Leave room for a final UTF-8 replacement character after a byte boundary.
       const output = safe.subarray(0, outputLimit - 4).toString("utf8");
-      resolve({ output, exitCode, truncated: truncated || safe.length > outputLimit - 4, timedOut });
+      resolve({ output, exitCode, truncated: truncated || safe.length > outputLimit - 4, timedOut, launched: true });
     };
-    child.stdout.on("data", consume); child.stderr.on("data", consume);
-    child.once("error", () => { consume(Buffer.from("Operating system could not launch the requested executable.")); finish(null); });
+    stdout.on("data", consume); stderr.on("data", consume);
+    child.once("error", () => {
+      // After a successful start, "error" only reports a failed kill; "close" follows.
+      if (child.pid !== undefined || done) return;
+      done = true; clearTimeout(timeout); clearTimeout(hardDeadline);
+      resolve(launchFailure(spec.executable));
+    });
     child.once("close", (code) => finish(code));
+    // "close" waits for every holder of the output pipes. A background process
+    // the command started can hold them long after the command exited, so
+    // report the command's own exit after a short drain instead of a timeout.
+    let drain: NodeJS.Timeout | undefined;
+    child.once("exit", (code) => {
+      drain = setTimeout(() => { stdout.destroy(); stderr.destroy(); finish(code); }, outputDrainMs);
+    });
     const timeout = setTimeout(() => {
       timedOut = true;
       if (process.platform === "win32" && child.pid) {
-        const killer = spawn(join(process.env["SystemRoot"] ?? "C:\\Windows", "System32", "taskkill.exe"), ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
-        killer.on("error", () => child.kill());
+        // taskkill /T trusts recorded parent PIDs, so it can also end an
+        // unrelated process whose dead parent's PID our command reused. The
+        // helper accepts only our direct child and descendants created after
+        // their parent. Our own child is still held, so killing it is safe.
+        execFile(guardianRunnerPath(), ["--kill-pid", String(child.pid), "--own-child", "--tree"], { windowsHide: true, timeout: 15_000, maxBuffer: 16 << 10, encoding: "utf8" },
+          (error, stdout) => { if (error !== null || parseTreeReport(stdout).outcome !== "dispatched") child.kill(); });
       } else { try { if (child.pid) process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); } }
     }, spec.timeout_seconds * 1000);
-    const hardDeadline = setTimeout(() => { child.stdout.destroy(); child.stderr.destroy(); child.unref(); finish(null); }, spec.timeout_seconds * 1000 + 3000);
+    const hardDeadline = setTimeout(() => { stdout.destroy(); stderr.destroy(); child.unref(); finish(null); }, spec.timeout_seconds * 1000 + 3000);
   });
 }

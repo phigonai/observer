@@ -2,6 +2,7 @@ import { create } from "@bufbuild/protobuf";
 import { timestampFromDate } from "@bufbuild/protobuf/wkt";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -164,7 +165,116 @@ test("a durable claim blocks another signal when the completion journal is missi
     actionId: actionID, idempotencyKey, machineId: machineID, agentId: "claimed-runtime", processId: BigInt(child.pid!),
     expectedStartedAt: startedAt, expiresAt: timestampFromDate(new Date(Date.now() + 60000)), action: RemoteActionType.KILL_AGENT,
   }));
-  assert.equal(result.resultCode, "execution_journal_unavailable");
+  assert.equal(result.resultCode, "execution_interrupted");
+  assert.equal(result.state, RemoteActionResultState.FAILED);
   assert.equal(child.exitCode, null); assert.equal(child.signalCode, null);
   assert.doesNotThrow(() => process.kill(child.pid!, 0));
+});
+
+test("a command that expires during slow process discovery is never dispatched", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-agent-action-slow-discovery-"));
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); });
+  await once(child, "spawn");
+  const evidence = await new SystemEvidenceProvider().listProcesses();
+  const observed = evidence.status === "ok" ? evidence.value.find((entry) => entry.processId === child.pid) : undefined;
+  assert.ok(observed, "the test process must have an OS-observed lifetime");
+  const startedAt = timestampFromDate(observed.startedAt);
+  const executor = new AgentActionExecutor({ enabled: true, machineID, dataDirectory: directory,
+    inventory: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      return create(AgentInventorySchema, { machineId: machineID, agents: [create(AgentIdentitySchema, {
+        agentId: "slow-runtime", processId: BigInt(child.pid!), state: AgentState.RUNNING, startedAt, capabilities: ["process-instance"],
+      })] });
+    },
+  });
+  const result = await executor.execute(create(AgentActionCommandSchema, {
+    actionId: actionID, idempotencyKey, machineId: machineID, agentId: "slow-runtime", processId: BigInt(child.pid!),
+    expectedStartedAt: startedAt, expiresAt: timestampFromDate(new Date(Date.now() + 400)), action: RemoteActionType.KILL_AGENT,
+  }));
+  assert.equal(result.state, RemoteActionResultState.EXPIRED);
+  assert.equal(result.resultCode, "command_expired");
+  assert.equal(result.targetStillRunning, true);
+  assert.equal(child.exitCode, null); assert.equal(child.signalCode, null);
+});
+
+test("a replay after the command expires returns the original receipt, not a false expiry", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-agent-action-retained-"));
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); });
+  await once(child, "spawn");
+  const evidence = await new SystemEvidenceProvider().listProcesses();
+  const observed = evidence.status === "ok" ? evidence.value.find((entry) => entry.processId === child.pid) : undefined;
+  assert.ok(observed, "the test process must have an OS-observed lifetime");
+  const startedAt = timestampFromDate(observed.startedAt);
+  let running = true;
+  const executor = new AgentActionExecutor({ enabled: true, machineID, dataDirectory: directory,
+    inventory: async () => create(AgentInventorySchema, { machineId: machineID, agents: running ? [create(AgentIdentitySchema, {
+      agentId: "retained-runtime", processId: BigInt(child.pid!), state: AgentState.RUNNING, startedAt, capabilities: ["process-instance"],
+    })] : [] }),
+  });
+  const expiresAt = Date.now() + 3_000;
+  const command = create(AgentActionCommandSchema, {
+    actionId: actionID, idempotencyKey, machineId: machineID, agentId: "retained-runtime", processId: BigInt(child.pid!),
+    expectedStartedAt: startedAt, expiresAt: timestampFromDate(new Date(expiresAt)), action: RemoteActionType.KILL_AGENT,
+  });
+  const first = await executor.execute(command);
+  assert.equal(first.resultCode, "process_stopped");
+  running = false;
+  await new Promise((resolve) => setTimeout(resolve, Math.max(0, expiresAt + 100 - Date.now())));
+  // Any later operation rewrites the journal; the expired receipt must survive it.
+  await executor.execute(create(AgentActionCommandSchema, { ...command, actionId: randomUUID(),
+    idempotencyKey: randomUUID(), expiresAt: timestampFromDate(new Date(Date.now() + 60_000)) }));
+  const replay = await new AgentActionExecutor({ enabled: true, machineID, dataDirectory: directory,
+    inventory: async () => create(AgentInventorySchema, { machineId: machineID }) }).execute(command);
+  assert.deepEqual(replay, first);
+});
+
+test("retained expired receipts make room instead of blocking new commands", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-agent-action-capacity-"));
+  const expired = new Date(Date.now() - 60_000).toISOString();
+  const hex = (value: number) => value.toString(16).padStart(12, "0");
+  await writeFile(join(directory, "agent-action-receipts.json"), JSON.stringify(Array.from({ length: 256 }, (_, index) => ({
+    commandDigest: "a".repeat(64), expiresAt: expired, actionId: `00000000-0000-4000-8000-${hex(index)}`,
+    idempotencyKey: `00000000-0000-4000-9000-${hex(index)}`, machineId: machineID, state: RemoteActionResultState.SUCCEEDED,
+    resultCode: "process_stopped", detail: "Synthetic", observedAt: expired, targetStillRunning: false,
+  }))));
+  const executor = new AgentActionExecutor({ enabled: false, machineID, dataDirectory: directory,
+    inventory: async () => create(AgentInventorySchema, { machineId: machineID }) });
+  const result = await executor.execute(create(AgentActionCommandSchema, {
+    actionId: actionID, idempotencyKey, machineId: machineID, agentId: "runtime", processId: 42n,
+    expectedStartedAt: timestampFromDate(new Date()), expiresAt: timestampFromDate(new Date(Date.now() + 60_000)), action: RemoteActionType.KILL_AGENT,
+  }));
+  assert.equal(result.resultCode, "executor_disabled");
+});
+
+test("a claimed signal without a receipt is reported as interrupted, even after expiry", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-agent-action-claim-expired-"));
+  await mkdir(join(directory, "process-operation-claims"));
+  await writeFile(join(directory, "process-operation-claims", `${idempotencyKey}.claim`), "previously claimed");
+  let reads = 0;
+  const executor = new AgentActionExecutor({ enabled: true, machineID, dataDirectory: directory,
+    inventory: async () => { reads++; return create(AgentInventorySchema, { machineId: machineID }); } });
+  const result = await executor.execute(create(AgentActionCommandSchema, {
+    actionId: actionID, idempotencyKey, machineId: machineID, agentId: "claimed-runtime", processId: 4242n,
+    expectedStartedAt: timestampFromDate(new Date()), expiresAt: timestampFromDate(new Date(Date.now() - 1_000)), action: RemoteActionType.KILL_AGENT,
+  }));
+  assert.equal(result.state, RemoteActionResultState.FAILED);
+  assert.equal(result.resultCode, "execution_interrupted");
+  assert.equal(reads, 0);
+});
+
+test("process discovery that never answers ends within the command window without a signal", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-agent-action-hung-discovery-"));
+  const executor = new AgentActionExecutor({ enabled: true, machineID, dataDirectory: directory,
+    inventory: () => new Promise(() => undefined),
+  });
+  const started = Date.now();
+  const result = await executor.execute(create(AgentActionCommandSchema, {
+    actionId: actionID, idempotencyKey, machineId: machineID, agentId: "hung-runtime", processId: 4242n,
+    expectedStartedAt: timestampFromDate(new Date()), expiresAt: timestampFromDate(new Date(Date.now() + 500)), action: RemoteActionType.KILL_AGENT,
+  }));
+  assert.ok(Date.now() - started < 3_000);
+  assert.equal(result.state, RemoteActionResultState.EXPIRED);
+  assert.equal(result.resultCode, "command_expired");
 });

@@ -3,6 +3,7 @@ import { timestampFromDate } from "@bufbuild/protobuf/wkt";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { GuardianContainmentExecutor } from "../src/guardian-containment.js";
+import type { ExactProcess, ProcessTreeControl, TreeStopMode, TreeStopOutcome } from "../src/process-tree.js";
 import { AgentState } from "../src/generated/phigon/v1/common_pb.js";
 import {
   AgentIdentitySchema,
@@ -24,10 +25,25 @@ function inventory(processID = 42n) {
   });
 }
 
+function recordingControl(outcome: TreeStopOutcome) {
+  const calls: Array<{ target: ExactProcess; mode: TreeStopMode }> = [];
+  const control: ProcessTreeControl = {
+    stop: async (target, mode) => {
+      calls.push({ target, mode });
+      return outcome;
+    },
+  };
+  return { control, calls };
+}
+
+const stopped: TreeStopOutcome = { outcome: "dispatched", rootRunning: false, descendants: 1, descendantsRunning: 0, descendantsDenied: 0 };
+
 test("an unavailable containment executor fails closed", async () => {
   let inventoryReads = 0;
+  const { control, calls } = recordingControl(stopped);
   const executor = new GuardianContainmentExecutor({
     enabled: false,
+    processControl: control,
     inventory: async () => {
       inventoryReads += 1;
       return inventory();
@@ -41,18 +57,16 @@ test("an unavailable containment executor fails closed", async () => {
   });
   assert.equal(response.code, "containment_disabled");
   assert.equal(inventoryReads, 0);
+  assert.equal(calls.length, 0);
 });
 
 test("containment rejects a stale process lifetime without signaling", async () => {
-  let signalCount = 0;
+  const { control, calls } = recordingControl(stopped);
   const executor = new GuardianContainmentExecutor({
     enabled: true,
     inventory: async () => inventory(43n),
     observerProcessID: 999,
-    platform: "linux",
-    signal: () => {
-      signalCount += 1;
-    },
+    processControl: control,
   });
   const response = await executor.execute({
     intervention: "kill_agent",
@@ -61,26 +75,16 @@ test("containment rejects a stale process lifetime without signaling", async () 
     expectedStartedAt: startedAt.toISOString(),
   });
   assert.equal(response.code, "stale_target");
-  assert.equal(signalCount, 0);
+  assert.equal(calls.length, 0);
 });
 
-test("containment signals only the verified process instance", async () => {
-  let alive = true;
-  const dispatched: string[] = [];
+test("containment force-stops only the verified process lifetime and its tree", async () => {
+  const { control, calls } = recordingControl(stopped);
   const executor = new GuardianContainmentExecutor({
     enabled: true,
     inventory: async () => inventory(),
     observerProcessID: 999,
-    platform: "linux",
-    signal: (_processID, signal) => {
-      if (signal === 0) {
-        if (!alive) throw Object.assign(new Error("gone"), { code: "ESRCH" });
-        return;
-      }
-      dispatched.push(signal);
-      alive = false;
-    },
-    sleep: async () => {},
+    processControl: control,
   });
   const response = await executor.execute({
     intervention: "kill_agent",
@@ -89,30 +93,17 @@ test("containment signals only the verified process instance", async () => {
     expectedStartedAt: startedAt.toISOString(),
   });
   assert.equal(response.state, "succeeded");
-  assert.deepEqual(dispatched, ["SIGKILL"]);
+  assert.equal(response.targetStillRunning, false);
+  assert.deepEqual(calls, [{ target: { processId: 42, startedAt }, mode: "kill" }]);
 });
 
-test("Windows stop makes a bounded graceful attempt without force escalation", async () => {
-  let alive = true;
-  const graceful: number[] = [];
-  const signals: string[] = [];
+test("a graceful stop never escalates and reports what the platform could not do", async () => {
+  const { control, calls } = recordingControl({ outcome: "graceful_unsupported" });
   const executor = new GuardianContainmentExecutor({
     enabled: true,
     inventory: async () => inventory(),
     observerProcessID: 999,
-    platform: "win32",
-    signal: (_processID, signal) => {
-      if (signal === 0) {
-        if (!alive) throw Object.assign(new Error("gone"), { code: "ESRCH" });
-        return;
-      }
-      signals.push(signal);
-    },
-    windowsGracefulStop: async (processID) => {
-      graceful.push(processID);
-      alive = false;
-    },
-    sleep: async () => {},
+    processControl: control,
   });
   const response = await executor.execute({
     intervention: "stop_agent",
@@ -120,7 +111,33 @@ test("Windows stop makes a bounded graceful attempt without force escalation", a
     processId: 42,
     expectedStartedAt: startedAt.toISOString(),
   });
-  assert.equal(response.state, "succeeded");
-  assert.deepEqual(graceful, [42]);
-  assert.deepEqual(signals, []);
+  assert.equal(response.state, "rejected");
+  assert.equal(response.code, "graceful_stop_unsupported");
+  assert.equal(response.targetStillRunning, true);
+  assert.deepEqual(calls.map((call) => call.mode), ["stop"]);
+});
+
+test("containment reports surviving children and refuses the observer itself", async () => {
+  const { control, calls } = recordingControl({ outcome: "dispatched", rootRunning: false, descendants: 2, descendantsRunning: 0, descendantsDenied: 1 });
+  const executor = new GuardianContainmentExecutor({
+    enabled: true,
+    inventory: async () => inventory(),
+    observerProcessID: 999,
+    processControl: control,
+  });
+  const response = await executor.execute({
+    intervention: "kill_agent",
+    agentId: "codex:runtime:42",
+    processId: 42,
+    expectedStartedAt: startedAt.toISOString(),
+  });
+  assert.equal(response.code, "process_stopped_children_running");
+  const self = await executor.execute({
+    intervention: "kill_agent",
+    agentId: "codex:runtime:42",
+    processId: 999,
+    expectedStartedAt: startedAt.toISOString(),
+  });
+  assert.equal(self.code, "self_target_rejected");
+  assert.equal(calls.length, 1);
 });
