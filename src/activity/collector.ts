@@ -276,6 +276,7 @@ export class ActivityCollector {
         }
         // Release the collection lock between bounded batches. A large archive
         // must not prevent the live reader from following current work.
+        const started = performance.now();
         const pass = await this.#withScanLock(async () => {
           const before = this.#emittedEvents;
           const result = await this.#collectOnce(this.#historyReader, true);
@@ -287,6 +288,8 @@ export class ActivityCollector {
         complete = pass.complete;
         if (!complete && pass.sourceRecords === 0) {
           await abortableDelay(100, signal ?? new AbortController().signal);
+        } else if (!complete) {
+          await abortableDelay(historyRest(performance.now() - started), signal ?? new AbortController().signal);
         }
       }
       return Object.freeze({
@@ -1057,6 +1060,17 @@ function clampObservedAt(value: Date, now: Date): Date {
   if (Number.isNaN(value.getTime())) return now;
   if (value.getTime() > now.getTime() + 5 * 60_000) return now;
   return value;
+}
+
+/**
+ * How long a history import rests after a batch that took `spentMs`. Resting
+ * as long as the batch worked keeps a large first import near half a core,
+ * and leaves the other half of the event loop to live collection; a full
+ * catch-up once held a whole core for minutes. One second at most.
+ */
+export function historyRest(spentMs: number): number {
+  if (!Number.isFinite(spentMs) || spentMs <= 0) return 0;
+  return Math.min(1_000, Math.round(spentMs));
 }
 
 async function abortableDelay(
