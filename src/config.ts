@@ -18,6 +18,7 @@ export type ActivitySourceDirectories = Readonly<{
   cursor: readonly string[];
   copilotChat: readonly string[];
   kiro: readonly string[];
+  zed: readonly string[];
   generic: readonly string[];
 }>;
 
@@ -311,6 +312,10 @@ export function loadConfig(
           "kiro.kiroagent",
           "workspace-sessions",
         )],
+      ),
+      zed: parseDirectoryList(
+        environment["PHIGON_ZED_ACTIVITY_DIRS"],
+        zedThreadDirectories(environment),
       ),
       generic: parseDirectoryList(
         environment["PHIGON_GENERIC_ACTIVITY_DIRS"],
@@ -607,6 +612,34 @@ function gooseSessionDirectories(
     "goose",
     "sessions",
   )];
+}
+
+/**
+ * Zed keeps agent threads in <data dir>/threads/threads.db. The data
+ * directory is %LOCALAPPDATA%/Zed on Windows, ~/Library/Application
+ * Support/Zed on macOS, and $FLATPAK_XDG_DATA_HOME or $XDG_DATA_HOME (or
+ * ~/.local/share) with "zed" elsewhere. The Flatpak build's own data folder
+ * is included because Zed outside the sandbox does not see it.
+ */
+function zedThreadDirectories(
+  environment: NodeJS.ProcessEnv,
+): readonly string[] {
+  if (process.platform === "win32") {
+    const localAppData = environment["LOCALAPPDATA"]?.trim() ||
+      join(homedir(), "AppData", "Local");
+    return [join(localAppData, "Zed", "threads")];
+  }
+  if (process.platform === "darwin") {
+    return [join(homedir(), "Library", "Application Support", "Zed", "threads")];
+  }
+  const dataHome = [
+    environment["FLATPAK_XDG_DATA_HOME"]?.trim(),
+    environment["XDG_DATA_HOME"]?.trim(),
+  ].find((value) => value !== undefined && isAbsolute(value));
+  return [
+    join(dataHome ?? join(homedir(), ".local", "share"), "zed", "threads"),
+    join(homedir(), ".var", "app", "dev.zed.Zed", "data", "zed", "threads"),
+  ];
 }
 
 /**

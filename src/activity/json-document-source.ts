@@ -229,7 +229,7 @@ export async function scanJSONDocumentSource(
   return { records, files: selected.length, malformed, oversized, complete };
 }
 
-function packCursor(
+export function packCursor(
   messages: readonly unknown[],
   count: number,
   idField: string | undefined,
@@ -246,7 +246,7 @@ function packCursor(
  * gone the document was rewritten and everything present is treated as
  * already delivered.
  */
-function resumeIndex(
+export function resumeIndex(
   messages: readonly unknown[],
   cursor: number,
   idField: string | undefined,

@@ -227,6 +227,23 @@ test("loadConfig reads Kiro chat sessions from the editor storage folder", () =>
   );
 });
 
+test("loadConfig finds Zed's threads database folder", () => {
+  const [directory] = loadConfig({ LOCALAPPDATA: join(tmpdir(), "local"), XDG_DATA_HOME: "/srv/data" })
+    .activitySourceDirectories.zed;
+  assert.equal(
+    directory,
+    process.platform === "win32"
+      ? join(tmpdir(), "local", "Zed", "threads")
+      : process.platform === "darwin"
+        ? join(homedir(), "Library", "Application Support", "Zed", "threads")
+        : join("/srv/data", "zed", "threads"),
+  );
+  assert.deepEqual(
+    loadConfig({ PHIGON_ZED_ACTIVITY_DIRS: "none" }).activitySourceDirectories.zed,
+    [],
+  );
+});
+
 test("loadConfig finds the Goose sessions database directory", () => {
   assert.deepEqual(
     loadConfig({ GOOSE_PATH_ROOT: "/srv/goose" }).activitySourceDirectories.goose,

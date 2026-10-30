@@ -38,7 +38,7 @@ export type SourceReaderMode = "live" | "history";
 export type ActivitySource = Readonly<{
   adapterId: string;
   roots: readonly string[];
-  format?: "jsonl" | "opencode-sqlite" | "json-messages" | "goose-sqlite";
+  format?: "jsonl" | "opencode-sqlite" | "json-messages" | "goose-sqlite" | "zed-sqlite";
   sourceDisplayName?: string;
   /** For json-messages sources: the top-level messages array field. */
   messagesField?: string;
@@ -256,6 +256,7 @@ export class JSONLSourceReader {
   // Folder listings for JSON-document agents, reused while folders are unchanged.
   readonly #documentListings = new DirectoryListingCache();
   readonly #gooseConnections = new SQLiteConnections();
+  readonly #zedConnections = new SQLiteConnections();
 
   constructor(
     dataDirectory: string,
@@ -485,6 +486,36 @@ export class JSONLSourceReader {
       remainingRecords -= goose.records.length;
       documentsComplete = documentsComplete && goose.complete;
     }
+    for (const source of sources) {
+      if (source.format !== "zed-sqlite") continue;
+      if (remainingRecords <= reservedDatabaseRecords) {
+        documentsComplete = false;
+        break;
+      }
+      const { scanZedSQLiteSources } = await import("./zed-sqlite-source.js");
+      const zed = await scanZedSQLiteSources({
+        adapterId: source.adapterId,
+        roots: source.roots.map(expandedActivityRoot),
+        cursors: this.#cursors,
+        initialScan,
+        replayOnFirstStart: this.#replayOnFirstStart,
+        replaySessions: this.#initialReplaySessions,
+        maxReplayRecords: Math.max(
+          32,
+          Math.floor(this.#initialReplayBytes / 1_024),
+        ),
+        maxRecords: remainingRecords - reservedDatabaseRecords,
+        historical: this.#mode === "history",
+        ...(this.#mode === "live" ? { connections: this.#zedConnections } : { completedHistory: this.#completedHistoryDatabases }),
+      });
+      records.push(...zed.records);
+      fileCount += zed.files;
+      malformed += zed.malformed;
+      oversized += zed.oversized;
+      documentFiles += zed.files;
+      remainingRecords -= zed.records.length;
+      documentsComplete = documentsComplete && zed.complete;
+    }
     let sqliteComplete = true;
     let sqliteFiles = 0;
     for (const source of sources) {
@@ -525,6 +556,7 @@ export class JSONLSourceReader {
     }
     this.#openCodeConnections.retain(configuredRoots(sources, "opencode-sqlite"));
     this.#gooseConnections.retain(configuredRoots(sources, "goose-sqlite"));
+    this.#zedConnections.retain(configuredRoots(sources, "zed-sqlite"));
     this.#initialScanComplete = true;
     this.#cursors.settle(maxCursorEntries);
     const checkpoint = Object.freeze({
@@ -568,6 +600,7 @@ export class JSONLSourceReader {
   close(): void {
     this.#openCodeConnections.closeAll();
     this.#gooseConnections.closeAll();
+    this.#zedConnections.closeAll();
   }
 
   /**

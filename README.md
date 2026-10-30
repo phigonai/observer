@@ -58,7 +58,7 @@ exactly what runs on your computers and what leaves them.
 | | Kiro | Yes | Built in (chat; agent actions not yet) |
 | | Antigravity | Yes | Not yet (no documented conversation format) |
 | | Trae | Yes | Not yet (its history database is encrypted) |
-| | Zed | Yes | Not yet |
+| | Zed (its own agent) | Yes | Built in |
 | | Factory Droid | Yes | Not yet |
 | | Roo Code | Yes | Not yet |
 | | Aider, Amazon Q Developer CLI, Continue | Yes | Bridge |
