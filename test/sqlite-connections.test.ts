@@ -247,8 +247,10 @@ test("an idle OpenCode database is closed, then reopened by a file change or the
     connections,
   });
   // Pins both files' modification times, standing in for a commit that a
-  // coarse file timestamp cannot show.
-  const fixed = new Date("2026-01-01T00:00:00.000Z");
+  // coarse file timestamp cannot show. The time is after the files were
+  // created: macOS moves a file's birth time back to an earlier modification
+  // time, which would make the database look replaced.
+  const fixed = new Date(Math.ceil(Date.now() / 1_000) * 1_000 + 3_600_000);
   const pinTimes = async () => {
     await utimes(path, fixed, fixed);
     await utimes(`${path}-wal`, fixed, fixed);
