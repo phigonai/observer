@@ -14,6 +14,7 @@ import { hermesActivityAdapter } from "../src/activity/adapters/hermes.js";
 import { kiroActivityAdapter } from "../src/activity/adapters/kiro.js";
 import { openClawActivityAdapter } from "../src/activity/adapters/openclaw.js";
 import { openCodeActivityAdapter } from "../src/activity/adapters/opencode.js";
+import { zedActivityAdapter } from "../src/activity/adapters/zed.js";
 import { errorDraft, toolDrafts } from "../src/activity/normalize.js";
 import { LocalPolicyEngine, truncateUTF8 } from "../src/activity/policy.js";
 import type {
@@ -1842,6 +1843,87 @@ test("Goose session messages become prompts, replies, commands, and file edits",
     ),
     [["/workspace/a.ts", FilesystemOperation.WRITE]],
   );
+});
+
+test("Zed thread items become prompts, replies, reasoning, commands, and file edits", () => {
+  const config = loadConfig({ PHIGON_OBSERVABILITY_PROFILE: "full" });
+  const context = {
+    sessionId: "session-zed",
+    observedAt,
+    policy: new LocalPolicyEngine(config.policy),
+  };
+  const timestamp = "2026-07-24T10:00:00.000Z";
+  const reply = (block: unknown) => ({ type: "zed_message", role: "assistant", content: [block], thread_id: "t1", timestamp });
+  const drafts = [
+    {
+      type: "zed_message",
+      role: "user",
+      content: [
+        { Text: "Why does " },
+        { Mention: { uri: { File: { abs_path: "/workspace/src/main.rs" } } } },
+        { Text: " panic?" },
+        { Image: {} },
+      ],
+      thread_id: "t1",
+      timestamp,
+    },
+    reply({ Thinking: { text: "Check the unwrap." } }),
+    reply({ Text: "It unwraps a missing value." }),
+    reply({ ToolUse: { id: "tool_1", name: "terminal", input: { command: "cargo test", cd: "workspace" }, is_input_complete: true } }),
+    reply({ ToolUse: { id: "tool_2", name: "edit_file", input: { path: "workspace/src/main.rs", mode: "edit", display_description: "Fix" }, is_input_complete: true } }),
+    { type: "zed_tool_result", tool_use_id: "tool_1", tool_name: "", is_error: true, content: "1 failed", thread_id: "t1", timestamp },
+    { type: "zed_tool_result", tool_use_id: "tool_2", tool_name: "edit_file", is_error: false, content: "Edited", thread_id: "t1", timestamp },
+    { type: "zed_message", role: "user", content: [{ Image: {} }], thread_id: "t1", timestamp },
+  ].flatMap((record) => zedActivityAdapter.parse(record, context));
+
+  assert.deepEqual(
+    drafts.flatMap((draft) =>
+      draft.payload.case === "activity"
+        ? [[draft.payload.value.kind, draft.payload.value.content]]
+        : []
+    ),
+    [
+      [ActivityKind.PROMPT, "Why does @main.rs panic?"],
+      [ActivityKind.REASONING, "Check the unwrap."],
+      [ActivityKind.RESPONSE, "It unwraps a missing value."],
+    ],
+  );
+  assert.deepEqual(
+    drafts.flatMap((draft) =>
+      draft.payload.case === "tool"
+        ? [[draft.payload.value.toolName, draft.payload.value.phase]]
+        : []
+    ),
+    [
+      ["terminal", ToolPhase.REQUESTED],
+      ["edit_file", ToolPhase.REQUESTED],
+      ["terminal", ToolPhase.FAILED],
+      ["edit_file", ToolPhase.SUCCEEDED],
+    ],
+  );
+  assert.deepEqual(
+    drafts.flatMap((draft) =>
+      draft.payload.case === "terminal"
+        ? [[draft.payload.value.phase, draft.payload.value.arguments ?? ""]]
+        : []
+    ),
+    [
+      [TerminalPhase.STARTED, "cargo test"],
+      [TerminalPhase.EXITED, ""],
+    ],
+  );
+  assert.deepEqual(
+    drafts.flatMap((draft) =>
+      draft.payload.case === "filesystem"
+        ? [[draft.payload.value.resource?.identifier, draft.payload.value.operation]]
+        : []
+    ),
+    [["workspace/src/main.rs", FilesystemOperation.WRITE]],
+  );
+  assertMetadataOnly(zedActivityAdapter.parse(
+    { type: "zed_message", role: "user", content: [{ Text: "fixturesecret in /private/project" }] },
+    { sessionId: "session-zed-private", observedAt, policy: metadataOnlyPolicy() },
+  ));
 });
 
 test("Copilot CLI compatible bridge records preserve prompts, replies, and tools", () => {

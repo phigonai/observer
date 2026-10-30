@@ -168,8 +168,8 @@ const genericAgents: readonly KnownAgentSpec[] = [
     processModel: "application",
   },
   {
-    // Zed stores agent threads compressed in threads/threads.db. No thread
-    // could be inspected yet, so only the application is discovered.
+    // Threads of Zed's own agent are read from threads/threads.db
+    // (zed-sqlite-source.ts). Only that agent saves threads there.
     id: "generic:zed",
     kind: AgentKind.GENERIC,
     displayName: "Zed",
@@ -181,7 +181,7 @@ const genericAgents: readonly KnownAgentSpec[] = [
       "~/Library/Application Support/Zed",
       "~/.config/zed",
     ],
-    capabilities: ["filesystem", "mcp", "terminal"],
+    capabilities: ["activity", "filesystem", "mcp", "native-activity", "terminal"],
     processModel: "application",
   },
   {

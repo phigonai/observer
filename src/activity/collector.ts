@@ -32,6 +32,7 @@ import { hermesActivityAdapter } from "./adapters/hermes.js";
 import { kiroActivityAdapter } from "./adapters/kiro.js";
 import { openClawActivityAdapter } from "./adapters/openclaw.js";
 import { openCodeActivityAdapter } from "./adapters/opencode.js";
+import { zedActivityAdapter } from "./adapters/zed.js";
 import { createOpenAICompatibleAdapter } from "./adapters/openai-compatible.js";
 import { activityBridgeAgents } from "./bridges.js";
 import { genericActivityAdapter } from "./adapters/generic.js";
@@ -83,6 +84,7 @@ const adapters: ReadonlyMap<string, VendorActivityAdapter> = new Map([
   ["cursor-transcript", cursorActivityAdapter],
   ["copilot-chat", copilotChatActivityAdapter],
   ["kiro-session", kiroActivityAdapter],
+  ["zed-thread", zedActivityAdapter],
 ]);
 
 export type ActivityCollectorMetrics = Readonly<{
@@ -887,6 +889,11 @@ function configuredSources(config: ObserverConfig): readonly ActivitySource[] {
       },
     },
     {
+      adapterId: "zed-thread",
+      roots: config.activitySourceDirectories.zed,
+      format: "zed-sqlite",
+    },
+    {
       adapterId: "generic",
       roots: config.activitySourceDirectories.generic,
     },
@@ -954,6 +961,7 @@ function sourceIdentityDisplayName(
       case "cursor-transcript": return "Cursor";
       case "copilot-chat": return "GitHub Copilot";
       case "kiro-session": return "Kiro";
+      case "zed-thread": return "Zed";
       default: return "Agent activity";
     }
   })();
