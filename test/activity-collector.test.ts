@@ -11,6 +11,7 @@ import test from "node:test";
 import {
   ActivityCollector,
   attributedRuntimeAgentID,
+  historyRest,
   mergeInventoryWithSourceIdentities,
   reportedGenericAgentIdentity,
   reportedProcessIdentity,
@@ -1331,4 +1332,13 @@ test("generic records without runtime evidence stay on source identity", async (
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("a history import rests as long as each batch worked, at most a second", () => {
+  assert.equal(historyRest(0), 0);
+  assert.equal(historyRest(-5), 0);
+  assert.equal(historyRest(Number.NaN), 0);
+  assert.equal(historyRest(12.4), 12);
+  assert.equal(historyRest(480), 480);
+  assert.equal(historyRest(5_000), 1_000);
 });
