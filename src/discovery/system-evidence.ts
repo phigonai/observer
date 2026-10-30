@@ -462,7 +462,10 @@ async function readVersion(executablePath: string): Promise<string> {
       script === undefined ? executablePath : "powershell.exe",
       script === undefined ? ["--version"] : ["-NoProfile", "-NonInteractive", "-File", script, "--version"],
       {
-        timeout: 5_000,
+        // Starting PowerShell alone can take several seconds on a busy or
+        // closely monitored computer, as for the PowerShell process listing.
+        // A probe result is cached, so a slow start is paid once per CLI.
+        timeout: script === undefined ? 5_000 : 15_000,
         maxBuffer: 4_096,
         encoding: "utf8",
         windowsHide: true,
