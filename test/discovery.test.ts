@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { before } from "node:test";
+import { promisify } from "node:util";
 import {
   AgentKind,
   AgentState,
@@ -35,6 +37,18 @@ import {
 } from "../src/custom-agent-registry.js";
 
 const observedAt = new Date("2026-07-24T10:00:00.000Z");
+
+// The first Windows PowerShell start on a fresh computer prepares its .NET
+// and module caches and can outlast a version probe's timeout. Start it once
+// so the probe tests below measure the probe, not that one-time cost.
+before(async () => {
+  if (process.platform !== "win32") return;
+  await promisify(execFile)(
+    "powershell.exe",
+    ["-NoProfile", "-NonInteractive", "-Command", "exit"],
+    { timeout: 120_000, windowsHide: true },
+  ).catch(() => undefined);
+});
 
 test("Windows version probes close pipeline input and honor mixed-case environment keys", { skip: process.platform !== "win32" }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-version-probe-"));
