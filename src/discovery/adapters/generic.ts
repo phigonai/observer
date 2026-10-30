@@ -185,15 +185,14 @@ const genericAgents: readonly KnownAgentSpec[] = [
     processModel: "application",
   },
   {
-    // No Factory Droid session could be inspected yet, so its CLI is
-    // discovered without reading conversations.
+    // Sessions are read from ~/.factory/sessions (adapters/factory-droid.ts).
     id: "generic:factory-droid",
     kind: AgentKind.GENERIC,
     displayName: "Factory Droid",
     executableNames: ["droid"],
     processNames: ["droid"],
     configurationPaths: ["~/.factory"],
-    capabilities: ["filesystem", "git", "mcp", "terminal"],
+    capabilities: ["activity", "filesystem", "git", "mcp", "native-activity", "terminal"],
   },
   {
     // The Roo Code extension's own storage. ~/.roo is not used as evidence:

@@ -7,6 +7,7 @@ import { codexActivityAdapter } from "../src/activity/adapters/codex.js";
 import { copilotActivityAdapter } from "../src/activity/adapters/copilot.js";
 import { copilotChatActivityAdapter } from "../src/activity/adapters/copilot-chat.js";
 import { cursorActivityAdapter } from "../src/activity/adapters/cursor.js";
+import { factoryDroidActivityAdapter } from "../src/activity/adapters/factory-droid.js";
 import { geminiActivityAdapter } from "../src/activity/adapters/gemini.js";
 import { gooseActivityAdapter } from "../src/activity/adapters/goose.js";
 import { genericActivityAdapter } from "../src/activity/adapters/generic.js";
@@ -1923,6 +1924,94 @@ test("Zed thread items become prompts, replies, reasoning, commands, and file ed
   assertMetadataOnly(zedActivityAdapter.parse(
     { type: "zed_message", role: "user", content: [{ Text: "fixturesecret in /private/project" }] },
     { sessionId: "session-zed-private", observedAt, policy: metadataOnlyPolicy() },
+  ));
+});
+
+test("Factory Droid session lines become prompts, replies, reasoning, commands, and file edits", () => {
+  const config = loadConfig({ PHIGON_OBSERVABILITY_PROFILE: "full" });
+  const context = {
+    sessionId: "session-droid",
+    observedAt,
+    policy: new LocalPolicyEngine(config.policy),
+  };
+  const message = (id: string, role: string, content: unknown) => ({
+    type: "message",
+    id,
+    timestamp: "2026-07-24T10:00:00.000Z",
+    message: { role, content },
+  });
+  const drafts = [
+    { type: "session_start", id: "s1", title: "Fix tests", cwd: "/workspace" },
+    message("m1", "user", [
+      { type: "text", text: "<system-reminder>Context for the model.</system-reminder>" },
+      { type: "text", text: "Fix the failing test." },
+    ]),
+    message("m2", "assistant", [
+      { type: "thinking", thinking: "Run it first." },
+      { type: "text", text: "Running the suite." },
+      { type: "tool_use", id: "tu1", name: "Execute", input: { command: "npm test" } },
+      { type: "tool_use", id: "tu2", name: "Edit", input: { file_path: "/workspace/a.ts", old_string: "a", new_string: "b" } },
+    ]),
+    message("m3", "user", [
+      { type: "tool_result", tool_use_id: "tu1", content: "1 failing", is_error: true },
+      { type: "tool_result", tool_use_id: "tu2", content: [{ type: "text", text: "Edited." }] },
+    ]),
+    { type: "session_event", data: "session_ended" },
+  ].flatMap((record) => factoryDroidActivityAdapter.parse(record, context));
+
+  assert.deepEqual(
+    drafts.flatMap((draft) =>
+      draft.payload.case === "activity"
+        ? [[draft.payload.value.kind, draft.payload.value.content]]
+        : []
+    ),
+    [
+      [ActivityKind.PROMPT, "Fix the failing test."],
+      [ActivityKind.RESPONSE, "Running the suite."],
+      [ActivityKind.REASONING, "Run it first."],
+    ],
+  );
+  assert.deepEqual(
+    drafts.flatMap((draft) =>
+      draft.payload.case === "tool"
+        ? [[draft.payload.value.toolName, draft.payload.value.phase]]
+        : []
+    ),
+    [
+      ["Execute", ToolPhase.REQUESTED],
+      ["Edit", ToolPhase.REQUESTED],
+      ["Execute", ToolPhase.FAILED],
+      ["Edit", ToolPhase.SUCCEEDED],
+    ],
+  );
+  assert.deepEqual(
+    drafts.flatMap((draft) =>
+      draft.payload.case === "terminal"
+        ? [[draft.payload.value.phase, draft.payload.value.arguments ?? ""]]
+        : []
+    ),
+    [
+      [TerminalPhase.STARTED, "npm test"],
+      [TerminalPhase.EXITED, ""],
+    ],
+  );
+  assert.deepEqual(
+    drafts.flatMap((draft) =>
+      draft.payload.case === "filesystem"
+        ? [[draft.payload.value.resource?.identifier, draft.payload.value.operation]]
+        : []
+    ),
+    [["/workspace/a.ts", FilesystemOperation.WRITE]],
+  );
+  assert.deepEqual(
+    drafts.flatMap((draft) =>
+      draft.payload.case === "lifecycle" ? [draft.payload.value.phase] : []
+    ),
+    [LifecyclePhase.DISCOVERED, LifecyclePhase.STOPPED],
+  );
+  assertMetadataOnly(factoryDroidActivityAdapter.parse(
+    message("m4", "user", [{ type: "text", text: "fixturesecret in /private/project" }]),
+    { sessionId: "session-droid-private", observedAt, policy: metadataOnlyPolicy() },
   ));
 });
 

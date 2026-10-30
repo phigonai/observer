@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { zstdCompressSync } from "node:zlib";
 import { create, toJsonString } from "@bufbuild/protobuf";
 import {
   timestampDate,
@@ -625,12 +627,33 @@ test("activity collector binds process-tagged records to the matching runtime id
   }
 });
 
-test("the default sources deliver Gemini CLI, Cline CLI, and Cursor conversations", async () => {
+test("the default sources deliver Gemini CLI, Cline CLI, Cursor, Factory Droid and Zed conversations", async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-native-sources-"));
   const geminiRoot = join(directory, "gemini-tmp");
   const clineRoot = join(directory, "cline-sessions");
   const cursorRoot = join(directory, "cursor-projects");
   const cursorTranscript = join(cursorRoot, "c-workspace", "agent-transcripts", "conv-1");
+  const droidRoot = join(directory, "factory-sessions");
+  const zedRoot = join(directory, "zed-threads");
+  await mkdir(join(droidRoot, "-workspace"), { recursive: true });
+  await mkdir(zedRoot, { recursive: true });
+  await writeFile(
+    join(droidRoot, "-workspace", "8d2c6f0e-1b7a-4f3e-9c55-0a1b2c3d4e5f.jsonl"),
+    [
+      { type: "session_start", id: "8d2c6f0e-1b7a-4f3e-9c55-0a1b2c3d4e5f", title: "Docs", cwd: "/workspace" },
+      { type: "message", id: "d1", timestamp: "2026-07-24T10:00:02.000Z", message: { role: "user", content: [{ type: "text", text: "Write the docs." }] } },
+    ].map((line) => JSON.stringify(line)).join("\n") + "\n",
+  );
+  await writeFile(
+    join(droidRoot, "-workspace", "8d2c6f0e-1b7a-4f3e-9c55-0a1b2c3d4e5f.settings.json"),
+    JSON.stringify({ model: "claude" }),
+  );
+  const zed = new DatabaseSync(join(zedRoot, "threads.db"));
+  zed.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, summary TEXT NOT NULL, updated_at TEXT NOT NULL, data_type TEXT NOT NULL, data BLOB NOT NULL)");
+  zed.prepare("INSERT INTO threads VALUES ('z1', 'Rename', '2026-07-24T10:00:03+00:00', 'zstd', ?)").run(
+    zstdCompressSync(Buffer.from(JSON.stringify({ version: "0.3.0", messages: [{ User: { id: "u1", content: [{ Text: "Rename the module." }] } }] }))),
+  );
+  zed.close();
   await mkdir(join(geminiRoot, "my-project", "chats"), { recursive: true });
   await mkdir(join(clineRoot, "1789500000000_abcde"), { recursive: true });
   await mkdir(cursorTranscript, { recursive: true });
@@ -663,6 +686,8 @@ test("the default sources deliver Gemini CLI, Cline CLI, and Cursor conversation
       PHIGON_GEMINI_ACTIVITY_DIRS: geminiRoot,
       PHIGON_CLINE_ACTIVITY_DIRS: clineRoot,
       PHIGON_CURSOR_ACTIVITY_DIRS: cursorRoot,
+      PHIGON_DROID_ACTIVITY_DIRS: droidRoot,
+      PHIGON_ZED_ACTIVITY_DIRS: zedRoot,
       PHIGON_COPILOT_CHAT_ACTIVITY_DIRS: join(directory, "none"),
       PHIGON_KIRO_ACTIVITY_DIRS: join(directory, "none"),
       PHIGON_GOOSE_ACTIVITY_DIRS: join(directory, "none"),
@@ -692,14 +717,16 @@ test("the default sources deliver Gemini CLI, Cline CLI, and Cursor conversation
         ? [event.payload.value.content]
         : []
     ).sort();
-    assert.deepEqual(prompts, ["Add a test.", "Explain the build.", "Fix the login."]);
+    assert.deepEqual(prompts, ["Add a test.", "Explain the build.", "Fix the login.", "Rename the module.", "Write the docs."]);
     assert.deepEqual(
       collector.sourceIdentities().map((identity) =>
         identity.displayName.split(" · ")[0]
       ).sort(),
-      ["Cline", "Cursor", "Gemini CLI"],
+      ["Cline", "Cursor", "Factory Droid", "Gemini CLI", "Zed"],
     );
   } finally {
+    // The live reader keeps the Zed database open between scans.
+    collector.close();
     await rm(directory, { recursive: true, force: true });
   }
 });

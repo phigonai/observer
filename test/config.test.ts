@@ -244,6 +244,17 @@ test("loadConfig finds Zed's threads database folder", () => {
   );
 });
 
+test("loadConfig reads Factory Droid sessions from ~/.factory/sessions", () => {
+  assert.deepEqual(
+    loadConfig({}).activitySourceDirectories.droid,
+    [join(homedir(), ".factory", "sessions")],
+  );
+  assert.deepEqual(
+    loadConfig({ PHIGON_DROID_ACTIVITY_DIRS: "none" }).activitySourceDirectories.droid,
+    [],
+  );
+});
+
 test("loadConfig finds the Goose sessions database directory", () => {
   assert.deepEqual(
     loadConfig({ GOOSE_PATH_ROOT: "/srv/goose" }).activitySourceDirectories.goose,
