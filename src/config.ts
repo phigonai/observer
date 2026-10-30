@@ -19,6 +19,7 @@ export type ActivitySourceDirectories = Readonly<{
   copilotChat: readonly string[];
   kiro: readonly string[];
   zed: readonly string[];
+  droid: readonly string[];
   generic: readonly string[];
 }>;
 
@@ -316,6 +317,10 @@ export function loadConfig(
       zed: parseDirectoryList(
         environment["PHIGON_ZED_ACTIVITY_DIRS"],
         zedThreadDirectories(environment),
+      ),
+      droid: parseDirectoryList(
+        environment["PHIGON_DROID_ACTIVITY_DIRS"],
+        [join(homedir(), ".factory", "sessions")],
       ),
       generic: parseDirectoryList(
         environment["PHIGON_GENERIC_ACTIVITY_DIRS"],

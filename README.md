@@ -59,7 +59,7 @@ exactly what runs on your computers and what leaves them.
 | | Antigravity | Yes | Not yet (no documented conversation format) |
 | | Trae | Yes | Not yet (its history database is encrypted) |
 | | Zed (its own agent) | Yes | Built in |
-| | Factory Droid | Yes | Not yet |
+| | Factory Droid | Yes | Built in |
 | | Roo Code | Yes | Not yet |
 | | Aider, Amazon Q Developer CLI, Continue | Yes | Bridge |
 | | Any other agent | [Register it](#custom-agents) | Bridge |

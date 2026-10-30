@@ -26,6 +26,7 @@ import { codexActivityAdapter } from "./adapters/codex.js";
 import { copilotActivityAdapter } from "./adapters/copilot.js";
 import { copilotChatActivityAdapter } from "./adapters/copilot-chat.js";
 import { cursorActivityAdapter } from "./adapters/cursor.js";
+import { factoryDroidActivityAdapter } from "./adapters/factory-droid.js";
 import { geminiActivityAdapter } from "./adapters/gemini.js";
 import { gooseActivityAdapter } from "./adapters/goose.js";
 import { hermesActivityAdapter } from "./adapters/hermes.js";
@@ -85,6 +86,7 @@ const adapters: ReadonlyMap<string, VendorActivityAdapter> = new Map([
   ["copilot-chat", copilotChatActivityAdapter],
   ["kiro-session", kiroActivityAdapter],
   ["zed-thread", zedActivityAdapter],
+  ["factory-droid", factoryDroidActivityAdapter],
 ]);
 
 export type ActivityCollectorMetrics = Readonly<{
@@ -460,9 +462,16 @@ export class ActivityCollector {
         );
       }
     } finally {
-      // Release the database connections the live reader kept open.
-      this.#reader.close();
+      this.close();
     }
+  }
+
+  /**
+   * Release the database connections the live reader keeps open. A later
+   * scan opens them again.
+   */
+  close(): void {
+    this.#reader.close();
   }
 
   metrics(): ActivityCollectorMetrics {
@@ -894,6 +903,13 @@ function configuredSources(config: ObserverConfig): readonly ActivitySource[] {
       format: "zed-sqlite",
     },
     {
+      adapterId: "factory-droid",
+      roots: config.activitySourceDirectories.droid,
+      // <project>/<session id>.jsonl, appended as the session runs, beside
+      // <session id>.settings.json.
+      pathPattern: "^(?:[^/]+/)?[^/]+\\.jsonl$",
+    },
+    {
       adapterId: "generic",
       roots: config.activitySourceDirectories.generic,
     },
@@ -962,6 +978,7 @@ function sourceIdentityDisplayName(
       case "copilot-chat": return "GitHub Copilot";
       case "kiro-session": return "Kiro";
       case "zed-thread": return "Zed";
+      case "factory-droid": return "Factory Droid";
       default: return "Agent activity";
     }
   })();
