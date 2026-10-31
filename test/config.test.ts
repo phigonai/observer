@@ -255,6 +255,26 @@ test("loadConfig reads Factory Droid sessions from ~/.factory/sessions", () => {
   );
 });
 
+test("loadConfig reads Cline, Roo Code and Kilo Code tasks from each editor's extension storage", () => {
+  const config = loadConfig({ APPDATA: join(tmpdir(), "roaming") });
+  const user = (product: string) => process.platform === "win32"
+    ? join(tmpdir(), "roaming", product, "User")
+    : undefined;
+  const roo = config.activitySourceDirectories.rooCode;
+  assert.equal(roo.length, 7);
+  assert.ok(roo.every((directory) => directory.endsWith(join("globalStorage", "rooveterinaryinc.roo-cline", "tasks"))));
+  if (process.platform === "win32") {
+    assert.ok(roo.includes(join(user("Code") ?? "", "globalStorage", "rooveterinaryinc.roo-cline", "tasks")));
+    assert.ok(roo.includes(join(user("Cursor") ?? "", "globalStorage", "rooveterinaryinc.roo-cline", "tasks")));
+  }
+  assert.ok(config.activitySourceDirectories.kiloCode.every((directory) => directory.includes("kilocode.kilo-code")));
+  assert.ok(config.activitySourceDirectories.clineTasks.includes(join(homedir(), ".cline", "data", "tasks")));
+  assert.deepEqual(
+    loadConfig({ PHIGON_ROO_CODE_ACTIVITY_DIRS: "none" }).activitySourceDirectories.rooCode,
+    [],
+  );
+});
+
 test("loadConfig finds the Goose sessions database directory", () => {
   assert.deepEqual(
     loadConfig({ GOOSE_PATH_ROOT: "/srv/goose" }).activitySourceDirectories.goose,

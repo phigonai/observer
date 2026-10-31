@@ -53,14 +53,15 @@ exactly what runs on your computers and what leaves them.
 | <img src="https://phigon.online/agents/gemini-cli.svg" width="20" alt=""> | Gemini CLI | Yes | Built in |
 | <img src="https://phigon.online/agents/amp.svg" width="20" alt=""> | Amp | Yes | Bridge |
 | <img src="https://phigon.online/agents/goose.svg" width="20" alt=""> | Goose | Yes | Built in |
-| <img src="https://phigon.online/agents/cline.svg" width="20" alt=""> | Cline (CLI) | Yes | Built in |
+| <img src="https://phigon.online/agents/cline.svg" width="20" alt=""> | Cline (CLI and VS Code extension) | Yes | Built in |
 | <img src="https://phigon.online/agents/openhands.svg" width="20" alt=""> | OpenHands | Yes | Bridge |
 | | Kiro | Yes | Built in (chat; agent actions not yet) |
 | | Antigravity | Yes | Not yet (no documented conversation format) |
 | | Trae | Yes | Not yet (its history database is encrypted) |
 | | Zed (its own agent) | Yes | Built in |
 | | Factory Droid | Yes | Built in |
-| | Roo Code | Yes | Not yet |
+| | Roo Code | Yes | Built in |
+| | Kilo Code | Yes | Built in |
 | | Aider, Amazon Q Developer CLI, Continue | Yes | Bridge |
 | | Any other agent | [Register it](#custom-agents) | Bridge |
 

@@ -21,6 +21,12 @@ import {
   type EventEnvelope,
 } from "../generated/phigon/v1/telemetry_pb.js";
 import { claudeActivityAdapter } from "./adapters/claude.js";
+import {
+  clineExtensionActivityAdapter,
+  clineTaskFirstMessageField,
+  kiloCodeActivityAdapter,
+  rooCodeActivityAdapter,
+} from "./adapters/cline-task.js";
 import { clineActivityAdapter } from "./adapters/cline.js";
 import { codexActivityAdapter } from "./adapters/codex.js";
 import { copilotActivityAdapter } from "./adapters/copilot.js";
@@ -87,6 +93,9 @@ const adapters: ReadonlyMap<string, VendorActivityAdapter> = new Map([
   ["kiro-session", kiroActivityAdapter],
   ["zed-thread", zedActivityAdapter],
   ["factory-droid", factoryDroidActivityAdapter],
+  ["cline-task", clineExtensionActivityAdapter],
+  ["roo-code-task", rooCodeActivityAdapter],
+  ["kilo-code-task", kiloCodeActivityAdapter],
 ]);
 
 export type ActivityCollectorMetrics = Readonly<{
@@ -909,6 +918,25 @@ function configuredSources(config: ObserverConfig): readonly ActivitySource[] {
       // <session id>.settings.json.
       pathPattern: "^(?:[^/]+/)?[^/]+\\.jsonl$",
     },
+    // Cline, Roo Code and Kilo Code tasks: <task id>/ui_messages.json, the
+    // list of messages the extension shows, rewritten as the task runs.
+    ...([
+      ["cline-task", config.activitySourceDirectories.clineTasks],
+      ["roo-code-task", config.activitySourceDirectories.rooCode],
+      ["kilo-code-task", config.activitySourceDirectories.kiloCode],
+    ] as const).map(([adapterId, roots]) => ({
+      adapterId,
+      roots,
+      format: "json-messages" as const,
+      pathPattern: "^[^/]+/ui_messages[.]json$",
+      messagesField: "",
+      document: {
+        directoryPattern: "^[^/]+$",
+        messageIdField: "ts",
+        pendingField: "partial",
+        firstMessageField: clineTaskFirstMessageField,
+      },
+    })),
     {
       adapterId: "generic",
       roots: config.activitySourceDirectories.generic,
@@ -979,6 +1007,9 @@ function sourceIdentityDisplayName(
       case "kiro-session": return "Kiro";
       case "zed-thread": return "Zed";
       case "factory-droid": return "Factory Droid";
+      case "cline-task": return "Cline";
+      case "roo-code-task": return "Roo Code";
+      case "kilo-code-task": return "Kilo Code";
       default: return "Agent activity";
     }
   })();

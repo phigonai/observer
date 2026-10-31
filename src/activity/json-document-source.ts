@@ -38,6 +38,17 @@ export type JSONDocumentOptions = Readonly<{
    */
   completeFields?: readonly string[];
   /**
+   * Field that is true while a message is still being written (for example
+   * Cline's `partial`). The last message is held back while it is true.
+   */
+  pendingField?: string;
+  /**
+   * When set, the document's first message is delivered with this field set
+   * to true. Some agents store the user's opening request like any other
+   * message, so only its position tells it apart.
+   */
+  firstMessageField?: string;
+  /**
    * Top-level field that holds the agent's own session id. When present it
    * names the session and its records, so two files holding the same
    * session produce the same record identities.
@@ -50,7 +61,10 @@ export type JSONDocumentSource = Readonly<{
   roots: readonly string[];
   /** Regular expression matched against the `/`-separated relative path. */
   pathPattern: string;
-  /** Top-level array that holds the conversation messages. */
+  /**
+   * Top-level array that holds the conversation messages, or "" when the
+   * document itself is the array.
+   */
   messagesField: string;
 }> & JSONDocumentOptions;
 
@@ -180,7 +194,7 @@ export async function scanJSONDocumentSource(
     // delivered once it is finished.
     const available = settled
       ? messages.length
-      : finishedMessageCount(messages, source.completeFields);
+      : finishedMessageCount(messages, source.completeFields, source.pendingField);
     let start: number;
     if (cursor === undefined) {
       if (options.historical) start = 0;
@@ -210,7 +224,9 @@ export async function scanJSONDocumentSource(
         observedAt: messageTime(messages[index]) ??
           new Date(file.modifiedMs),
         initialReplay: options.historical || replayPaths.has(file.path),
-        value: messages[index],
+        value: index === 0 && source.firstMessageField !== undefined && isRecord(messages[0])
+          ? { ...messages[0], [source.firstMessageField]: true }
+          : messages[index],
       });
     }
     remaining -= end - start;
@@ -309,6 +325,9 @@ function readMessages(
   const document = source.documentFormat === "mutation-log"
     ? replayMutationLog(text)
     : JSON.parse(text) as unknown;
+  if (source.messagesField === "") {
+    return Array.isArray(document) ? { messages: document } : undefined;
+  }
   if (!isRecord(document)) return undefined;
   const messages = document[source.messagesField];
   if (!Array.isArray(messages)) return undefined;
@@ -431,7 +450,15 @@ function containerAt(
 function finishedMessageCount(
   messages: readonly unknown[],
   completeFields: readonly string[] | undefined,
+  pendingField?: string,
 ): number {
+  if (
+    pendingField !== undefined &&
+    messages.length > 0 &&
+    fieldAt(messages.at(-1), pendingField) === true
+  ) {
+    return messages.length - 1;
+  }
   if (completeFields === undefined || completeFields.length === 0) {
     return messages.length;
   }
@@ -462,6 +489,7 @@ function messageKey(
   idField = "id",
 ): string {
   const id = fieldAt(message, idField);
+  if (typeof id === "number" && Number.isSafeInteger(id)) return `id:${id}`;
   return typeof id === "string" && id !== "" && id.length <= 256
     ? `id:${id}`
     : `index:${index}`;

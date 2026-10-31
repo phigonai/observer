@@ -627,7 +627,7 @@ test("activity collector binds process-tagged records to the matching runtime id
   }
 });
 
-test("the default sources deliver Gemini CLI, Cline CLI, Cursor, Factory Droid and Zed conversations", async () => {
+test("the default sources deliver Gemini CLI, Cline CLI, Cursor, Factory Droid, Zed and Roo Code conversations", async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-native-sources-"));
   const geminiRoot = join(directory, "gemini-tmp");
   const clineRoot = join(directory, "cline-sessions");
@@ -635,6 +635,12 @@ test("the default sources deliver Gemini CLI, Cline CLI, Cursor, Factory Droid a
   const cursorTranscript = join(cursorRoot, "c-workspace", "agent-transcripts", "conv-1");
   const droidRoot = join(directory, "factory-sessions");
   const zedRoot = join(directory, "zed-threads");
+  const rooRoot = join(directory, "roo-tasks");
+  await mkdir(join(rooRoot, "6f1c2b9e-roo"), { recursive: true });
+  await writeFile(
+    join(rooRoot, "6f1c2b9e-roo", "ui_messages.json"),
+    JSON.stringify([{ ts: 1785000004000, type: "say", say: "text", text: "Add a dark theme." }]),
+  );
   await mkdir(join(droidRoot, "-workspace"), { recursive: true });
   await mkdir(zedRoot, { recursive: true });
   await writeFile(
@@ -688,6 +694,9 @@ test("the default sources deliver Gemini CLI, Cline CLI, Cursor, Factory Droid a
       PHIGON_CURSOR_ACTIVITY_DIRS: cursorRoot,
       PHIGON_DROID_ACTIVITY_DIRS: droidRoot,
       PHIGON_ZED_ACTIVITY_DIRS: zedRoot,
+      PHIGON_ROO_CODE_ACTIVITY_DIRS: rooRoot,
+      PHIGON_CLINE_TASKS_ACTIVITY_DIRS: join(directory, "none"),
+      PHIGON_KILO_CODE_ACTIVITY_DIRS: join(directory, "none"),
       PHIGON_COPILOT_CHAT_ACTIVITY_DIRS: join(directory, "none"),
       PHIGON_KIRO_ACTIVITY_DIRS: join(directory, "none"),
       PHIGON_GOOSE_ACTIVITY_DIRS: join(directory, "none"),
@@ -717,12 +726,12 @@ test("the default sources deliver Gemini CLI, Cline CLI, Cursor, Factory Droid a
         ? [event.payload.value.content]
         : []
     ).sort();
-    assert.deepEqual(prompts, ["Add a test.", "Explain the build.", "Fix the login.", "Rename the module.", "Write the docs."]);
+    assert.deepEqual(prompts, ["Add a dark theme.", "Add a test.", "Explain the build.", "Fix the login.", "Rename the module.", "Write the docs."]);
     assert.deepEqual(
       collector.sourceIdentities().map((identity) =>
         identity.displayName.split(" · ")[0]
       ).sort(),
-      ["Cline", "Cursor", "Factory Droid", "Gemini CLI", "Zed"],
+      ["Cline", "Cursor", "Factory Droid", "Gemini CLI", "Roo Code", "Zed"],
     );
   } finally {
     // The live reader keeps the Zed database open between scans.

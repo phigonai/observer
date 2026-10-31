@@ -196,7 +196,8 @@ const genericAgents: readonly KnownAgentSpec[] = [
   },
   {
     // The Roo Code extension's own storage. ~/.roo is not used as evidence:
-    // other tools create it to share skills.
+    // other tools create it to share skills. Its tasks are read from
+    // <storage>/tasks (adapters/cline-task.ts).
     id: "generic:roo-code",
     kind: AgentKind.GENERIC,
     displayName: "Roo Code",
@@ -208,7 +209,23 @@ const genericAgents: readonly KnownAgentSpec[] = [
       "~/Library/Application Support/Code/User/globalStorage/rooveterinaryinc.roo-cline",
       "~/.config/Code/User/globalStorage/rooveterinaryinc.roo-cline",
     ],
-    capabilities: ["browser", "filesystem", "mcp", "terminal"],
+    capabilities: ["activity", "browser", "filesystem", "mcp", "native-activity", "terminal"],
+  },
+  {
+    // The Kilo Code extension's own storage; tasks are read from its
+    // tasks folder like Roo Code's.
+    id: "generic:kilo-code",
+    kind: AgentKind.GENERIC,
+    displayName: "Kilo Code",
+    executableNames: [],
+    processNames: [],
+    configurationPaths: [
+      "~/AppData/Roaming/Code/User/globalStorage/kilocode.kilo-code",
+      "~/AppData/Roaming/Cursor/User/globalStorage/kilocode.kilo-code",
+      "~/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code",
+      "~/.config/Code/User/globalStorage/kilocode.kilo-code",
+    ],
+    capabilities: ["activity", "browser", "filesystem", "mcp", "native-activity", "terminal"],
   },
   {
     id: "generic:amazon-q",
@@ -234,8 +251,15 @@ const genericAgents: readonly KnownAgentSpec[] = [
     displayName: "Cline",
     executableNames: [],
     processNames: [],
-    configurationPaths: ["~/.cline"],
-    capabilities: ["activity", "browser", "filesystem", "mcp", "terminal"],
+    // The CLI's home, and the VS Code extension's storage.
+    configurationPaths: [
+      "~/.cline",
+      "~/AppData/Roaming/Code/User/globalStorage/saoudrizwan.claude-dev",
+      "~/AppData/Roaming/Cursor/User/globalStorage/saoudrizwan.claude-dev",
+      "~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev",
+      "~/.config/Code/User/globalStorage/saoudrizwan.claude-dev",
+    ],
+    capabilities: ["activity", "browser", "filesystem", "mcp", "native-activity", "terminal"],
   },
   {
     id: "generic:continue",
