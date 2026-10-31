@@ -136,6 +136,7 @@ test("the Windows helper is asked for the exact tree and its report is validated
   const timedOut = new WindowsProcessTreeControl(async () => { throw Object.assign(new Error("timeout"), { killed: true }); });
   assert.deepEqual(await timedOut.stop({ processId: 42, startedAt }, "kill"), { outcome: "failed", code: "helper_timeout" });
   assert.deepEqual(parseTreeReport('{"outcome":"graceful_unsupported"}'), { outcome: "graceful_unsupported" });
+  assert.deepEqual(parseTreeReport('{"outcome":"console_shared","root_running":true}'), { outcome: "console_shared" });
   assert.deepEqual(parseTreeReport('{"outcome":"failed","error":"x"}'), { outcome: "failed", code: "helper_failed" });
   assert.deepEqual(parseTreeReport("not json"), { outcome: "failed", code: "helper_report_invalid" });
 });
@@ -143,7 +144,7 @@ test("the Windows helper is asked for the exact tree and its report is validated
 test("every outcome becomes an honest receipt within the journal bound", () => {
   const outcomes: TreeStopOutcome[] = [
     { outcome: "stale" }, { outcome: "exited" }, { outcome: "self_target" }, { outcome: "access_denied" },
-    { outcome: "graceful_unsupported" }, { outcome: "failed", code: "helper_timeout" },
+    { outcome: "graceful_unsupported" }, { outcome: "console_shared" }, { outcome: "failed", code: "helper_timeout" },
     { outcome: "dispatched", rootRunning: true, descendants: 0, descendantsRunning: 0, descendantsDenied: 0 },
     { outcome: "dispatched", rootRunning: false, descendants: 3, descendantsRunning: 1, descendantsDenied: 1 },
     { outcome: "dispatched", rootRunning: false, descendants: 1, descendantsRunning: 0, descendantsDenied: 0 },
@@ -159,12 +160,13 @@ test("every outcome becomes an honest receipt within the journal bound", () => {
     `${RemoteActionResultState.REJECTED}:self_target_rejected:true`,
     `${RemoteActionResultState.FAILED}:access_denied:true`,
     `${RemoteActionResultState.REJECTED}:graceful_stop_unsupported:true`,
+    `${RemoteActionResultState.REJECTED}:terminal_shared:true`,
     `${RemoteActionResultState.FAILED}:os_dispatch_failed:true`,
     `${RemoteActionResultState.FAILED}:process_still_running:true`,
     `${RemoteActionResultState.SUCCEEDED}:process_stopped_children_running:false`,
     `${RemoteActionResultState.SUCCEEDED}:process_stopped:false`,
   ]);
-  assert.match(describeOutcome(outcomes[7]!, false)[2], /2 of its child processes are still running/u);
+  assert.match(describeOutcome(outcomes[8]!, false)[2], /2 of its child processes are still running/u);
 });
 
 function isAlive(processId: number): boolean {
@@ -222,8 +224,9 @@ test("graceful stop on this computer is honest about what the platform can do", 
   const directory = await mkdtemp(join(tmpdir(), "phigon-process-tree-stop-"));
   const result = await executorFor(directory, agentPid, startedAt).execute(commandFor(agentPid, startedAt, RemoteActionType.STOP_AGENT));
   if (process.platform === "win32") {
-    // A console process has no window to close; nothing may be sent.
-    assert.equal(result.resultCode, "graceful_stop_unsupported", result.detail);
+    // The test agent has no window. It either has no terminal, or shares the
+    // test runner's, so Ctrl+C would reach the runner too: nothing may be sent.
+    assert.ok(["graceful_stop_unsupported", "terminal_shared"].includes(result.resultCode), result.detail);
     assert.equal(result.state, RemoteActionResultState.REJECTED);
     assert.equal(isAlive(agentPid), true);
     assert.equal(isAlive(childPid), true);

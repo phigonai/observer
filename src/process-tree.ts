@@ -6,7 +6,7 @@ export type ExactProcess = Readonly<{ processId: number; startedAt: Date }>;
 export type TreeStopMode = "stop" | "kill";
 
 export type TreeStopOutcome =
-  | Readonly<{ outcome: "stale" | "exited" | "access_denied" | "graceful_unsupported" | "self_target" }>
+  | Readonly<{ outcome: "stale" | "exited" | "access_denied" | "graceful_unsupported" | "console_shared" | "self_target" }>
   | Readonly<{ outcome: "failed"; code: string }>
   | Readonly<{
     outcome: "dispatched";
@@ -45,7 +45,9 @@ export function describeTreeOutcome(outcome: TreeStopOutcome, graceful: boolean)
     case "access_denied":
       return receipt("failed", "access_denied", "The operating system denied permission to stop this process. It may run as another user or as administrator. It is still running.", true);
     case "graceful_unsupported":
-      return receipt("rejected", "graceful_stop_unsupported", "This agent has no window Windows can ask to close, so a graceful stop is not possible. Nothing was sent. Use force stop instead.", true);
+      return receipt("rejected", "graceful_stop_unsupported", "This agent has no window to close and no terminal to press Ctrl+C in, so a graceful stop is not possible. Nothing was sent. Use force stop instead.", true);
+    case "console_shared":
+      return receipt("rejected", "terminal_shared", "Other programs share this agent's terminal, and Ctrl+C would reach them too. Nothing was sent. Use force stop instead.", true);
     case "failed":
       return receipt("failed", "os_dispatch_failed", `The operating system could not complete the request (${outcome.code}). The agent may still be running.`, true);
     case "dispatched": {
@@ -259,7 +261,7 @@ export function parseTreeReport(stdout: string): TreeStopOutcome {
     return typeof item === "number" && Number.isSafeInteger(item) && item >= 0 ? item : 0;
   };
   switch (report["outcome"]) {
-    case "stale": case "exited": case "access_denied": case "graceful_unsupported": case "self_target":
+    case "stale": case "exited": case "access_denied": case "graceful_unsupported": case "console_shared": case "self_target":
       return { outcome: report["outcome"] };
     case "dispatched":
       return {
