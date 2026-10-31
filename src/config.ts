@@ -20,6 +20,9 @@ export type ActivitySourceDirectories = Readonly<{
   kiro: readonly string[];
   zed: readonly string[];
   droid: readonly string[];
+  clineTasks: readonly string[];
+  rooCode: readonly string[];
+  kiloCode: readonly string[];
   generic: readonly string[];
 }>;
 
@@ -321,6 +324,22 @@ export function loadConfig(
       droid: parseDirectoryList(
         environment["PHIGON_DROID_ACTIVITY_DIRS"],
         [join(homedir(), ".factory", "sessions")],
+      ),
+      clineTasks: parseDirectoryList(
+        environment["PHIGON_CLINE_TASKS_ACTIVITY_DIRS"],
+        [
+          ...extensionTaskDirectories(environment, "saoudrizwan.claude-dev"),
+          // The Cline CLI and JetBrains plugin before their session format.
+          join(homedir(), ".cline", "data", "tasks"),
+        ],
+      ),
+      rooCode: parseDirectoryList(
+        environment["PHIGON_ROO_CODE_ACTIVITY_DIRS"],
+        extensionTaskDirectories(environment, "rooveterinaryinc.roo-cline"),
+      ),
+      kiloCode: parseDirectoryList(
+        environment["PHIGON_KILO_CODE_ACTIVITY_DIRS"],
+        extensionTaskDirectories(environment, "kilocode.kilo-code"),
       ),
       generic: parseDirectoryList(
         environment["PHIGON_GENERIC_ACTIVITY_DIRS"],
@@ -652,6 +671,20 @@ function zedThreadDirectories(
  * Windows, ~/Library/Application Support/<product>/User on macOS, and
  * $XDG_CONFIG_HOME (or ~/.config)/<product>/User elsewhere.
  */
+/**
+ * The task folders of a VS Code extension (Cline and its forks keep
+ * `tasks/<task id>/ui_messages.json` in the extension's global storage) in
+ * every VS Code-based editor it can be installed in.
+ */
+function extensionTaskDirectories(
+  environment: NodeJS.ProcessEnv,
+  extension: string,
+): readonly string[] {
+  return ["Code", "Code - Insiders", "VSCodium", "Cursor", "Windsurf", "Trae", "Kiro"].map(
+    (product) => join(editorUserDirectory(environment, product), "globalStorage", extension, "tasks"),
+  );
+}
+
 function editorUserDirectory(
   environment: NodeJS.ProcessEnv,
   product: string,
