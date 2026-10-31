@@ -20,7 +20,11 @@ const maxTreeMembers = 1024
 //	exited                the exact process had already exited
 //	access_denied         the OS refused access to the exact process
 //	graceful_unsupported  graceful stop requested but the process has no
-//	                      window Windows can ask to close; nothing was sent
+//	                      window to close and no terminal to press Ctrl+C
+//	                      in; nothing was sent
+//	console_shared        graceful stop requested, but other programs share
+//	                      the agent's terminal and Ctrl+C would reach them
+//	                      too; nothing was sent
 //	self_target           the target is the observer or this helper
 //	invalid               malformed request
 //	unsupported           this platform uses the observer's own executor

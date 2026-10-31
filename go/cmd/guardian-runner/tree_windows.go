@@ -94,15 +94,21 @@ func dispatchTree(pid int, graceful bool, wait time.Duration, verified func(crea
 
 	if graceful {
 		windowsByOwner := topLevelWindows(members)
-		if len(windowsByOwner[members[0].pid]) == 0 {
-			// Windows can only ask a process to exit by closing its windows.
-			// Console agents have none; never escalate to force silently.
-			return treeReport{Outcome: "graceful_unsupported", RootRunning: true, Descendants: len(members) - 1}
-		}
-		for _, member := range members {
-			for _, window := range windowsByOwner[member.pid] {
-				_, _, _ = postMessage.Call(uintptr(window), wmClose, 0, 0)
+		if len(windowsByOwner[members[0].pid]) > 0 {
+			for _, member := range members {
+				for _, window := range windowsByOwner[member.pid] {
+					_, _, _ = postMessage.Call(uintptr(window), wmClose, 0, 0)
+				}
 			}
+		} else if outcome := interruptConsole(members, func() bool { return running(members[0].handle) }); outcome != "" {
+			// A terminal agent is asked with Ctrl+C instead of a window close.
+			// When neither is possible, nothing is sent: a graceful stop never
+			// escalates to force on its own.
+			report := treeReport{Outcome: outcome, RootRunning: true, Descendants: len(members) - 1}
+			if outcome == "failed" {
+				report.Error = "console interrupt failed"
+			}
+			return report
 		}
 	} else {
 		terminated := 0
@@ -252,13 +258,29 @@ func topLevelWindows(members []treeMember) map[uint32][]windows.HWND {
 	found := map[uint32][]windows.HWND{}
 	callback := windows.NewCallback(func(window windows.HWND, _ uintptr) uintptr {
 		var owner uint32
-		if _, err := windows.GetWindowThreadProcessId(window, &owner); err == nil && owners[owner] {
+		if _, err := windows.GetWindowThreadProcessId(window, &owner); err == nil && owners[owner] && !isConsoleWindow(window) {
 			found[owner] = append(found[owner], window)
 		}
 		return 1
 	})
 	_ = windows.EnumWindows(callback, nil)
 	return found
+}
+
+// isConsoleWindow reports a terminal's own window. Windows attributes it to
+// the first program running in the terminal, but closing it ends everything
+// in that terminal, so it is never treated as an agent's window.
+func isConsoleWindow(window windows.HWND) bool {
+	name := make([]uint16, 64)
+	copied, err := windows.GetClassName(window, &name[0], int32(len(name)))
+	if err != nil || copied <= 0 {
+		return false
+	}
+	switch windows.UTF16ToString(name[:copied]) {
+	case "ConsoleWindowClass", "PseudoConsoleWindow":
+		return true
+	}
+	return false
 }
 
 func creationTime(handle windows.Handle) (int64, error) {
