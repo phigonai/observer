@@ -270,22 +270,72 @@ test("one malformed stored identity invalidates the complete catalog", async () 
   }
 });
 
-test("catalog persistence failures are surfaced", async () => {
+test("catalog persistence failures are reported and retried on the next pass", async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-history-failure-"));
   const path = join(directory, "historical-agent-identities.json");
+  const errors: unknown[] = [];
   try {
-    const store = new HistoricalIdentityStore(directory, scope);
+    const store = new HistoricalIdentityStore(directory, scope, {
+      onSaveError: (error) => errors.push(error),
+    });
     assert.deepEqual(await store.load(), []);
     await mkdir(path);
-    await assert.rejects(
-      store.remember([runtimeIdentity(30, AgentState.RUNNING, 701n)]),
-    );
-    assert.deepEqual(store.identities(), [
+    const expected = [
       create(AgentIdentitySchema, {
         ...runtimeIdentity(30, AgentState.RUNNING, 701n),
         state: AgentState.STOPPED,
       }),
+    ];
+    assert.deepEqual(
+      await store.remember([runtimeIdentity(30, AgentState.RUNNING, 701n)]),
+      expected,
+    );
+    assert.equal(errors.length, 1);
+    assert.deepEqual(store.identities(), expected);
+
+    // Nothing new on the next pass, yet the catalog is written now.
+    await rm(path, { recursive: true });
+    await store.remember([]);
+    assert.equal(errors.length, 1);
+    assert.deepEqual(
+      await new HistoricalIdentityStore(directory, scope).load(),
+      expected,
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a new observation time alone does not rewrite the catalog", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-history-observed-"));
+  const path = join(directory, "historical-agent-identities.json");
+  const observed = (minute: number) => new Date(Date.UTC(2026, 7, 2, 12, minute));
+  try {
+    const store = new HistoricalIdentityStore(directory, scope);
+    await store.remember([runtimeIdentity(40, AgentState.RUNNING, 801n, observed(0))]);
+    const written = await readFile(path, "utf8");
+
+    // Discovery passes that only refresh the time leave the file alone, but
+    // the inventory still carries the newest time.
+    const refreshed = await store.remember([
+      runtimeIdentity(40, AgentState.RUNNING, 801n, observed(5)),
     ]);
+    assert.equal(await readFile(path, "utf8"), written);
+    assert.equal(
+      refreshed[0]?.lastObservedAt?.seconds,
+      BigInt(observed(5).getTime() / 1_000),
+    );
+
+    // Any other change writes the catalog, with the newest time.
+    await store.remember([
+      create(AgentIdentitySchema, {
+        ...runtimeIdentity(40, AgentState.RUNNING, 801n, observed(10)),
+        version: "0.146.0",
+      }),
+    ]);
+    const rewritten = JSON.parse(await readFile(path, "utf8"));
+    assert.equal(rewritten.identities[0].version, "0.146.0");
+    assert.equal(rewritten.identities[0].last_observed_at, observed(10).toISOString());
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

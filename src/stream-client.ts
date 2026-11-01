@@ -14,6 +14,7 @@ import {
   toBinary,
 } from "@bufbuild/protobuf";
 import { timestampFromDate } from "@bufbuild/protobuf/wkt";
+import { abortableDelay } from "./abortable-delay.js";
 import type { AgentActionExecutor } from "./agent-action-executor.js";
 import { DEFAULT_CONTROL_PLANE_ORIGIN, type ObserverConfig } from "./config.js";
 import {
@@ -1173,22 +1174,4 @@ function channelCredentials(config: ObserverConfig) {
 
 function isServiceError(error: unknown): error is ServiceError {
   return error instanceof Error && "code" in error;
-}
-
-async function abortableDelay(
-  milliseconds: number,
-  signal: AbortSignal,
-): Promise<void> {
-  if (signal.aborted) return;
-  await new Promise<void>((resolve) => {
-    const timeout = setTimeout(resolve, milliseconds);
-    signal.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timeout);
-        resolve();
-      },
-      { once: true },
-    );
-  });
 }

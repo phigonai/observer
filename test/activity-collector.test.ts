@@ -19,6 +19,7 @@ import {
   reportedProcessIdentity,
   reportedSessionID,
 } from "../src/activity/collector.js";
+import { JSONLSourceReader, type SourceFailure } from "../src/activity/source-reader.js";
 import { loadConfig } from "../src/config.js";
 import {
   ActivityKind,
@@ -1377,4 +1378,205 @@ test("a history import rests as long as each batch worked, at most a second", ()
   assert.equal(historyRest(12.4), 12);
   assert.equal(historyRest(480), 480);
   assert.equal(historyRest(5_000), 1_000);
+});
+
+test("a source that fails is skipped with backoff while the others keep collecting", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-failing-source-"));
+  const sourceRoot = join(directory, "sessions");
+  const openCodeRoot = join(directory, "opencode");
+  const dataDirectory = join(directory, "data");
+  await mkdir(sourceRoot, { recursive: true });
+  await mkdir(openCodeRoot, { recursive: true });
+  // Not a database: opening it fails with an error that is not "busy".
+  await writeFile(join(openCodeRoot, "opencode.db"), "x".repeat(4_096));
+  const codexRecord = (message: string) => `${JSON.stringify({
+    timestamp: "2026-07-24T10:10:00.000Z",
+    type: "event_msg",
+    payload: { type: "agent_message", message },
+  })}\n`;
+  await writeFile(join(sourceRoot, "codex.jsonl"), codexRecord("before the failure"), "utf8");
+  let now = Date.parse("2026-11-01T12:00:00.000Z");
+  const config = loadConfig({
+    PHIGON_DATA_DIR: dataDirectory,
+    PHIGON_ACTIVITY_REPLAY_ON_FIRST_START: "true",
+    PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE: "100",
+    PHIGON_COLLECT_RESPONSE_CONTENT: "true",
+    PHIGON_COLLECT_VENDOR_PAYLOAD: "true",
+  });
+  const emitted: EventEnvelope[] = [];
+  const reported: SourceFailure[] = [];
+  let registryReadable = false;
+  const collector = new ActivityCollector({
+    config,
+    credential: {
+      machineId: "5f1b4cb4-a77d-4f53-af66-197e184683f4",
+      tenantId: "7d1b4cb4-a77d-4f53-af66-197e184683f4",
+      credential: `phg_m_${"0".repeat(43)}`,
+      controlPlaneOrigin: "http://127.0.0.1:8080",
+      createdAt: "2026-07-24T00:00:00.000Z",
+    },
+    initialSequence: 0n,
+    durableDelivery: true,
+    emit: (event) => emitted.push(event),
+    sources: [
+      { adapterId: "codex", roots: [sourceRoot] },
+      { adapterId: "opencode", roots: [openCodeRoot], format: "opencode-sqlite" },
+    ],
+    additionalSources: async () => {
+      if (!registryReadable) throw new Error("custom agent registry is unreadable");
+      return [];
+    },
+    reader: new JSONLSourceReader(dataDirectory, true, 256 << 10, 1, "live", () => now),
+    onSourceFailure: (failure) => reported.push(failure),
+  });
+  const delivered = () => emitted
+    .map((event) => toJsonString(EventEnvelopeSchema, event))
+    .join("\n");
+
+  try {
+    await collector.scanOnce();
+    assert.match(delivered(), /before the failure/u);
+    const [failure] = collector.sourceFailures();
+    assert.equal(collector.sourceFailures().length, 1);
+    assert.equal(failure?.adapterId, "opencode");
+    assert.equal(failure?.failures, 1);
+    assert.equal(collector.metrics().failingSources, 1);
+    assert.deepEqual(
+      reported.map((item) => item.adapterId).sort(),
+      ["opencode", "registered agents"],
+    );
+
+    // Skipped while it backs off; the other source still delivers.
+    await writeFile(
+      join(sourceRoot, "codex.jsonl"),
+      codexRecord("before the failure") + codexRecord("during the backoff"),
+      "utf8",
+    );
+    now += 1_000;
+    await collector.scanOnce();
+    assert.match(delivered(), /during the backoff/u);
+    assert.equal(collector.sourceFailures()[0]?.failures, 1);
+
+    // Retried after five seconds, then twice as long after a second failure.
+    now += 5_000;
+    await collector.scanOnce();
+    const second = collector.sourceFailures()[0];
+    assert.equal(second?.failures, 2);
+    assert.equal(second?.retryAt.getTime(), now + 10_000);
+    assert.equal(reported.length, 2);
+
+    // Once the database is readable again the failure clears.
+    await rm(join(openCodeRoot, "opencode.db"));
+    registryReadable = true;
+    now += 10_000;
+    await collector.scanOnce();
+    assert.deepEqual(collector.sourceFailures(), []);
+  } finally {
+    collector.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+async function refusalFixture(prefix: string) {
+  const directory = await mkdtemp(join(tmpdir(), prefix));
+  const sourceRoot = join(directory, "sessions");
+  await mkdir(sourceRoot, { recursive: true });
+  await writeFile(
+    join(sourceRoot, "codex.jsonl"),
+    ["first", "second", "third"].map((message, index) =>
+      `${JSON.stringify({
+        timestamp: `2026-07-24T10:1${index}:00.000Z`,
+        type: "event_msg",
+        payload: { type: "agent_message", message: `${message} reply` },
+      })}\n`
+    ).join(""),
+    "utf8",
+  );
+  const collector = (
+    dataDirectory: string,
+    emit: (event: EventEnvelope) => void,
+    onDeliveryRefused?: (error: unknown) => void,
+  ) => new ActivityCollector({
+    config: loadConfig({
+      PHIGON_DATA_DIR: join(directory, dataDirectory),
+      PHIGON_ACTIVITY_REPLAY_ON_FIRST_START: "true",
+      PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE: "100",
+      PHIGON_COLLECT_VENDOR_PAYLOAD: "true",
+    }),
+    credential: {
+      machineId: "5f1b4cb4-a77d-4f53-af66-197e184683f4",
+      tenantId: "7d1b4cb4-a77d-4f53-af66-197e184683f4",
+      credential: `phg_m_${"0".repeat(43)}`,
+      controlPlaneOrigin: "http://127.0.0.1:8080",
+      createdAt: "2026-07-24T00:00:00.000Z",
+    },
+    initialSequence: 0n,
+    durableDelivery: true,
+    emit,
+    sources: [{ adapterId: "codex", roots: [sourceRoot] }],
+    ...(onDeliveryRefused === undefined ? {} : { onDeliveryRefused }),
+  });
+  // Refuses the second event once, like a full spool, then accepts.
+  const refusingOnce = (accepted: EventEnvelope[]) => {
+    let calls = 0;
+    return (event: EventEnvelope) => {
+      if (++calls === 2) {
+        throw new Error("Telemetry spool is full; collection stopped before data loss.");
+      }
+      accepted.push(event);
+    };
+  };
+  return { directory, collector, refusingOnce };
+}
+
+test("a refused delivery puts the live reader back so no record is skipped", async () => {
+  const { directory, collector, refusingOnce } = await refusalFixture("phigon-refused-live-");
+  try {
+    const expected: EventEnvelope[] = [];
+    await collector("reference", (event) => expected.push(event)).scanOnce();
+    assert.ok(expected.length >= 3);
+
+    const accepted: EventEnvelope[] = [];
+    const refusals: unknown[] = [];
+    const refused = collector("data", refusingOnce(accepted), (error) => refusals.push(error));
+    await assert.rejects(refused.scanOnce(), /refused/u);
+    assert.equal(refused.metrics().refusedDeliveries, 1);
+    assert.equal(refusals.length, 1);
+    await refused.scanOnce();
+
+    // Every record was delivered after all; the one event accepted before
+    // the refusal repeats with its source event ID for the server to drop.
+    assert.deepEqual(
+      new Set(accepted.map((event) => event.sourceEventId)),
+      new Set(expected.map((event) => event.sourceEventId)),
+    );
+    // The refused event's sequence was not consumed.
+    assert.deepEqual(
+      accepted.map((event) => event.sequence),
+      accepted.map((_, index) => BigInt(index + 1)),
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("history sync waits out a refused delivery and skips no record", async () => {
+  const { directory, collector, refusingOnce } = await refusalFixture("phigon-refused-history-");
+  try {
+    const expected: EventEnvelope[] = [];
+    await collector("reference", (event) => expected.push(event)).syncHistory();
+    assert.ok(expected.length >= 3);
+
+    const accepted: EventEnvelope[] = [];
+    const refused = collector("data", refusingOnce(accepted));
+    const summary = await refused.syncHistory();
+    assert.equal(refused.metrics().refusedDeliveries, 1);
+    assert.deepEqual(
+      new Set(accepted.map((event) => event.sourceEventId)),
+      new Set(expected.map((event) => event.sourceEventId)),
+    );
+    assert.equal(summary.throughSequence, BigInt(accepted.length));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

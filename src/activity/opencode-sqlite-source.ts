@@ -503,6 +503,7 @@ function isUnavailableDatabase(error: unknown): boolean {
       "EACCES",
       "EPERM",
       "ENOTDIR",
+      "EBUSY",
       "ESTALE",
     ].includes(String(error.code)) ||
     /database is locked|unable to open database file/iu.test(error.message)

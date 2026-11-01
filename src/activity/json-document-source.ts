@@ -78,7 +78,26 @@ type ScanOptions = Readonly<{
   maxReplayRecords: number;
   maxRecords: number;
   historical: boolean;
+  /**
+   * When the previous run last scanned, if there was one. On the first
+   * scan a document without a cursor that began after it is read from its
+   * first message instead of being baselined.
+   */
+  newSince?: number;
 }>;
+
+/**
+ * Whether a file was created after `time`. It must also have been modified
+ * after it; where the file system records creation times, an older file
+ * that was only written to does not count, so it is not uploaded again.
+ */
+export function startedAfter(
+  metadata: Readonly<{ birthtimeMs: number; mtimeMs: number }>,
+  time: number,
+): boolean {
+  return metadata.mtimeMs > time &&
+    (metadata.birthtimeMs <= 0 || metadata.birthtimeMs > time);
+}
 
 type DocumentFile = Readonly<{
   root: string;
@@ -154,11 +173,23 @@ export async function scanJSONDocumentSource(
       oversized++;
       continue;
     }
+    // A conversation that began while the observer was stopped is new work.
+    const startedWhileStopped =
+      cursor === undefined &&
+      options.initialScan &&
+      !options.historical &&
+      options.newSince !== undefined &&
+      file.modifiedMs > options.newSince &&
+      await stat(file.path).then(
+        (metadata) => startedAfter(metadata, options.newSince ?? 0),
+        () => false,
+      );
     const baselineOnly =
       cursor === undefined &&
       options.initialScan &&
       !options.historical &&
-      !replayPaths.has(file.path);
+      !replayPaths.has(file.path) &&
+      !startedWhileStopped;
     if (remaining <= 0 && !baselineOnly) {
       complete = false;
       continue;
@@ -197,7 +228,7 @@ export async function scanJSONDocumentSource(
       : finishedMessageCount(messages, source.completeFields, source.pendingField);
     let start: number;
     if (cursor === undefined) {
-      if (options.historical) start = 0;
+      if (options.historical || startedWhileStopped) start = 0;
       else if (replayPaths.has(file.path)) {
         start = Math.max(0, available - options.maxReplayRecords);
       } else if (options.initialScan) start = available;

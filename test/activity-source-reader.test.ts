@@ -2182,14 +2182,14 @@ test("a history import skips a database it already read to the end until a commi
     await utimes(databasePath, fixedSeconds, fixedSeconds);
     const skipped = await reader.scan(sources);
     assert.deepEqual([skipped.records.length, skipped.complete, skipped.metrics.malformed], [0, true, 0]);
+    assert.deepEqual(reader.sourceFailures(), []);
 
-    // A changed time means a commit may have landed: it is read again.
+    // A changed time means a commit may have landed: it is read again, and
+    // the damaged file fails as a source of its own.
     await utimes(databasePath, fixedSeconds + 60, fixedSeconds + 60);
-    const reread = await reader.scan(sources).then(
-      (scan) => scan.metrics.malformed > 0 ? "rejected" : "read",
-      () => "rejected",
-    );
-    assert.equal(reread, "rejected");
+    const reread = await reader.scan(sources);
+    assert.equal(reread.records.length, 0);
+    assert.deepEqual(reader.sourceFailures().map((failure) => failure.adapterId), ["opencode"]);
   } finally {
     reader.close();
     await rm(directory, { recursive: true, force: true });

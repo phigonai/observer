@@ -12,22 +12,22 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
-  renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import { fromBinary, toBinary } from "@bufbuild/protobuf";
+import { atomicReplaceSync } from "./atomic-replace.js";
 import {
   EventEnvelopeSchema,
   type EventEnvelope,
 } from "./generated/phigon/v1/telemetry_pb.js";
-import { BoundedEventQueue } from "./event-queue.js";
+import { BoundedEventQueue, type QueueMetrics } from "./event-queue.js";
 
 const spoolVersion = 1;
 const spoolFileName = "telemetry-spool.jsonl";
-const maxSpoolBytes = 64 << 20;
+const defaultMaxSpoolBytes = 64 << 20;
 const compactAfterOperations = 1024;
 const scopedIDPattern = /^[A-Za-z0-9._:-]{1,128}$/u;
 
@@ -67,6 +67,7 @@ type SpoolRecord = SpoolEvent | SpoolSequenceRecord;
 export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
   readonly #dataDirectory: string;
   readonly #path: string;
+  readonly #maxBytes: number;
   #scope: SpoolScope | undefined;
   #key: Buffer | undefined;
   #operations = 0;
@@ -77,10 +78,30 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
   #fileSecured = false;
   #size: number | undefined;
 
-  constructor(dataDirectory: string, capacity = 2048) {
+  constructor(
+    dataDirectory: string,
+    capacity = 2048,
+    maxBytes = defaultMaxSpoolBytes,
+  ) {
     super(capacity);
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+      throw new Error("Telemetry spool byte budget must be a positive integer.");
+    }
     this.#dataDirectory = dataDirectory;
     this.#path = join(dataDirectory, spoolFileName);
+    this.#maxBytes = maxBytes;
+  }
+
+  /**
+   * Adds the spool's size by bytes: the stored size of the unacknowledged
+   * events, which is what a compaction keeps, and the budget it must fit.
+   */
+  override metrics(): QueueMetrics {
+    return Object.freeze({
+      ...super.metrics(),
+      bytes: this.queuedBytes(),
+      byteCapacity: this.#maxBytes,
+    });
   }
 
   restore(tenantID: string, machineID: string, credential: string): void {
@@ -105,7 +126,7 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
     try {
       if (!existsSync(this.#path)) return;
       const metadata = statSync(this.#path);
-      if (!metadata.isFile() || metadata.size > maxSpoolBytes) {
+      if (!metadata.isFile() || metadata.size > this.#maxBytes) {
         throw new Error("Telemetry spool exceeds its safe storage bound.");
       }
       const restored = new BoundedEventQueue<EventEnvelope>(this.metrics().capacity);
@@ -115,14 +136,15 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
       for (const line of completeLines) {
         if (line.length === 0) continue;
         const record = parseRecord(line, scope);
-        this.#restoreRecord(record, restored);
+        this.#restoreRecord(record, restored, Buffer.byteLength(line) + 1);
       }
       if (!raw.endsWith("\n") && (lines.at(-1)?.length ?? 0) > 0) {
         // A crash can leave only the final append incomplete. It was never a
         // durable event, so ignore that tail and compact the verified prefix.
       }
-      this.#writeCompactedQueue(restored);
+      const sizes = this.#writeCompactedQueue(restored);
       this.replaceState(restored);
+      this.reweigh(sizes);
       this.#operations = 0;
     } catch (error) {
       this.#scope = undefined;
@@ -145,15 +167,19 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
     }
     validateEventScope(value, scope, sequence);
     const record = this.#encryptedRecord(value, sequence, coalesceKey);
-    this.#append(record);
-    super.enqueue(value, sequence, coalesceKey);
+    const bytes = this.#append(record);
+    super.enqueue(value, sequence, coalesceKey, bytes);
     this.#compactIfNeeded();
   }
 
+  // Removals apply in memory before they are appended. On a full spool the
+  // compaction that makes room for the record then already leaves the
+  // removed events out, so an acknowledgement can always drain the spool.
+  // A removal lost in a crash only sends the event again.
   override acknowledge(throughSequence: bigint): void {
     if (throughSequence <= this.metrics().acknowledged) return;
-    this.#append(this.#sequenceRecord("acknowledge", throughSequence));
     super.acknowledge(throughSequence);
+    this.#append(this.#sequenceRecord("acknowledge", throughSequence));
     this.#compactIfNeeded();
   }
 
@@ -161,8 +187,8 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
     if (!this.pending().some((event) => event.sequence === sequence)) {
       return false;
     }
-    this.#append(this.#sequenceRecord("discard", sequence));
     const discarded = super.discard(sequence);
+    this.#append(this.#sequenceRecord("discard", sequence));
     this.#compactIfNeeded();
     return discarded;
   }
@@ -187,6 +213,7 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
   #restoreRecord(
     record: SpoolRecord,
     target: BoundedEventQueue<EventEnvelope>,
+    bytes: number,
   ): void {
     const sequence = parseSequence(record.sequence);
     if (record.operation === "acknowledge") {
@@ -201,7 +228,7 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
     if (!target.canEnqueue(record.coalesce_key)) {
       throw new Error("Telemetry spool contains more events than the configured queue capacity.");
     }
-    target.enqueue(event, sequence, record.coalesce_key);
+    target.enqueue(event, sequence, record.coalesce_key, bytes);
   }
 
   #encryptedRecord(
@@ -269,14 +296,15 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
     };
   }
 
-  #append(record: SpoolRecord): void {
+  /** Append one record and return its stored size. */
+  #append(record: SpoolRecord): number {
     this.#prepareDirectory();
     const encoded = `${JSON.stringify(record)}\n`;
     const bytes = Buffer.byteLength(encoded);
-    if (this.#currentSize() + bytes > maxSpoolBytes) {
+    if (this.#currentSize() + bytes > this.#maxBytes) {
       this.#compact();
     }
-    if (this.#currentSize() + bytes > maxSpoolBytes) {
+    if (this.#currentSize() + bytes > this.#maxBytes) {
       throw new Error("Telemetry spool is full; collection stopped before data loss.");
     }
     if (this.#currentSize() === 0) this.#fileSecured = false;
@@ -302,6 +330,7 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
     }
     this.#size = this.#currentSize() + bytes;
     this.#operations++;
+    return bytes;
   }
 
   #prepareDirectory(): void {
@@ -328,11 +357,12 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
   }
 
   #compact(): void {
-    this.#writeCompactedQueue(this);
+    this.reweigh(this.#writeCompactedQueue(this));
     this.#operations = 0;
   }
 
-  #writeCompactedQueue(queue: BoundedEventQueue<EventEnvelope>): void {
+  /** Rewrite the spool as `queue` and return each queued event's stored size. */
+  #writeCompactedQueue(queue: BoundedEventQueue<EventEnvelope>): number[] {
     this.#requireScope();
     mkdirSync(this.#dataDirectory, { recursive: true, mode: 0o700 });
     makeDirectoryPrivateSync(this.#dataDirectory);
@@ -346,8 +376,9 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
         )
       ),
     ];
-    const encoded = `${records.map((record) => JSON.stringify(record)).join("\n")}\n`;
-    if (Buffer.byteLength(encoded) > maxSpoolBytes) {
+    const lines = records.map((record) => JSON.stringify(record));
+    const encoded = `${lines.join("\n")}\n`;
+    if (Buffer.byteLength(encoded) > this.#maxBytes) {
       throw new Error("Telemetry spool is full; collection stopped before data loss.");
     }
     const temporaryPath = `${this.#path}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
@@ -359,7 +390,7 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
         flush: true,
       });
       this.#size = undefined;
-      renameSync(temporaryPath, this.#path);
+      atomicReplaceSync(temporaryPath, this.#path);
       chmodSync(this.#path, 0o600);
       this.#directoryPrepared = true;
       this.#fileSecured = true;
@@ -372,6 +403,8 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
       }
       throw error;
     }
+    // The first line is the acknowledgement; each event is one line.
+    return lines.slice(1).map((line) => Buffer.byteLength(line) + 1);
   }
 
   #requireScope(): SpoolScope {

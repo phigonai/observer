@@ -3,6 +3,7 @@ import {
   timestampDate,
   timestampFromDate,
 } from "@bufbuild/protobuf/wkt";
+import { abortableDelay } from "../abortable-delay.js";
 import { AgentState } from "../generated/phigon/v1/common_pb.js";
 import {
   AgentIdentitySchema,
@@ -253,22 +254,4 @@ export async function runDiscoveryLoop(
     }
     await abortableDelay(intervalMs, signal);
   }
-}
-
-async function abortableDelay(
-  milliseconds: number,
-  signal: AbortSignal,
-): Promise<void> {
-  if (signal.aborted) return;
-  await new Promise<void>((resolve) => {
-    const timeout = setTimeout(resolve, milliseconds);
-    signal.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timeout);
-        resolve();
-      },
-      { once: true },
-    );
-  });
 }
