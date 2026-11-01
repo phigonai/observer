@@ -1,5 +1,6 @@
 import { loadConfig } from "./config.js";
 import { FileCredentialStore } from "./credential-store.js";
+import { trustSavedAuthority } from "./server-authority.js";
 
 /** Restore paired endpoints so a new terminal/service cannot switch workspaces. */
 export async function connectionEnvironment(
@@ -15,6 +16,9 @@ export async function connectionEnvironment(
     result[name] = value;
   }
   const initial = loadConfig(result);
+  // A company's own server: trust the authority pinned when this computer paired.
+  const authority = trustSavedAuthority(initial.dataDirectory);
+  if (authority !== undefined) result["PHIGON_TLS_CA_FILE"] ||= authority;
   const credential = await new FileCredentialStore(initial.dataDirectory).load();
   if (!credential) return result;
   result["PHIGON_CONTROL_PLANE_URL"] ||= credential.controlPlaneOrigin;

@@ -160,6 +160,20 @@ settings. A full description is in
 
 Run `phigon-observer help` for every flag.
 
+### A company's own Phigon server
+
+The Phigon app can run a company's own server, and other computers on the
+company network can connect to it. That server signs its HTTPS certificate
+with an authority of its own, so the **Connect machine** command adds
+`--server-ca-sha256 <fingerprint>`.
+
+On first contact, pairing finds the authority in the server's certificate
+chain whose SHA-256 matches the fingerprint. It saves that authority as
+`server-ca.pem` in the data directory, and every later HTTPS and gRPC
+connection trusts it. A server that presents another certificate is refused
+before anything is sent. `remove-machine` deletes the file. This needs
+Node.js 24.5 or newer.
+
 ## Configuration
 
 Settings are environment variables. The most common ones:
@@ -168,7 +182,7 @@ Settings are environment variables. The most common ones:
 | --- | --- |
 | `PHIGON_DATA_DIR` | Where the credential, checkpoints and encrypted queue live. Use a separate directory per workspace. |
 | `PHIGON_CONTROL_PLANE_URL`, `PHIGON_GRPC_URL` | Endpoints for a self-hosted workspace. Pairing saves them; the stream refuses to send credentials anywhere else. |
-| `PHIGON_TLS_CA_FILE` | A private certificate authority for gRPC. Use `NODE_EXTRA_CA_CERTS` for HTTPS. |
+| `PHIGON_TLS_CA_FILE` | A private certificate authority for gRPC. Use `NODE_EXTRA_CA_CERTS` for HTTPS. Pairing with `--server-ca-sha256` sets up both for you. |
 | `PHIGON_TLS_CLIENT_CERT_FILE`, `PHIGON_TLS_CLIENT_KEY_FILE` | Client certificate, when the workspace requires mutual TLS. |
 | `PHIGON_COLLECT_*` | Turns individual content categories off (or on, within the workspace policy). |
 | `PHIGON_REDACT_PATH_PATTERNS` | Extra file path patterns to redact. |
