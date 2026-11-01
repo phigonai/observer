@@ -1,5 +1,5 @@
 import { atomicReplace } from "./atomic-replace.js";
-import { redactSecrets } from "./content-redaction.js";
+import { credentialEnvironmentName, redactSecrets } from "./content-redaction.js";
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { guardianRunnerPath } from "./guardian-native.js";
@@ -155,25 +155,9 @@ export function powerCommand(restart: boolean): CommandSpec {
     : { executable: "/sbin/shutdown", arguments: [restart ? "-r" : "-h", "+1"], timeout_seconds: 10 };
 }
 
-/** Names whose values are credentials, in environment variables and in NAME=value output. */
-export function credentialName(name: string): boolean {
-  const lower = name.toLowerCase();
-  if (lower === "key" || lower === "pwd" || lower === "oldpwd") return false;
-  return /token|secret|passw(?:or)?d|api[_-]?key|passphrase|credential|cookie|(?:key|pwd)$|(?:^|[_.-])auth$|dsn$|connection[_-]?string/u.test(lower);
-}
-
-// Command output only: well-known credential formats beyond the shared set.
-const commandTokenFormats = /\b(?:glpat-[A-Za-z0-9_-]{20,}|xapp-[A-Za-z0-9-]{10,}|hf_[A-Za-z0-9]{30,}|ya29\.[A-Za-z0-9_-]{20,}|rk_(?:live|test)_[A-Za-z0-9]{10,}|shpat_[a-fA-F0-9]{32}|dop_v1_[a-f0-9]{64}|pypi-[A-Za-z0-9_-]{50,})/gu;
-const assignment = /(^|[\s;,{(&?-])(["']?)([A-Za-z_][A-Za-z0-9_.-]{0,127})\2([ \t]*[:=][ \t]*)("[^"\n]*"|'[^'\n]*'|[^\s,;}&]+)/gmu;
-
 export function redactCommandOutput(value: string): string {
-  let safe = redactSecrets(value, "[REDACTED]").replace(commandTokenFormats, "[REDACTED]");
-  // Short values such as ids and booleans stay readable.
-  safe = safe.replace(assignment, (match: string, lead: string, quote: string, name: string, separator: string, item: string) =>
-    credentialName(name) && item.replace(/^["']|["']$/gu, "").length >= 6 && !item.includes("[REDACTED")
-      ? `${lead}${quote}${name}${quote}${separator}[REDACTED]`
-      : match);
-  for (const [key, secret] of Object.entries(process.env)) if (credentialName(key) && secret && secret.length >= 8) safe = safe.split(secret).join("[REDACTED]");
+  let safe = redactSecrets(value, "[REDACTED]");
+  for (const [key, secret] of Object.entries(process.env)) if (credentialEnvironmentName(key) && secret && secret.length >= 8) safe = safe.split(secret).join("[REDACTED]");
   // The paired credential lives in the data directory, not the environment;
   // redactSecrets masks its phg_m_ prefix wherever it is printed.
   return safe;
@@ -190,7 +174,7 @@ function launchFailure(executable: string): CommandExecution {
 
 export async function runCommand(spec: CommandSpec): Promise<CommandExecution> {
   return new Promise((resolve) => {
-    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^PHIGON_/iu.test(key) && !credentialName(key)));
+    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^PHIGON_/iu.test(key) && !credentialEnvironmentName(key)));
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn(spec.executable, spec.arguments, { shell: false, windowsHide: true, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"], env, ...(spec.working_directory ? { cwd: spec.working_directory } : {}) });

@@ -66,6 +66,8 @@ import {
 } from "./pair.js";
 import { removeMachine } from "./remove-machine.js";
 import { forgetServerAuthority, parseAuthorityFingerprint, pinServerAuthority } from "./server-authority.js";
+import { hasByteHeadroom } from "./event-queue.js";
+import { InstanceLock } from "./instance-lock.js";
 import { clearEventSpool } from "./event-spool.js";
 import { GuardianDecisionJournal } from "./guardian-decision-journal.js";
 import {
@@ -516,6 +518,7 @@ export async function run(
       const stop = () => controller.abort();
       process.once("SIGINT", stop);
       process.once("SIGTERM", stop);
+      let instanceLock: InstanceLock | undefined;
       try {
         const credential = await new FileCredentialStore(
           config.dataDirectory,
@@ -548,6 +551,9 @@ export async function run(
             "Full-content collection is outside the consented metadata profile.",
           );
         }
+        // Before any queued activity, cursor or saved state is read. A
+        // signal only aborts the tasks, so `finally` releases the lock.
+        instanceLock = await InstanceLock.acquire(config.dataDirectory);
         let effectivePolicy = intersectCollectionPolicy(config.policy);
         let collector: ActivityCollector | undefined;
         let resolveCollector: ((value: ActivityCollector) => void) | undefined;
@@ -665,6 +671,15 @@ export async function run(
             tenantId: credential.tenantId,
             machineId: credential.machineId,
           },
+          {
+            onSaveError: (error) => output.stderr(
+              `Saved agent identities could not be written (${
+                (error instanceof Error ? error.message : String(error))
+                  .replace(/\s+/gu, " ")
+                  .slice(0, 200)
+              }); retrying on the next pass.\n`,
+            ),
+          },
         );
         let historicalIdentities = await historicalStore.load();
         const initialDiscovery = await discoveryEngine.discover(
@@ -752,17 +767,32 @@ export async function run(
             durableDelivery: true,
             policy: effectivePolicy,
             emit: (event) => client.enqueue(event),
+            // The spool also has a byte budget; reaching it fails delivery
+            // instead of waiting, so both stop well before it.
             canCollect: () => {
               const queue = client.metrics().queue;
               return (
+                hasByteHeadroom(queue) &&
                 queue.capacity - queue.depth >=
                 Math.max(32, config.activityRateLimitPerMinute)
               );
             },
             canSyncHistory: () => {
               const queue = client.metrics().queue;
-              return queue.capacity - queue.depth >= Math.min(queue.capacity, historySyncQueueHeadroom);
+              return hasByteHeadroom(queue) &&
+                queue.capacity - queue.depth >= Math.min(queue.capacity, historySyncQueueHeadroom);
             },
+            onDeliveryRefused: (error) => output.stderr(
+              `Telemetry delivery is paused (${
+                (error instanceof Error ? error.message : String(error))
+                  .replace(/\s+/gu, " ")
+                  .slice(0, 200)
+              }). Collection resumes from the same records once queued events are acknowledged.\n`,
+            ),
+            onSourceFailure: (failure) => output.stderr(
+              `Activity source ${failure.adapterId} could not be read (${failure.message}). ` +
+                "It is retried shortly; other sources keep collecting.\n",
+            ),
             additionalSources: async () =>
               registeredAgentActivitySources(
                 await customAgentRegistry.list(),
@@ -820,6 +850,7 @@ export async function run(
       } finally {
         process.removeListener("SIGINT", stop);
         process.removeListener("SIGTERM", stop);
+        await instanceLock?.release();
       }
       return 0;
     }

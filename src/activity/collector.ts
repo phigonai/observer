@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { create, toBinary } from "@bufbuild/protobuf";
 import { timestampFromDate } from "@bufbuild/protobuf/wkt";
+import { abortableDelay } from "../abortable-delay.js";
 import type { ObserverConfig } from "../config.js";
 import type { CollectionPolicy } from "../config.js";
 import type { StoredMachineCredential } from "../credential-store.js";
@@ -54,6 +55,7 @@ import {
   type ActivitySourceCheckpoint,
   JSONLSourceReader,
   type ActivitySource,
+  type SourceFailure,
 } from "./source-reader.js";
 import type { VendorActivityAdapter } from "./types.js";
 import { processKeyCapability } from "../discovery/process-identity.js";
@@ -82,6 +84,10 @@ const adapters: ReadonlyMap<string, VendorActivityAdapter> = new Map([
   // Keep the flexible generic parser after the generated bridge adapters so
   // the generic bridge cannot accidentally replace it with a fixed label.
   ["generic", genericActivityAdapter],
+  // Deliberately replaces the generated OpenCode bridge parser: the native
+  // adapter reads both OpenCode's database events and the structured CLI
+  // records (step_start, tool_use, text, step_finish) that
+  // `ingest --agent opencode` receives, as docs/activity-collection.md says.
   ["opencode", openCodeActivityAdapter],
   // Native recordings use their own adapter IDs so the OpenAI-compatible
   // `ingest --agent` bridges for the same products keep their parser.
@@ -108,6 +114,10 @@ export type ActivityCollectorMetrics = Readonly<{
   lastSequence: bigint;
   pendingCheckpoints: number;
   backpressuredScans: number;
+  /** Scans whose records delivery refused; they are read again later. */
+  refusedDeliveries: number;
+  /** Sources or files currently skipped after a failure. */
+  failingSources: number;
 }>;
 
 export type HistorySyncSummary = Readonly<{
@@ -134,7 +144,23 @@ export type ActivityCollectorOptions = Readonly<{
   onSourceIdentity?: (
     identity: AgentIdentity,
   ) => void | Promise<void>;
+  /**
+   * Called when delivery first refuses an event after accepting the
+   * previous ones, for example because the spool is full.
+   */
+  onDeliveryRefused?: (error: unknown) => void;
+  /**
+   * Called when a source (or one of its files) starts failing. It is
+   * skipped for a while and retried; every other source keeps collecting.
+   */
+  onSourceFailure?: (failure: SourceFailure) => void;
 }>;
+
+/**
+ * `emit` refused an event. The reader was put back to where the scan
+ * started, so its records are read again once delivery has room.
+ */
+class DeliveryRefusedError extends Error {}
 
 type PendingCheckpoint = Readonly<{
   throughSequence: bigint;
@@ -164,6 +190,12 @@ export class ActivityCollector {
   readonly #onSourceIdentity: (
     identity: AgentIdentity,
   ) => void | Promise<void>;
+  readonly #onDeliveryRefused: (error: unknown) => void;
+  readonly #onSourceFailure: (failure: SourceFailure) => void;
+  readonly #reportedFailures = new WeakSet<SourceFailure>();
+  #registeredSourcesFailing = false;
+  #deliveryRefused = false;
+  #refusedDeliveries = 0;
   #policy: LocalPolicyEngine;
   readonly #limiter: MinuteRateLimiter;
   readonly #agentsByKind = new Map<AgentKind, AgentIdentity[]>();
@@ -208,6 +240,8 @@ export class ActivityCollector {
     this.#canCollect = options.canCollect ?? (() => true);
     this.#canSyncHistory = options.canSyncHistory ?? this.#canCollect;
     this.#onSourceIdentity = options.onSourceIdentity ?? (() => undefined);
+    this.#onDeliveryRefused = options.onDeliveryRefused ?? (() => undefined);
+    this.#onSourceFailure = options.onSourceFailure ?? (() => undefined);
     this.#policy = new LocalPolicyEngine(
       options.policy ?? options.config.policy,
       options.config.redactionPathPatterns,
@@ -284,25 +318,32 @@ export class ActivityCollector {
           throw new Error("History sync expired before all available records were uploaded.");
         }
         if (!this.#canSyncHistory()) {
-          await abortableDelay(250, signal ?? new AbortController().signal);
+          await abortableDelay(250, signal);
           continue;
         }
         // Release the collection lock between bounded batches. A large archive
         // must not prevent the live reader from following current work.
         const started = performance.now();
-        const pass = await this.#withScanLock(async () => {
-          const before = this.#emittedEvents;
-          const result = await this.#collectOnce(this.#historyReader, true);
-          eventsUploaded += this.#emittedEvents - before;
-          return result;
-        });
+        let pass: CollectionPass;
+        try {
+          pass = await this.#withScanLock(async () => {
+            const before = this.#emittedEvents;
+            const result = await this.#collectOnce(this.#historyReader, true);
+            eventsUploaded += this.#emittedEvents - before;
+            return result;
+          });
+        } catch (error) {
+          if (!(error instanceof DeliveryRefusedError)) throw error;
+          await abortableDelay(250, signal);
+          continue;
+        }
         recordsScanned += pass.sourceRecords;
         filesDiscovered = Math.max(filesDiscovered, pass.discoveredFiles);
         complete = pass.complete;
         if (!complete && pass.sourceRecords === 0) {
-          await abortableDelay(100, signal ?? new AbortController().signal);
+          await abortableDelay(100, signal);
         } else if (!complete) {
-          await abortableDelay(historyRest(performance.now() - started), signal ?? new AbortController().signal);
+          await abortableDelay(historyRest(performance.now() - started), signal);
         }
       }
       return Object.freeze({
@@ -337,10 +378,12 @@ export class ActivityCollector {
         discoveredFiles: 0,
       };
     }
+    const start = reader.position();
     const scan = await reader.scan([
       ...this.#sources,
-      ...await this.#additionalSources(),
+      ...await this.#registeredSources(),
     ], Math.max(1, Math.floor(allowance / maxDraftsPerRecord)));
+    this.#reportSourceFailures(reader);
     this.#sourceRecords += scan.metrics.records;
     this.#malformedRecords += scan.metrics.malformed;
     this.#oversizedRecords += scan.metrics.oversized;
@@ -429,11 +472,29 @@ export class ActivityCollector {
           this.#oversizedEvents++;
           continue;
         }
+        try {
+          this.#emit(event);
+        } catch (error) {
+          // The reader already moved past this scan's records. Put it back
+          // so none is skipped; the ones delivered before this event are
+          // sent again with the same source event IDs, which the server
+          // deduplicates. The sequence stays unused, leaving no gap.
+          reader.rewind(start);
+          this.#refusedDeliveries++;
+          if (!this.#deliveryRefused) {
+            this.#deliveryRefused = true;
+            this.#onDeliveryRefused(error);
+          }
+          throw new DeliveryRefusedError(
+            "Telemetry delivery refused an activity event.",
+            { cause: error },
+          );
+        }
         this.#lastSequence = nextSequence;
-        this.#emit(event);
         this.#emittedEvents++;
       }
     }
+    this.#deliveryRefused = false;
     await this.#flushSourceIdentitySaves();
     const pending = {
       throughSequence: this.#lastSequence,
@@ -464,7 +525,13 @@ export class ActivityCollector {
   async run(signal: AbortSignal): Promise<void> {
     try {
       while (!signal.aborted) {
-        await this.scanOnce();
+        try {
+          await this.scanOnce();
+        } catch (error) {
+          // A full queue or spool waits for acknowledgements like any
+          // other backpressure; the refused records are read again.
+          if (!(error instanceof DeliveryRefusedError)) throw error;
+        }
         await abortableDelay(
           this.#config.activityScanIntervalMs,
           signal,
@@ -494,7 +561,53 @@ export class ActivityCollector {
       lastSequence: this.#lastSequence,
       pendingCheckpoints: this.#pendingCheckpoints.length,
       backpressuredScans: this.#backpressuredScans,
+      refusedDeliveries: this.#refusedDeliveries,
+      failingSources: this.#reader.sourceFailures().length,
     });
+  }
+
+  /**
+   * Sources of registered custom agents. When their list cannot be read,
+   * this scan goes on with the built-in sources.
+   */
+  async #registeredSources(): Promise<readonly ActivitySource[]> {
+    try {
+      const sources = await this.#additionalSources();
+      this.#registeredSourcesFailing = false;
+      return sources;
+    } catch (error) {
+      if (!this.#registeredSourcesFailing) {
+        this.#registeredSourcesFailing = true;
+        const now = this.#clock();
+        this.#onSourceFailure(Object.freeze({
+          adapterId: "registered agents",
+          failures: 1,
+          message: (error instanceof Error ? error.message : String(error))
+            .replace(/\s+/gu, " ")
+            .slice(0, 200),
+          failedAt: now,
+          // Read again on the next scan.
+          retryAt: now,
+        }));
+      }
+      return [];
+    }
+  }
+
+  #reportSourceFailures(reader: JSONLSourceReader): void {
+    for (const failure of reader.sourceFailures()) {
+      if (failure.failures !== 1 || this.#reportedFailures.has(failure)) continue;
+      this.#reportedFailures.add(failure);
+      this.#onSourceFailure(failure);
+    }
+  }
+
+  /** Sources and files skipped after a failure, by the live and history readers. */
+  sourceFailures(): readonly SourceFailure[] {
+    return [
+      ...this.#reader.sourceFailures(),
+      ...this.#historyReader.sourceFailures(),
+    ];
   }
 
   sourceIdentities(): AgentIdentity[] {
@@ -1127,22 +1240,4 @@ function clampObservedAt(value: Date, now: Date): Date {
 export function historyRest(spentMs: number): number {
   if (!Number.isFinite(spentMs) || spentMs <= 0) return 0;
   return Math.min(1_000, Math.round(spentMs));
-}
-
-async function abortableDelay(
-  milliseconds: number,
-  signal: AbortSignal,
-): Promise<void> {
-  if (signal.aborted) return;
-  await new Promise<void>((resolve) => {
-    const timeout = setTimeout(resolve, milliseconds);
-    signal.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timeout);
-        resolve();
-      },
-      { once: true },
-    );
-  });
 }

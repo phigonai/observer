@@ -4,12 +4,12 @@ import {
   chmod,
   mkdir,
   readFile,
-  rename,
   stat,
   unlink,
   writeFile,
 } from "node:fs/promises";
 import { join } from "node:path";
+import { atomicReplace } from "./atomic-replace.js";
 import { create } from "@bufbuild/protobuf";
 import {
   timestampDate,
@@ -38,6 +38,14 @@ const scopedIDPattern = /^[A-Za-z0-9._:-]{1,128}$/u;
 export type HistoricalIdentityScope = Readonly<{
   tenantId: string;
   machineId: string;
+}>;
+
+export type HistoricalIdentityStoreOptions = Readonly<{
+  /**
+   * Called when the catalog could not be written. The identities stay in
+   * memory and the next `remember` writes the catalog again.
+   */
+  onSaveError?: (error: unknown) => void;
 }>;
 
 type StoredIdentity = Readonly<{
@@ -76,15 +84,25 @@ export class HistoricalIdentityStore {
   #loadPromise: Promise<readonly AgentIdentity[]> | undefined;
   #saveChain = Promise.resolve();
   #needsRewrite = false;
+  readonly #onSaveError: (error: unknown) => void;
 
   constructor(
     dataDirectory: string,
     scope: HistoricalIdentityScope,
+    options: HistoricalIdentityStoreOptions = {},
   ) {
     validateScope(scope);
     this.#dataDirectory = dataDirectory;
     this.#path = join(dataDirectory, catalogFileName);
     this.#scope = Object.freeze({ ...scope });
+    this.#onSaveError = options.onSaveError ?? ((error) => {
+      process.emitWarning(
+        `Saved agent identities could not be written and are retried on the next pass: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        { code: "PHIGON_IDENTITY_CATALOG" },
+      );
+    });
   }
 
   load(): Promise<readonly AgentIdentity[]> {
@@ -104,18 +122,28 @@ export class HistoricalIdentityStore {
           const sanitized = sanitizedHistoricalIdentity(candidate);
           if (sanitized === undefined) continue;
           const previous = this.#identities.get(sanitized.agentId);
+          // Discovery refreshes the observation time of every running agent
+          // on each pass. Keep the newest time in memory, but rewrite the
+          // catalog only when something else changed.
           if (
             previous === undefined ||
-            serializedIdentity(previous) !== serializedIdentity(sanitized)
+            comparableIdentity(previous) !== comparableIdentity(sanitized)
           ) {
-            this.#identities.set(sanitized.agentId, sanitized);
             changed = true;
           }
+          this.#identities.set(sanitized.agentId, sanitized);
         }
         if (this.#bound()) changed = true;
         if (changed) {
-          await this.#save();
-          this.#needsRewrite = false;
+          try {
+            await this.#save();
+            this.#needsRewrite = false;
+          } catch (error) {
+            // A catalog that cannot be written, for example while Windows
+            // holds it locked, must not stop discovery or collection.
+            this.#needsRewrite = true;
+            this.#onSaveError(error);
+          }
         }
         return this.identities();
       });
@@ -204,7 +232,7 @@ export class HistoricalIdentityStore {
         `${JSON.stringify(catalog)}\n`,
         { encoding: "utf8", flag: "wx", mode: 0o600 },
       );
-      await rename(temporaryPath, this.#path);
+      await atomicReplace(temporaryPath, this.#path);
       await chmod(this.#path, 0o600);
     } catch (error) {
       try {
@@ -506,8 +534,9 @@ function inventoryRetentionOrder(
   return recentIdentityFirst(left, right);
 }
 
-function serializedIdentity(value: AgentIdentity): string {
-  return JSON.stringify(storedIdentity(value));
+/** The stored identity without its observation time. */
+function comparableIdentity(value: AgentIdentity): string {
+  return JSON.stringify({ ...storedIdentity(value), last_observed_at: "" });
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {

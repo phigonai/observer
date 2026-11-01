@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { hasByteHeadroom } from "../src/event-queue.js";
 import { FileBackedEventQueue } from "../src/event-spool.js";
 import { PrivacyClass } from "../src/generated/phigon/v1/common_pb.js";
 import {
@@ -160,6 +161,90 @@ test("event spool rejects oversized files before reading them", async () => {
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("event spool reports its stored bytes across acknowledgement, compaction and restart", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-event-spool-bytes-"));
+  const path = join(directory, "telemetry-spool.jsonl");
+  try {
+    const queue = new FileBackedEventQueue(directory, 16, 64 << 10);
+    queue.restore(tenantID, machineID, credential);
+    assert.equal(queue.metrics().bytes, 0);
+    assert.equal(queue.metrics().byteCapacity, 64 << 10);
+    for (let sequence = 1n; sequence <= 3n; sequence++) {
+      queue.enqueue(lifecycleEvent(sequence, "x".repeat(200)), sequence);
+    }
+    // Before any acknowledgement the spool holds exactly the queued events.
+    const queued = queue.metrics().bytes ?? 0;
+    assert.equal(queued, (await stat(path)).size);
+    const lines = (await readFile(path, "utf8")).split("\n");
+    queue.acknowledge(1n);
+    const unacknowledged = queued - Buffer.byteLength(lines[0] ?? "") - 1;
+    assert.equal(queue.metrics().bytes, unacknowledged);
+    // Rewriting the spool keeps the same stored size for the same events.
+    queue.replacePending((event) => event);
+    assert.equal(queue.metrics().bytes, unacknowledged);
+    queue.discard(3n);
+    const kept = queue.metrics().bytes;
+    assert.equal(kept, Buffer.byteLength(lines[1] ?? "") + 1);
+
+    const restarted = new FileBackedEventQueue(directory, 16, 64 << 10);
+    restarted.restore(tenantID, machineID, credential);
+    assert.equal(restarted.metrics().bytes, kept);
+    restarted.acknowledge(2n);
+    assert.equal(restarted.metrics().bytes, 0);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("collection stops by bytes before the spool budget, and a full spool still drains", async () => {
+  const root = await mkdtemp(join(tmpdir(), "phigon-event-spool-budget-"));
+  // A fixed time keeps every event, and so the spool, the same size.
+  const large = (sequence: bigint) => create(EventEnvelopeSchema, {
+    ...lifecycleEvent(sequence, "y".repeat(1_000)),
+    observedAt: timestampFromDate(new Date("2026-11-01T00:00:00.000Z")),
+  });
+  try {
+    const measured = new FileBackedEventQueue(join(root, "measure"), 1_024);
+    measured.restore(tenantID, machineID, credential);
+    for (let sequence = 1n; sequence <= 8n; sequence++) {
+      measured.enqueue(large(sequence), sequence);
+    }
+    const budget = (await stat(join(root, "measure", "telemetry-spool.jsonl"))).size;
+
+    // Eight large events fill the budget exactly, far below the event count.
+    const queue = new FileBackedEventQueue(join(root, "spool"), 1_024, budget);
+    queue.restore(tenantID, machineID, credential);
+    let pausedAt: bigint | undefined;
+    for (let sequence = 1n; sequence <= 8n; sequence++) {
+      queue.enqueue(large(sequence), sequence);
+      if (pausedAt === undefined && !hasByteHeadroom(queue.metrics())) {
+        pausedAt = sequence;
+      }
+    }
+    assert.equal(queue.metrics().bytes, budget);
+    // Collection paused at three quarters of the budget, with room left.
+    assert.equal(pausedAt, 6n);
+    // Past the budget the spool refuses rather than dropping an event.
+    assert.throws(() => queue.enqueue(large(9n), 9n), /spool is full/u);
+    // The acknowledgement record does not fit either, yet it is accepted.
+    queue.acknowledge(4n);
+    assert.equal(queue.metrics().depth, 4);
+    assert.equal(hasByteHeadroom(queue.metrics()), true);
+    const restarted = new FileBackedEventQueue(join(root, "spool"), 1_024, budget);
+    restarted.restore(tenantID, machineID, credential);
+    assert.deepEqual(restarted.pending().map((event) => event.sequence), [5n, 6n, 7n, 8n]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a queue without a byte budget always has byte headroom", () => {
+  const base = { capacity: 4, depth: 0, utilization: 0, dropped: 0, coalesced: 0, acknowledged: 0n };
+  assert.equal(hasByteHeadroom(base), true);
+  assert.equal(hasByteHeadroom({ ...base, bytes: 74, byteCapacity: 100 }), true);
+  assert.equal(hasByteHeadroom({ ...base, bytes: 75, byteCapacity: 100 }), false);
 });
 
 function lifecycleEvent(sequence: bigint, reason: string): EventEnvelope {

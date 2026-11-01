@@ -7,12 +7,35 @@ export type QueueMetrics = Readonly<{
   acknowledged: bigint;
   oldestSequence?: bigint;
   latestSequence?: bigint;
+  /** Stored size of the queued events, for a queue with a byte budget. */
+  bytes?: number;
+  /** The byte budget. A queue at its budget refuses new events. */
+  byteCapacity?: number;
 }>;
+
+/**
+ * Collection pauses once a byte-budgeted queue holds this share of its
+ * budget. Events can be up to 1 MiB each, so the event count alone lets a
+ * slow server fill the budget first; the rest is room for a scan already
+ * under way.
+ */
+const byteBackpressureRatio = 0.75;
+
+/** Whether a queue still has room by bytes for another collection pass. */
+export function hasByteHeadroom(metrics: QueueMetrics): boolean {
+  return (
+    metrics.bytes === undefined ||
+    metrics.byteCapacity === undefined ||
+    metrics.bytes < metrics.byteCapacity * byteBackpressureRatio
+  );
+}
 
 export type QueuedEvent<T> = Readonly<{
   value: T;
   sequence: bigint;
   coalesceKey?: string;
+  /** Stored size of the event, when the queue keeps a byte budget. */
+  bytes?: number;
 }>;
 
 export class BoundedEventQueue<T> {
@@ -27,6 +50,8 @@ export class BoundedEventQueue<T> {
   #dropped = 0;
   #coalesced = 0;
   #acknowledged = 0n;
+  // Sum of the `bytes` of the queued events (#events[#head..]).
+  #bytes = 0;
 
   constructor(capacity = 2048) {
     if (!Number.isSafeInteger(capacity) || capacity < 1) {
@@ -39,17 +64,20 @@ export class BoundedEventQueue<T> {
     value: T,
     sequence: bigint,
     coalesceKey?: string,
+    bytes = 0,
   ): void {
     if (sequence <= this.#acknowledged) return;
     const event = {
       value,
       sequence,
       ...(coalesceKey === undefined ? {} : { coalesceKey }),
+      ...(bytes === 0 ? {} : { bytes }),
     };
     if (coalesceKey === undefined && this.#size() < this.#capacity) {
       const last = this.#last();
       if (last === undefined || last.sequence <= sequence) {
         this.#events.push(event);
+        this.#bytes += bytes;
         return;
       }
     }
@@ -59,7 +87,8 @@ export class BoundedEventQueue<T> {
         (candidate) => candidate.coalesceKey === coalesceKey,
       );
       if (index >= 0) {
-        this.#events[index] = { value, sequence, coalesceKey };
+        this.#bytes += bytes - (this.#events[index]?.bytes ?? 0);
+        this.#events[index] = event;
         this.#events.sort((left, right) =>
           left.sequence < right.sequence ? -1 : left.sequence > right.sequence ? 1 : 0,
         );
@@ -68,10 +97,11 @@ export class BoundedEventQueue<T> {
       }
     }
     if (this.#events.length >= this.#capacity) {
-      this.#events.shift();
+      this.#bytes -= this.#events.shift()?.bytes ?? 0;
       this.#dropped++;
     }
     this.#events.splice(this.#firstAfter(sequence), 0, event);
+    this.#bytes += bytes;
   }
 
   canEnqueue(coalesceKey?: string): boolean {
@@ -95,7 +125,7 @@ export class BoundedEventQueue<T> {
       (event) => event.sequence === sequence,
     );
     if (index < 0) return false;
-    this.#events.splice(index, 1);
+    this.#bytes -= this.#events.splice(index, 1)[0]?.bytes ?? 0;
     this.#dropped++;
     return true;
   }
@@ -137,6 +167,30 @@ export class BoundedEventQueue<T> {
     this.#dropped = source.#dropped;
     this.#coalesced = source.#coalesced;
     this.#acknowledged = source.#acknowledged;
+    this.#bytes = source.#bytes;
+  }
+
+  /** Stored size of the queued events. */
+  protected queuedBytes(): number {
+    return this.#bytes;
+  }
+
+  /** Replace the stored sizes of the queued events, oldest first. */
+  protected reweigh(bytes: readonly number[]): void {
+    this.#compact();
+    if (bytes.length !== this.#events.length) {
+      throw new Error("Event queue sizes do not match the queued events.");
+    }
+    this.#events = this.#events.map((event, index) => {
+      const size = bytes[index] ?? 0;
+      return {
+        value: event.value,
+        sequence: event.sequence,
+        ...(event.coalesceKey === undefined ? {} : { coalesceKey: event.coalesceKey }),
+        ...(size === 0 ? {} : { bytes: size }),
+      };
+    });
+    this.#bytes = bytes.reduce((total, size) => total + size, 0);
   }
 
   latestSequence(): bigint | undefined {
@@ -198,7 +252,11 @@ export class BoundedEventQueue<T> {
   }
 
   #removeThrough(sequence: bigint): void {
-    this.#head = this.#firstAfter(sequence);
+    const head = this.#firstAfter(sequence);
+    for (let index = this.#head; index < head; index++) {
+      this.#bytes -= this.#events[index]?.bytes ?? 0;
+    }
+    this.#head = head;
     // Release acknowledged events once they are half of the backing array,
     // which keeps the copy amortized to constant work per event.
     if (this.#head > 0 && this.#head * 2 >= this.#events.length) {

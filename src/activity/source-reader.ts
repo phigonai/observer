@@ -18,6 +18,7 @@ import {
   DirectoryListingCache,
   type JSONDocumentOptions,
   scanJSONDocumentSource,
+  startedAfter,
 } from "./json-document-source.js";
 import { type CompletedHistory, SQLiteConnections } from "./sqlite-connections.js";
 
@@ -32,6 +33,12 @@ const defaultInitialReplayBytes = 256 << 10;
 const readWindowBytes = 1 << 20;
 const maxLineBytes = 6 << 20;
 const maxCursorEntries = 16_384;
+// A source or file that fails is skipped for a while, twice as long after
+// each further failure, so one broken agent folder or database cannot stop
+// the others or be retried on every scan.
+const failureRetryBaseMs = 5_000;
+const failureRetryMaxMs = 5 * 60_000;
+const maxTrackedFailures = 256;
 
 export type SourceReaderMode = "live" | "history";
 
@@ -61,6 +68,16 @@ export type SourceRecord = Readonly<{
   value: unknown;
 }>;
 
+/** A source, or one of its files, that failed and is being skipped. */
+export type SourceFailure = Readonly<{
+  adapterId: string;
+  /** Consecutive failed attempts. */
+  failures: number;
+  message: string;
+  failedAt: Date;
+  retryAt: Date;
+}>;
+
 export type SourceReaderMetrics = Readonly<{
   files: number;
   discoveredFiles: number;
@@ -72,11 +89,31 @@ export type SourceReaderMetrics = Readonly<{
 type CursorState = Readonly<{
   version: 1;
   files: Readonly<Record<string, number>>;
+  /** When the scan that produced these cursors started. */
+  scanned_at?: string;
+}>;
+
+export type SavedCursors = Readonly<{
+  cursors: Map<string, number>;
+  /** When the scan that produced them started; absent before any save. */
+  scannedAt?: number;
 }>;
 
 export type ActivitySourceCheckpoint = Readonly<{
   generation: number;
   cursors: ReadonlyMap<string, number>;
+  /** When this scan started, in epoch milliseconds. */
+  scannedAt: number;
+}>;
+
+/** Where a reader's next scan starts; see `JSONLSourceReader.position`. */
+export type SourceReaderPosition = Readonly<{
+  cursors: ReadonlyMap<string, number> | undefined;
+  oversizedContinuations: ReadonlySet<string>;
+  completedHistoryFiles: ReadonlyMap<string, number>;
+  completedHistoryDatabases: ReadonlyMap<string, string>;
+  initialScanComplete: boolean;
+  unbaselinedSources: ReadonlySet<string>;
 }>;
 
 type FileIdentity = Readonly<{
@@ -110,6 +147,8 @@ type CanonicalSourcePath = Readonly<{
  */
 class RecentCursors extends Map<string, number> {
   readonly #used = new Set<string>();
+  // Values from before `track`, for each cursor changed since.
+  #journal: Map<string, number | undefined> | undefined;
 
   override get(key: string): number | undefined {
     const value = super.get(key);
@@ -118,8 +157,36 @@ class RecentCursors extends Map<string, number> {
   }
 
   override set(key: string, value: number): this {
+    this.#remember(key);
     super.delete(key);
     return super.set(key, value);
+  }
+
+  override delete(key: string): boolean {
+    this.#remember(key);
+    return super.delete(key);
+  }
+
+  /** Start remembering the cursors a source changes. */
+  track(): void {
+    this.#journal = new Map();
+  }
+
+  /** Stop remembering; with `rollback`, undo every change since `track`. */
+  untrack(rollback: boolean): void {
+    const journal = this.#journal;
+    this.#journal = undefined;
+    if (!rollback || journal === undefined) return;
+    for (const [key, value] of journal) {
+      if (value === undefined) super.delete(key);
+      else super.set(key, value);
+    }
+  }
+
+  #remember(key: string): void {
+    if (this.#journal !== undefined && !this.#journal.has(key)) {
+      this.#journal.set(key, super.get(key));
+    }
   }
 
   /** Move cursors read since the last call to the recent end, then bound. */
@@ -147,12 +214,12 @@ export class ActivityCursorStore {
     this.#path = join(dataDirectory, "activity-cursors.json");
   }
 
-  async load(): Promise<Map<string, number>> {
+  async load(): Promise<SavedCursors> {
     let raw: string;
     try {
       raw = await readFile(this.#path, "utf8");
     } catch (error) {
-      if (isNodeError(error) && error.code === "ENOENT") return new Map();
+      if (isNodeError(error) && error.code === "ENOENT") return { cursors: new Map() };
       throw error;
     }
     let value: unknown;
@@ -168,7 +235,7 @@ export class ActivityCursorStore {
       const recovered = new Map<string, number>();
       await this.save(recovered);
       process.emitWarning("Saved activity checkpoints were unreadable. Available source history will be rescanned using stable record IDs.", { code: "PHIGON_CURSOR_RECOVERY" });
-      return recovered;
+      return { cursors: recovered };
     }
     if (
       typeof value !== "object" ||
@@ -194,10 +261,18 @@ export class ActivityCursorStore {
         result.set(key, offset);
       }
     }
-    return result;
+    const scannedAt = "scanned_at" in value && typeof value.scanned_at === "string"
+      ? Date.parse(value.scanned_at)
+      : Number.NaN;
+    return Number.isFinite(scannedAt)
+      ? { cursors: result, scannedAt }
+      : { cursors: result };
   }
 
-  async save(cursors: ReadonlyMap<string, number>): Promise<void> {
+  async save(
+    cursors: ReadonlyMap<string, number>,
+    scannedAt?: number,
+  ): Promise<void> {
     await mkdir(this.#dataDirectory, { recursive: true, mode: 0o700 });
     await makeDirectoryPrivate(this.#dataDirectory);
     // Keep the map's order (least recently used first) so a restarted
@@ -205,7 +280,11 @@ export class ActivityCursorStore {
     const files = Object.fromEntries(
       [...cursors.entries()].slice(-maxCursorEntries),
     );
-    const state: CursorState = { version: 1, files };
+    const state: CursorState = {
+      version: 1,
+      files,
+      ...(scannedAt === undefined ? {} : { scanned_at: new Date(scannedAt).toISOString() }),
+    };
     const temporary = `${this.#path}.${process.pid}.${randomUUID()}.tmp`;
     try {
       await writeFile(temporary, `${JSON.stringify(state)}\n`, {
@@ -238,6 +317,14 @@ export class JSONLSourceReader {
   // identical checkpoint every tick; rewriting and flushing it would cost a
   // synchronous disk write per scan interval without changing anything.
   #savedCursors: ReadonlyMap<string, number> | undefined;
+  #savedScannedAt: number | undefined;
+  // When the scan behind the saved cursors started, as loaded at startup.
+  // Undefined on the first start ever. A file without a cursor that began
+  // after it was created while the observer was stopped.
+  #lastRunAt: number | undefined;
+  // The cursors as the previous scan left them, which is where the next
+  // scan starts. Kept so a position costs no copy on every scan.
+  #scanStart: ReadonlyMap<string, number> | undefined;
   #initialScanComplete = false;
   #generation = 0;
   #committedGeneration = 0;
@@ -245,11 +332,11 @@ export class JSONLSourceReader {
   // Canonical paths from the previous listing, keyed by resolved root and
   // listed path. Holds only files seen in the latest listing.
   #canonicalPaths = new Map<string, CanonicalSourcePath>();
-  readonly #completedHistoryFiles = new Map<string, number>();
-  readonly #completedHistoryDatabases: CompletedHistory = new Map();
+  #completedHistoryFiles = new Map<string, number>();
+  #completedHistoryDatabases: CompletedHistory = new Map();
   // Cursors that stopped inside a record above the line limit. The next read
   // skips to that record's end instead of parsing its tail as a new record.
-  readonly #oversizedContinuations = new Set<string>();
+  #oversizedContinuations = new Set<string>();
   // Live database connections kept between scans, so an unchanged database
   // is recognized without reopening it and rerunning every session query.
   readonly #openCodeConnections = new SQLiteConnections();
@@ -257,6 +344,12 @@ export class JSONLSourceReader {
   readonly #documentListings = new DirectoryListingCache();
   readonly #gooseConnections = new SQLiteConnections();
   readonly #zedConnections = new SQLiteConnections();
+  readonly #failures = new Map<string, SourceFailure>();
+  // Live sources that were skipped or failed while their first scan would
+  // have baselined them. Their first successful scan baselines instead, so
+  // an old archive is not read as new work once the source recovers.
+  #unbaselinedSources = new Set<string>();
+  readonly #clock: () => number;
 
   constructor(
     dataDirectory: string,
@@ -264,6 +357,7 @@ export class JSONLSourceReader {
     initialReplayBytes = defaultInitialReplayBytes,
     initialReplaySessions = 1,
     mode: SourceReaderMode = "live",
+    clock: () => number = Date.now,
   ) {
     this.#cursorStore = new ActivityCursorStore(dataDirectory);
     this.#replayOnFirstStart = replayOnFirstStart;
@@ -276,6 +370,7 @@ export class JSONLSourceReader {
       Math.max(1, initialReplaySessions),
     );
     this.#mode = mode;
+    this.#clock = clock;
   }
 
   async scan(sources: readonly ActivitySource[], maxRecords?: number): Promise<
@@ -289,14 +384,21 @@ export class JSONLSourceReader {
     if (this.#cursors === undefined) {
       const loaded = await this.#cursorStore.load();
       this.#cursors = new RecentCursors();
-      for (const [key, offset] of loaded) this.#cursors.set(key, offset);
-      this.#savedCursors = loaded;
+      for (const [key, offset] of loaded.cursors) this.#cursors.set(key, offset);
+      this.#savedCursors = loaded.cursors;
+      this.#savedScannedAt = loaded.scannedAt;
+      this.#lastRunAt = loaded.scannedAt;
+      this.#scanStart = loaded.cursors;
     }
+    const scannedAt = this.#clock();
     const records: SourceRecord[] = [];
     let fileCount = 0;
     let malformed = 0;
     let oversized = 0;
     let candidates: SourceFile[] = [];
+    const initialScan = !this.#initialScanComplete;
+    // Files of sources that missed their baseline, baselined on this scan.
+    const baselinePaths = new Set<string>();
     const cacheKey = JSON.stringify(sources);
     if (this.#mode === "history" && this.#sourceCache?.key === cacheKey && Date.now() - this.#sourceCache.at < 5_000) {
       candidates = this.#sourceCache.files;
@@ -304,56 +406,19 @@ export class JSONLSourceReader {
     const canonicalPaths = new Map<string, CanonicalSourcePath>();
     for (const source of sources) {
       if (source.format !== undefined && source.format !== "jsonl") continue;
-      const pathPattern = source.pathPattern === undefined
-        ? undefined
-        : new RegExp(source.pathPattern, "u");
-      for (const configuredRoot of source.roots) {
-        const root = expandedActivityRoot(configuredRoot);
-        const rootFiles = await listJSONLFiles(root);
-        let rootReal: string | undefined;
-        for (const file of rootFiles) {
-          if (
-            pathPattern !== undefined &&
-            !pathPattern.test(relative(root, file.path).split(sep).join("/"))
-          ) {
-            continue;
-          }
-          let canonicalPath: string;
-          try {
-            // The listing never follows links, so a listed file keeps its
-            // canonical path while its root resolves to the same place and
-            // the file keeps its identity. Resolve each file only once.
-            rootReal ??= await realpath(root);
-            const key = `${rootReal}\u0000${file.path}`;
-            const identity = fileIdentityKey(file.identity);
-            const known = this.#canonicalPaths.get(key);
-            canonicalPath =
-              known !== undefined && identity !== undefined &&
-                known.identity === identity
-                ? known.path
-                : await realpath(file.path);
-            if (identity !== undefined) {
-              canonicalPaths.set(key, { path: canonicalPath, identity });
-            }
-          } catch (error) {
-            if (isTransientSourceError(error)) continue;
-            throw error;
-          }
-          candidates.push({
-            adapterId: source.adapterId,
-            ...(source.sourceDisplayName === undefined
-              ? {}
-              : { sourceDisplayName: source.sourceDisplayName }),
-            root,
-            path: canonicalPath,
-            modifiedMs: file.modifiedMs,
-            identity: file.identity,
-          });
-          if (candidates.length > maxCursorEntries * 2) {
-            candidates = reconciledSourceFiles(candidates);
-            candidates.sort(recentFileFirst);
-            candidates.length = maxCursorEntries;
-          }
+      const key = sourceKey(source);
+      const sourceInitial = initialScan || this.#unbaselinedSources.has(key);
+      const listed = await this.#isolated(key, source.adapterId, sourceInitial, () =>
+        this.#listJSONLSource(source, canonicalPaths)
+      );
+      if (listed === undefined) continue;
+      for (const file of listed) {
+        candidates.push(file);
+        if (sourceInitial && !initialScan) baselinePaths.add(file.path);
+        if (candidates.length > maxCursorEntries * 2) {
+          candidates = reconciledSourceFiles(candidates);
+          candidates.sort(recentFileFirst);
+          candidates.length = maxCursorEntries;
         }
       }
     }
@@ -363,20 +428,22 @@ export class JSONLSourceReader {
     const recentCandidates = reconciledSourceFiles(candidates)
       .sort(recentFileFirst)
       .slice(0, maxCursorEntries);
-    const initialScan = !this.#initialScanComplete;
     const selected = this.#mode === "history"
       ? await this.#pendingHistoryFiles(recentCandidates)
       : recentCandidates.slice(0, maxSourceFiles);
     const replayFiles = initialScan && this.#replayOnFirstStart
       ? newestFilesPerAdapter(selected, this.#initialReplaySessions)
       : new Set<string>();
-    if (initialScan && this.#mode === "live") {
+    if (this.#mode === "live" && (initialScan || baselinePaths.size > 0)) {
       for (const file of [...recentCandidates].reverse()) {
+        if (!initialScan && !baselinePaths.has(file.path)) continue;
         if (!replayFiles.has(file.path)) {
           try {
             await this.#baselineFile(file.root, file.path);
           } catch (error) {
-            if (!isTransientSourceError(error)) throw error;
+            if (!isTransientSourceError(error)) {
+              this.#recordFailure(fileKey(file.path), file.adapterId, error);
+            }
           }
         }
       }
@@ -395,6 +462,7 @@ export class JSONLSourceReader {
         fileCount++;
         continue;
       }
+      if (this.#skipping(fileKey(file.path))) continue;
       let result;
       try {
         const rootReal = rootRealPaths.get(file.root) ??
@@ -409,9 +477,12 @@ export class JSONLSourceReader {
           remainingRecords - reservedDatabaseRecords,
         );
       } catch (error) {
-        if (isTransientSourceError(error)) continue;
-        throw error;
+        if (!isTransientSourceError(error)) {
+          this.#recordFailure(fileKey(file.path), file.adapterId, error);
+        }
+        continue;
       }
+      this.#failures.delete(fileKey(file.path));
       fileCount++;
       records.push(...result.records);
       malformed += result.malformed;
@@ -425,18 +496,21 @@ export class JSONLSourceReader {
     }
     let documentsComplete = true;
     let documentFiles = 0;
+    const cursors = this.#cursors;
     for (const source of sources) {
       if (source.format !== "json-messages") continue;
-      const documents = await scanJSONDocumentSource({
+      const key = sourceKey(source);
+      const sourceInitial = initialScan || this.#unbaselinedSources.has(key);
+      const documents = await this.#isolated(key, source.adapterId, sourceInitial, () => scanJSONDocumentSource({
         adapterId: source.adapterId,
         roots: source.roots.map(expandedActivityRoot),
         pathPattern: source.pathPattern ?? "\\.json$",
         messagesField: source.messagesField ?? "messages",
         ...source.document,
       }, {
-        cursors: this.#cursors,
+        cursors,
         listings: this.#documentListings,
-        initialScan,
+        initialScan: sourceInitial,
         replayOnFirstStart: this.#replayOnFirstStart,
         replaySessions: this.#initialReplaySessions,
         maxReplayRecords: Math.max(
@@ -445,7 +519,9 @@ export class JSONLSourceReader {
         ),
         maxRecords: Math.max(0, remainingRecords - reservedDatabaseRecords),
         historical: this.#mode === "history",
-      });
+        ...(this.#lastRunAt === undefined ? {} : { newSince: this.#lastRunAt }),
+      }));
+      if (documents === undefined) continue;
       records.push(...documents.records);
       fileCount += documents.files;
       malformed += documents.malformed;
@@ -464,11 +540,13 @@ export class JSONLSourceReader {
       const { scanGooseSQLiteSources } = await import(
         "./goose-sqlite-source.js"
       );
-      const goose = await scanGooseSQLiteSources({
+      const key = sourceKey(source);
+      const sourceInitial = initialScan || this.#unbaselinedSources.has(key);
+      const goose = await this.#isolated(key, source.adapterId, sourceInitial, () => scanGooseSQLiteSources({
         adapterId: source.adapterId,
         roots: source.roots.map(expandedActivityRoot),
-        cursors: this.#cursors,
-        initialScan,
+        cursors,
+        initialScan: sourceInitial,
         replayOnFirstStart: this.#replayOnFirstStart,
         maxReplayRecords: Math.max(
           32,
@@ -477,7 +555,8 @@ export class JSONLSourceReader {
         maxRecords: remainingRecords - reservedDatabaseRecords,
         historical: this.#mode === "history",
         ...(this.#mode === "live" ? { connections: this.#gooseConnections } : { completedHistory: this.#completedHistoryDatabases }),
-      });
+      }));
+      if (goose === undefined) continue;
       records.push(...goose.records);
       fileCount += goose.files;
       malformed += goose.malformed;
@@ -493,11 +572,13 @@ export class JSONLSourceReader {
         break;
       }
       const { scanZedSQLiteSources } = await import("./zed-sqlite-source.js");
-      const zed = await scanZedSQLiteSources({
+      const key = sourceKey(source);
+      const sourceInitial = initialScan || this.#unbaselinedSources.has(key);
+      const zed = await this.#isolated(key, source.adapterId, sourceInitial, () => scanZedSQLiteSources({
         adapterId: source.adapterId,
         roots: source.roots.map(expandedActivityRoot),
-        cursors: this.#cursors,
-        initialScan,
+        cursors,
+        initialScan: sourceInitial,
         replayOnFirstStart: this.#replayOnFirstStart,
         replaySessions: this.#initialReplaySessions,
         maxReplayRecords: Math.max(
@@ -507,7 +588,8 @@ export class JSONLSourceReader {
         maxRecords: remainingRecords - reservedDatabaseRecords,
         historical: this.#mode === "history",
         ...(this.#mode === "live" ? { connections: this.#zedConnections } : { completedHistory: this.#completedHistoryDatabases }),
-      });
+      }));
+      if (zed === undefined) continue;
       records.push(...zed.records);
       fileCount += zed.files;
       malformed += zed.malformed;
@@ -530,11 +612,13 @@ export class JSONLSourceReader {
       const { scanOpenCodeSQLiteSources } = await import(
         "./opencode-sqlite-source.js"
       );
-      const sqlite = await scanOpenCodeSQLiteSources({
+      const key = sourceKey(source);
+      const sourceInitial = initialScan || this.#unbaselinedSources.has(key);
+      const sqlite = await this.#isolated(key, source.adapterId, sourceInitial, () => scanOpenCodeSQLiteSources({
         adapterId: source.adapterId,
         roots: source.roots.map(expandedActivityRoot),
-        cursors: this.#cursors,
-        initialScan,
+        cursors,
+        initialScan: sourceInitial,
         replayOnFirstStart: this.#replayOnFirstStart,
         maxReplayRecords: Math.min(
           remainingRecords,
@@ -545,7 +629,8 @@ export class JSONLSourceReader {
         ),
         historical: this.#mode === "history",
         ...(this.#mode === "live" ? { connections: this.#openCodeConnections } : { completedHistory: this.#completedHistoryDatabases }),
-      });
+      }));
+      if (sqlite === undefined) continue;
       records.push(...sqlite.records);
       fileCount += sqlite.files;
       malformed += sqlite.malformed;
@@ -562,7 +647,9 @@ export class JSONLSourceReader {
     const checkpoint = Object.freeze({
       generation: ++this.#generation,
       cursors: new Map(this.#cursors),
+      scannedAt,
     });
+    this.#scanStart = checkpoint.cursors;
     const jsonlComplete = this.#mode !== "history" || selected.length === 0;
     return {
       records,
@@ -583,14 +670,122 @@ export class JSONLSourceReader {
     if (checkpoint.generation > this.#generation) {
       throw new Error("Activity source checkpoint is invalid.");
     }
+    // Saved once more when the time is missing, so the next start knows
+    // when this one ran. Later idle scans keep the time of the last change:
+    // a file read since then would have changed the cursors.
     if (
       this.#savedCursors === undefined ||
+      this.#savedScannedAt === undefined ||
       !sameCursors(checkpoint.cursors, this.#savedCursors)
     ) {
-      await this.#cursorStore.save(checkpoint.cursors);
+      await this.#cursorStore.save(checkpoint.cursors, checkpoint.scannedAt);
       this.#savedCursors = checkpoint.cursors;
+      this.#savedScannedAt = checkpoint.scannedAt;
     }
     this.#committedGeneration = checkpoint.generation;
+  }
+
+  /**
+   * Where the next scan starts. A scan moves the cursors past every record
+   * it returns, before the caller delivers them; `rewind` puts the reader
+   * back here when they could not be delivered, so the next scan returns
+   * the same records instead of skipping them.
+   */
+  position(): SourceReaderPosition {
+    return {
+      cursors: this.#scanStart,
+      oversizedContinuations: new Set(this.#oversizedContinuations),
+      completedHistoryFiles: new Map(this.#completedHistoryFiles),
+      completedHistoryDatabases: new Map(this.#completedHistoryDatabases),
+      initialScanComplete: this.#initialScanComplete,
+      unbaselinedSources: new Set(this.#unbaselinedSources),
+    };
+  }
+
+  rewind(position: SourceReaderPosition): void {
+    if (position.cursors === undefined) {
+      // Taken before the first scan: reload what is durable.
+      this.#cursors = undefined;
+    } else {
+      this.#cursors = new RecentCursors();
+      for (const [key, offset] of position.cursors) {
+        this.#cursors.set(key, offset);
+      }
+    }
+    this.#scanStart = position.cursors;
+    this.#oversizedContinuations = new Set(position.oversizedContinuations);
+    this.#completedHistoryFiles = new Map(position.completedHistoryFiles);
+    this.#completedHistoryDatabases = new Map(position.completedHistoryDatabases);
+    this.#initialScanComplete = position.initialScanComplete;
+    this.#unbaselinedSources = new Set(position.unbaselinedSources);
+  }
+
+  /** Sources and files that failed and are skipped until `retryAt`. */
+  sourceFailures(): readonly SourceFailure[] {
+    return [...this.#failures.values()];
+  }
+
+  /**
+   * Run one source's scan so that its failure cannot fail the others. A
+   * failed source is recorded, skipped until its retry time, and its cursor
+   * changes are undone so none of its records is skipped. Returns undefined
+   * when the source was skipped or failed.
+   */
+  async #isolated<T>(
+    key: string,
+    adapterId: string,
+    baselines: boolean,
+    scan: () => Promise<T>,
+  ): Promise<T | undefined> {
+    const remember = (missed: boolean) => {
+      if (this.#mode !== "live") return;
+      if (missed && baselines) this.#unbaselinedSources.add(key);
+      else if (!missed) this.#unbaselinedSources.delete(key);
+    };
+    if (this.#skipping(key)) {
+      remember(true);
+      return undefined;
+    }
+    this.#cursors?.track();
+    try {
+      const result = await scan();
+      this.#cursors?.untrack(false);
+      this.#failures.delete(key);
+      remember(false);
+      return result;
+    } catch (error) {
+      this.#cursors?.untrack(true);
+      this.#recordFailure(key, adapterId, error);
+      remember(true);
+      return undefined;
+    }
+  }
+
+  #skipping(key: string): boolean {
+    const failure = this.#failures.get(key);
+    return failure !== undefined && this.#clock() < failure.retryAt.getTime();
+  }
+
+  #recordFailure(key: string, adapterId: string, error: unknown): void {
+    const failures = (this.#failures.get(key)?.failures ?? 0) + 1;
+    const now = this.#clock();
+    this.#failures.delete(key);
+    this.#failures.set(key, Object.freeze({
+      adapterId,
+      failures,
+      message: (error instanceof Error ? error.message : String(error))
+        .replace(/\s+/gu, " ")
+        .slice(0, 200),
+      failedAt: new Date(now),
+      retryAt: new Date(now + Math.min(
+        failureRetryMaxMs,
+        failureRetryBaseMs * 2 ** Math.min(failures - 1, 16),
+      )),
+    }));
+    for (const oldest of this.#failures.keys()) {
+      if (this.#failures.size <= maxTrackedFailures) break;
+      this.#failures.delete(oldest);
+    }
   }
 
   /**
@@ -766,12 +961,75 @@ export class JSONLSourceReader {
     return { records, malformed, oversized, processedRecords };
   }
 
+  /** The files of one JSONL source, with their canonical paths. */
+  async #listJSONLSource(
+    source: ActivitySource,
+    canonicalPaths: Map<string, CanonicalSourcePath>,
+  ): Promise<SourceFile[]> {
+    let files: SourceFile[] = [];
+    const pathPattern = source.pathPattern === undefined
+      ? undefined
+      : new RegExp(source.pathPattern, "u");
+    for (const configuredRoot of source.roots) {
+      const root = expandedActivityRoot(configuredRoot);
+      const rootFiles = await listJSONLFiles(root);
+      let rootReal: string | undefined;
+      for (const file of rootFiles) {
+        if (
+          pathPattern !== undefined &&
+          !pathPattern.test(relative(root, file.path).split(sep).join("/"))
+        ) {
+          continue;
+        }
+        let canonicalPath: string;
+        try {
+          // The listing never follows links, so a listed file keeps its
+          // canonical path while its root resolves to the same place and
+          // the file keeps its identity. Resolve each file only once.
+          rootReal ??= await realpath(root);
+          const key = `${rootReal}\u0000${file.path}`;
+          const identity = fileIdentityKey(file.identity);
+          const known = this.#canonicalPaths.get(key);
+          canonicalPath =
+            known !== undefined && identity !== undefined &&
+              known.identity === identity
+              ? known.path
+              : await realpath(file.path);
+          if (identity !== undefined) {
+            canonicalPaths.set(key, { path: canonicalPath, identity });
+          }
+        } catch (error) {
+          if (isTransientSourceError(error)) continue;
+          throw error;
+        }
+        files.push({
+          adapterId: source.adapterId,
+          ...(source.sourceDisplayName === undefined
+            ? {}
+            : { sourceDisplayName: source.sourceDisplayName }),
+          root,
+          path: canonicalPath,
+          modifiedMs: file.modifiedMs,
+          identity: file.identity,
+        });
+        if (files.length > maxCursorEntries * 2) {
+          files = reconciledSourceFiles(files);
+          files.sort(recentFileFirst);
+          files.length = maxCursorEntries;
+        }
+      }
+    }
+    return files;
+  }
+
   async #pendingHistoryFiles(
     files: readonly SourceFile[],
   ): Promise<SourceFile[]> {
     const pending: SourceFile[] = [];
     for (const file of files) {
       if (this.#completedHistoryFiles.get(file.path) === file.modifiedMs) continue;
+      // A failing file is retried later without holding the import open.
+      if (this.#skipping(fileKey(file.path))) continue;
       try {
         const metadata = await stat(file.path);
         const offset = this.#cursors?.get(fileCursorId(file.path, metadata)) ??
@@ -783,7 +1041,9 @@ export class JSONLSourceReader {
           this.#completedHistoryFiles.set(file.path, file.modifiedMs);
         }
       } catch (error) {
-        if (!isTransientSourceError(error)) throw error;
+        if (!isTransientSourceError(error)) {
+          this.#recordFailure(fileKey(file.path), file.adapterId, error);
+        }
       }
     }
     return pending;
@@ -814,10 +1074,14 @@ export class JSONLSourceReader {
     const metadata = await stat(fileReal);
     if (!metadata.isFile()) return;
     if (this.#cursors?.has(fileCursorId(fileReal, metadata)) || this.#cursors?.has(digest(fileReal))) return;
+    // A session that began while the observer was stopped is read from its
+    // start; any other file without a cursor starts at its end, as before.
     this.#setCursor(
       fileCursorId(fileReal, metadata),
       digest(fileReal),
-      metadata.size,
+      this.#lastRunAt !== undefined && startedAfter(metadata, this.#lastRunAt)
+        ? 0
+        : metadata.size,
     );
   }
 }
@@ -1057,6 +1321,14 @@ function configuredRoots(
   ));
 }
 
+function sourceKey(source: ActivitySource): string {
+  return JSON.stringify([source.format ?? "jsonl", source.adapterId, source.roots, source.pathPattern ?? ""]);
+}
+
+function fileKey(path: string): string {
+  return `file\u0000${path}`;
+}
+
 function sameCursors(
   left: ReadonlyMap<string, number>,
   right: ReadonlyMap<string, number>,
@@ -1088,6 +1360,7 @@ function isTransientSourceError(error: unknown): boolean {
       error.code === "EACCES" ||
       error.code === "EPERM" ||
       error.code === "ENOTDIR" ||
+      error.code === "EBUSY" ||
       error.code === "ESTALE")
   );
 }
