@@ -76,6 +76,8 @@ export type ObserverConfig = Readonly<{
   machineTokenConfigured: boolean;
   remoteActionsEnabled: boolean;
   remoteCommandsEnabled: boolean;
+  /** Tell the person at this computer when Phigon stops an agent or runs a command. */
+  userNotices: boolean;
   guardianDecisionTimeoutMs: number;
   tlsCaFile: string | undefined;
   tlsClientCertFile: string | undefined;
@@ -354,6 +356,7 @@ export function loadConfig(
       "PHIGON_REMOTE_ACTIONS_ENABLED",
     ),
     remoteCommandsEnabled: parseBoolean(environment["PHIGON_REMOTE_COMMANDS_ENABLED"] ?? "false", "PHIGON_REMOTE_COMMANDS_ENABLED"),
+    userNotices: parseBoolean(environment["PHIGON_USER_NOTICES"] ?? "true", "PHIGON_USER_NOTICES"),
     guardianDecisionTimeoutMs: parseBoundedPositiveInteger(
       environment["PHIGON_GUARDIAN_DECISION_TIMEOUT_MS"] ?? "65000",
       "PHIGON_GUARDIAN_DECISION_TIMEOUT_MS",

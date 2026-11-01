@@ -6,6 +6,7 @@ import type { HTTPGuardianDecisionClient } from "./agentic-guardian.js";
 import type { GuardianContainmentExecutor } from "./guardian-containment.js";
 import type { GuardianDecisionJournal } from "./guardian-decision-journal.js";
 import type { GuardianHostedClient } from "./guardian-hosted-client.js";
+import { noticeAgentName, type UserNotices } from "./user-notices.js";
 
 // Discovery is a detection boundary, not a pre-execution sandbox. It can contain
 // agents launched outside the managed CLI only after a central admin decision.
@@ -19,6 +20,8 @@ export class GuardianProcessMonitor {
     journal: Pick<GuardianDecisionJournal, "append">;
     onStatus: (message: string) => void;
     coverageClient?: Pick<GuardianHostedClient, "post">;
+    /** Tells the person at this computer when an agent was stopped. */
+    notices?: Pick<UserNotices, "agentStopped" | "agentBlocked">;
   }>) {}
 
   async review(inventory: AgentInventory, parentSignal: AbortSignal): Promise<void> {
@@ -68,6 +71,11 @@ export class GuardianProcessMonitor {
           }) : undefined;
         // Allows are already audited centrally. Report denied running processes
         // even when the admin authorized only action blocking, never escalation.
+        if (containment?.state === "succeeded") {
+          const notice = { key: `${agent.agentId}:${agent.processId}`, agent: noticeAgentName(agent.displayName), reason: decision.reason };
+          if (decision.model === "agent-block") this.options.notices?.agentBlocked(notice);
+          else this.options.notices?.agentStopped({ ...notice, forced: decision.intervention === "kill_agent" });
+        }
         if (decision.decision !== "allow") {
           denied++;
           if (containment !== undefined && containment.state !== "succeeded") containmentFailed++;

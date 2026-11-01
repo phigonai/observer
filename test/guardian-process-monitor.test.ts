@@ -85,3 +85,35 @@ test("discovered agents require central containment authority and exact lifetime
   controller.abort(); await monitor.review(inventory, controller.signal);
   assert.equal(calls, 2, "shutdown must not dispatch new reviews");
 });
+
+test("the person at the computer is told when Phigon stops a blocked agent, once per process", async () => {
+  const started = new Date("2026-09-05T00:00:00Z");
+  const inventory = create(AgentInventorySchema, { machineId: "machine", agents: [
+    create(AgentIdentitySchema, { agentId: "claude:7", displayName: "Claude Code · PID 7", processId: 7n, startedAt: timestampFromDate(started), state: AgentState.RUNNING, capabilities: ["process-instance"] }),
+  ] });
+  let model = "agent-block";
+  let stopped = true;
+  const notices: string[] = [];
+  const monitor = new GuardianProcessMonitor({
+    machineId: "machine", onStatus: () => undefined,
+    policyStore: { load: async () => ({ machineId: "machine", policyDigest: "a".repeat(64), defaultEffect: "allow", rules: [], receivedAt: started.toISOString() }) },
+    decisionClient: { decide: async () => ({ decision: "deny", reason: "Claude Code is blocked by Phigon AI.", risk: "high", confidence: 1, model, cached: false, latencyMs: 1, intervention: "stop_agent" }) },
+    containment: { execute: async () => stopped
+      ? { state: "succeeded", code: "process_stopped", detail: "Stopped." }
+      : { state: "failed", code: "already_exited", detail: "The agent process had already exited." } },
+    journal: { append: async () => undefined },
+    notices: {
+      agentBlocked: (notice) => { notices.push(`blocked ${notice.key} ${notice.agent}: ${notice.reason}`); },
+      agentStopped: (notice) => { notices.push(`stopped ${notice.key} ${notice.agent} forced=${String(notice.forced)}`); },
+    },
+  });
+  const signal = new AbortController().signal;
+  await monitor.review(inventory, signal);
+  assert.deepEqual(notices, ["blocked claude:7:7 Claude Code: Claude Code is blocked by Phigon AI."]);
+  model = "policy-gateway";
+  await monitor.review(inventory, signal);
+  assert.equal(notices[1], "stopped claude:7:7 Claude Code forced=false");
+  stopped = false;
+  await monitor.review(inventory, signal);
+  assert.equal(notices.length, 2, "a process that was already gone was not stopped by Phigon");
+});

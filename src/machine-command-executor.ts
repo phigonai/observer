@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { create, fromJsonString, toJsonString } from "@bufbuild/protobuf";
 import { timestampDate, timestampFromDate } from "@bufbuild/protobuf/wkt";
 import { AgentActionResultSchema, RemoteActionResultState as State, RemoteActionType as Action, type AgentActionCommand, type AgentActionResult } from "./generated/phigon/v1/action_pb.js";
+import type { UserNotices } from "./user-notices.js";
 
 export const machineActionTypes: readonly Action[] = [Action.RUN_COMMAND, Action.INSPECT_SYSTEM, Action.SHUTDOWN_MACHINE, Action.RESTART_MACHINE];
 export type CommandSpec = { executable: string; arguments: string[]; working_directory?: string; timeout_seconds: number };
@@ -39,6 +40,8 @@ export type MachineCommandOptions = {
   replace?: typeof rename;
   /** Running agent processes for inspect_system; omitted means none are listed. */
   agents?: () => Promise<RunningAgents>;
+  /** Tells the person at this computer what Phigon did. */
+  notices?: UserNotices;
 };
 
 /** Separate machine-owner enrollment; durable claims prevent crash/retry execution. */
@@ -113,6 +116,11 @@ export class MachineCommandExecutor {
           execution.timedOut ? "Command exceeded its time limit; termination was requested." : power && succeeded ? "Operating system accepted the power change scheduled for one minute from now." : succeeded ? "Command completed." : "Command did not complete successfully.",
           { output: execution.output, outputTruncated: execution.truncated, ...(execution.exitCode === null ? {} : { exitCode: execution.exitCode }) });
     }
+    if (command.action === Action.RUN_COMMAND && result.resultCode !== "command_not_started") {
+      this.#options.notices?.commandRan({ key: command.actionId, program: programName(spec!.executable), reason: command.reason });
+    } else if (result.resultCode === "power_change_scheduled") {
+      this.#options.notices?.powerChange({ key: command.actionId, restart: command.action === Action.RESTART_MACHINE, reason: command.reason });
+    }
     const temporary = `${path}.tmp`;
     await writeFile(temporary, JSON.stringify({ digest, receipt: toJsonString(AgentActionResultSchema, result) }), { mode: 0o600, flush: true });
     // A scanner briefly holding the receipt on Windows must not turn a
@@ -134,6 +142,11 @@ export async function pruneCommandReceipts(directory: string, now = Date.now()):
     const stat = await lstat(path).catch(() => null);
     if (stat?.isFile() && stat.mtimeMs < now - 30 * 86_400_000) await unlink(path).catch(() => undefined);
   }
+}
+
+/** "C:\Tools\node.exe" and "/usr/bin/node" are "node". */
+export function programName(executable: string): string {
+  return executable.split(/[\\/]/u).pop()?.replace(/\.(?:exe|cmd|bat|ps1)$/iu, "") || "a command";
 }
 
 export function powerCommand(restart: boolean): CommandSpec {

@@ -84,6 +84,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { StreamStateStore } from "./stream-state.js";
 import { connectionEnvironment } from "./connection-config.js";
 import { latestObserverVersion, newerVersion, offerObserverUpdate } from "./update.js";
+import { UserNotices } from "./user-notices.js";
 
 type Output = Readonly<{
   stdout: (value: string) => void;
@@ -555,7 +556,9 @@ export async function run(
         const discoveryEngine = new DiscoveryEngine({
           customAgentRegistry,
         });
+        const userNotices = new UserNotices({ enabled: config.userNotices });
         const actionExecutor = new AgentActionExecutor({
+          notices: userNotices,
           enabled: config.remoteActionsEnabled,
           commandsEnabled: config.remoteCommandsEnabled,
           machineID: credential.machineId,
@@ -719,6 +722,7 @@ export async function run(
             inventory: async () => (await discoveryEngine.discover(credential.machineId)).inventory,
           }),
           journal: new GuardianDecisionJournal(config.dataDirectory),
+          notices: userNotices,
           onStatus: (message) => output.stdout(`${message}\n`),
         });
         const monitoring = (async () => {
