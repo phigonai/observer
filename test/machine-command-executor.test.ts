@@ -47,6 +47,24 @@ test("remote command enrollment, exact request binding, and durable replay", asy
   assert.equal((await restarted.execute({ ...command, actionId: randomUUID(), idempotencyKey: randomUUID(), expiresAt: timestampFromDate(new Date(0)) })).state, State.EXPIRED);
 });
 
+test("command expiry is judged by the server's clock, not a skewed local one", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-command-skew-"));
+  t.after(async () => { if (!resolve(directory).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe test cleanup path"); await rm(directory, { recursive: true, force: true }); });
+  const machineID = randomUUID();
+  const command = (expiresAt: number) => create(AgentActionCommandSchema, { actionId: randomUUID(), idempotencyKey: randomUUID(), machineId: machineID, agentId: "__machine__", processId: 0n, action: Action.RUN_COMMAND, expiresAt: timestampFromDate(new Date(expiresAt)), reason: "Clock skew test", commandJson: JSON.stringify({ executable: process.execPath, arguments: ["-e", "console.log('ran')"], timeout_seconds: 5 }) });
+  for (const skewMs of [-600_000, 600_000]) {
+    const serverNow = () => Date.now() + skewMs;
+    // One minute left on the server's clock; ten minutes off on this one.
+    const fresh = command(serverNow() + 60_000);
+    const local = new MachineCommandExecutor({ enabled: true, machineID, dataDirectory: directory });
+    assert.equal((await local.execute(fresh)).state, State.EXPIRED);
+    const skewed = new MachineCommandExecutor({ enabled: true, machineID, dataDirectory: directory, serverNow });
+    const retry = { ...fresh, actionId: randomUUID(), idempotencyKey: randomUUID() };
+    assert.equal((await skewed.execute(retry)).state, State.SUCCEEDED);
+    assert.equal((await skewed.execute({ ...retry, actionId: randomUUID(), idempotencyKey: randomUUID(), expiresAt: timestampFromDate(new Date(serverNow() - 1_000)) })).state, State.EXPIRED);
+  }
+});
+
 test("output is readable, bounded, and redacted; stdin closes and nonzero exits remain failures", async () => {
   const result = await runCommand({ executable: process.execPath, arguments: ["-e", "console.log('password=syntheticsecret123'); process.stdout.write('a'.repeat(40000)); process.exitCode=7"], timeout_seconds: 5 });
   assert.equal(result.exitCode, 7); assert.equal(result.truncated, true);

@@ -27,13 +27,16 @@ export interface CredentialStore {
   load(): Promise<StoredMachineCredential | null>;
 }
 
+/** The machine credential's file name in the data directory. */
+export const credentialFileName = "machine-credential.json";
+
 export class FileCredentialStore implements CredentialStore {
   readonly #dataDirectory: string;
   readonly #credentialPath: string;
 
   constructor(dataDirectory: string) {
     this.#dataDirectory = dataDirectory;
-    this.#credentialPath = join(dataDirectory, "machine-credential.json");
+    this.#credentialPath = join(dataDirectory, credentialFileName);
   }
 
   async save(value: StoredMachineCredential): Promise<void> {

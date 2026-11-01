@@ -79,3 +79,51 @@ test("machine removal never sends a credential to a different origin", async () 
   );
   assert.equal(requested, false);
 });
+
+test("machine removal finishes locally when an administrator already removed the machine", async () => {
+  const { config, credential } = fixture();
+  let cleared = false;
+  const result = await removeMachine({
+    config,
+    credential,
+    fetcher: async () => new Response(JSON.stringify({
+      error: {
+        code: "invalid_credential",
+        message: "Machine credential is invalid or revoked.",
+      },
+    }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    }),
+    clearCredential: async () => {
+      cleared = true;
+      return true;
+    },
+  });
+  assert.equal(result.status, "already_removed");
+  assert.equal(result.credentialRemoved, true);
+  assert.equal(cleared, true);
+});
+
+test("machine removal keeps the credential on any other refusal", async () => {
+  const { config, credential } = fixture();
+  let cleared = false;
+  await assert.rejects(
+    removeMachine({
+      config,
+      credential,
+      fetcher: async () => new Response(JSON.stringify({
+        error: { code: "unauthorized", message: "Proxy authentication required." },
+      }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      }),
+      clearCredential: async () => {
+        cleared = true;
+        return true;
+      },
+    }),
+    /Proxy authentication required\. The local credential was kept\./u,
+  );
+  assert.equal(cleared, false);
+});

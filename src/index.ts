@@ -42,6 +42,7 @@ export {
   type ObserverStreamMetrics,
   type StreamClientOptions,
 } from "./stream-client.js";
+export { ServerClock } from "./server-clock.js";
 export {
   StreamStateStore,
   type StreamState,

@@ -1284,6 +1284,22 @@ function fileIdentityKey(
   return `${identity.dev}:${identity.ino}:${identity.birthtimeMs}`;
 }
 
+/**
+ * Whether saved `cursors` are at the end of the file at `path`, so every
+ * record in it was read. A file that grew or was replaced since does not
+ * count.
+ */
+export async function fileReadThrough(
+  path: string,
+  cursors: ReadonlyMap<string, number>,
+): Promise<boolean> {
+  const fileReal = await realpath(path);
+  const metadata = await stat(fileReal);
+  const offset = cursors.get(fileCursorId(fileReal, metadata)) ??
+    cursors.get(digest(fileReal));
+  return offset === metadata.size;
+}
+
 function fileCursorId(
   path: string,
   metadata: Readonly<{ dev: number; ino: number; birthtimeMs: number }>,

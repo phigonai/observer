@@ -13,7 +13,7 @@ import {
   fromBinary,
   toBinary,
 } from "@bufbuild/protobuf";
-import { timestampFromDate } from "@bufbuild/protobuf/wkt";
+import { timestampDate, timestampFromDate } from "@bufbuild/protobuf/wkt";
 import { abortableDelay } from "./abortable-delay.js";
 import type { AgentActionExecutor } from "./agent-action-executor.js";
 import { DEFAULT_CONTROL_PLANE_ORIGIN, type ObserverConfig } from "./config.js";
@@ -72,6 +72,7 @@ import {
   type EventEnvelope,
   type ResourceReference,
 } from "./generated/phigon/v1/telemetry_pb.js";
+import type { ServerClock } from "./server-clock.js";
 import { StreamStateStore } from "./stream-state.js";
 
 type StreamStatePersistence = Pick<StreamStateStore, "load" | "save">;
@@ -108,6 +109,8 @@ export type StreamClientOptions = Readonly<{
   ) => void | Promise<void>;
   actionExecutor?: ActionExecutor;
   onHistorySync?: (command: HistorySyncCommand) => Promise<HistorySyncResult>;
+  /** Learns the server's time from the timestamps on its replies. */
+  serverClock?: ServerClock;
   handshakeTimeoutMs?: number;
   responseTimeoutMs?: number;
 }>;
@@ -142,8 +145,10 @@ export class ObserverStreamClient {
   readonly #readyWaiters = new Set<(sequence: bigint) => void>();
   readonly #handshakeTimeoutMs: number;
   readonly #responseTimeoutMs: number;
+  readonly #serverClock: ServerClock | undefined;
 
   constructor(options: StreamClientOptions) {
+    this.#serverClock = options.serverClock;
     this.#handshakeTimeoutMs = options.handshakeTimeoutMs ?? 20_000;
     this.#responseTimeoutMs = options.responseTimeoutMs ?? Math.max(30_000, options.config.heartbeatIntervalMs * 3);
     this.#config = options.config;
@@ -181,6 +186,15 @@ export class ObserverStreamClient {
     this.#pumpEvents?.();
   }
 
+  /**
+   * Writes the events queued so far to the durable spool. The spool groups
+   * its writes, so a source checkpoint may move past an event only after
+   * this returns. Throws when the spool cannot be written.
+   */
+  flush(): void {
+    if (this.#queue instanceof FileBackedEventQueue) this.#queue.flush();
+  }
+
   updateInventory(inventory: AgentInventory): void {
     this.#latestInventory = inventory;
     this.#sendInventory?.(inventory);
@@ -207,6 +221,15 @@ export class ObserverStreamClient {
   }
 
   async run(signal: AbortSignal): Promise<void> {
+    try {
+      await this.#run(signal);
+    } finally {
+      // Write what the spool still buffers; losing it only resends events.
+      try { this.flush(); } catch { /* Retried by the next write. */ }
+    }
+  }
+
+  async #run(signal: AbortSignal): Promise<void> {
     const initialBackoffMs = 250;
     let backoffMs = initialBackoffMs;
     while (!signal.aborted) {
@@ -217,7 +240,7 @@ export class ObserverStreamClient {
       } catch (error) {
         if (signal.aborted) return;
         if (isServiceError(error) && error.code === status.UNAUTHENTICATED) {
-          throw new Error("Machine credential was rejected. Generate a new pairing code in your workspace and pair again; keep the existing data directory.");
+          throw new Error("The workspace no longer accepts this computer's key: an administrator removed the computer or revoked the key. Get a new pairing code from your workspace and run pair again with the same data directory. The computer is paired as a new machine, and activity that was not delivered is moved aside.");
         }
         if (error instanceof PermanentTelemetryError) throw error;
         // A connection that completed its handshake ends the outage; the
@@ -261,11 +284,17 @@ export class ObserverStreamClient {
     if (signal.aborted) return;
     if (this.#queue instanceof FileBackedEventQueue) {
       try {
-        this.#queue.restore(
+        const retired = this.#queue.restore(
           credential.tenantId,
           credential.machineId,
           credential.credential,
         );
+        if (retired !== undefined) {
+          this.#onStatus(
+            "Queued activity from an earlier pairing of this computer cannot be " +
+              `delivered as this machine; it was moved to ${retired}.`,
+          );
+        }
       } catch (error) {
         // Retrying cannot repair a corrupt, oversized or foreign spool; stop
         // and say so instead of reconnecting forever with nothing delivered.
@@ -527,6 +556,14 @@ export class ObserverStreamClient {
         };
         stream.on("data", (response: StreamTelemetryResponse) => {
           lastResponseAt = Date.now();
+          const serverTime = response.payload.case === "acknowledgement"
+            ? response.payload.value.receivedAt
+            : response.payload.case === "policy"
+              ? response.payload.value.effectiveAt
+              : undefined;
+          if (serverTime !== undefined) {
+            this.#serverClock?.observe(timestampDate(serverTime));
+          }
           if (response.payload.case === "historySyncCommand") {
             const command = response.payload.value;
             const commandKey = `${command.jobId}:${command.idempotencyKey}`;

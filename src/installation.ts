@@ -3,6 +3,9 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
+/** The file holding this installation's ID, in the data directory. */
+export const installationFileName = "installation-id";
+
 const uuidPattern =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -11,7 +14,7 @@ export async function loadOrCreateInstallationID(
 ): Promise<string> {
   await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
   await makeDirectoryPrivate(dataDirectory);
-  const installationPath = join(dataDirectory, "installation-id");
+  const installationPath = join(dataDirectory, installationFileName);
   try {
     const existing = (await readFile(installationPath, "utf8")).trim();
     if (!uuidPattern.test(existing)) {

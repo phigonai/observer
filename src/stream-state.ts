@@ -17,13 +17,16 @@ export type StreamState = Readonly<{
   recoveryPending?: boolean;
 }>;
 
+/** The stream cursor's file name in the data directory. */
+export const streamStateFileName = "stream-state.json";
+
 export class StreamStateStore {
   readonly #dataDirectory: string;
   readonly #path: string;
 
   constructor(dataDirectory: string) {
     this.#dataDirectory = dataDirectory;
-    this.#path = join(dataDirectory, "stream-state.json");
+    this.#path = join(dataDirectory, streamStateFileName);
   }
 
   async load(machineId: string, spooledAcknowledgement?: bigint): Promise<StreamState> {
