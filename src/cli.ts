@@ -65,6 +65,7 @@ import {
   type ConsentProfile,
 } from "./pair.js";
 import { removeMachine } from "./remove-machine.js";
+import { forgetServerAuthority, parseAuthorityFingerprint, pinServerAuthority } from "./server-authority.js";
 import { clearEventSpool } from "./event-spool.js";
 import { GuardianDecisionJournal } from "./guardian-decision-journal.js";
 import {
@@ -481,6 +482,7 @@ export async function run(
         credential,
         clearCredential: async () => {
           clearEventSpool(config.dataDirectory);
+          await forgetServerAuthority(config.dataDirectory);
           return await credentialStore.clear();
         },
       });
@@ -834,6 +836,8 @@ export async function run(
       const consentProfile = parseConsentProfile(
         flagValue(flags, "--consent-profile"),
       );
+      const authorityFlag = flagValue(flags, "--server-ca-sha256");
+      const authority = authorityFlag === undefined ? undefined : parseAuthorityFingerprint(authorityFlag);
       if (json && !flags.includes("--accept-consent")) {
         throw new Error(
           "JSON pairing requires --accept-consent after reviewing the selected profile.",
@@ -846,12 +850,24 @@ export async function run(
           throw new Error("Consent was not granted. No pairing request was sent.");
         }
       }
-      const result = await pairMachine({
-        config,
-        code,
-        consentProfile,
-        ...(displayName === undefined ? {} : { displayName }),
-      });
+      if (authority !== undefined) {
+        await pinServerAuthority(config.controlPlaneUrl, authority, config.dataDirectory);
+      }
+      let result: Awaited<ReturnType<typeof pairMachine>>;
+      try {
+        result = await pairMachine({
+          config,
+          code,
+          consentProfile,
+          ...(displayName === undefined ? {} : { displayName }),
+        });
+      } catch (error) {
+        // An authority pinned for a pairing that failed is not kept.
+        if (authority !== undefined && await new FileCredentialStore(config.dataDirectory).load() === null) {
+          await forgetServerAuthority(config.dataDirectory);
+        }
+        throw error;
+      }
       output.stdout(
         json
           ? `${JSON.stringify(result, null, 2)}\n`
@@ -1246,7 +1262,7 @@ function helpText(): string {
     "  phigon-observer --version",
     "  phigon-observer discover [--json]",
     "  phigon-observer ingest --agent <agent-id|custom> [--name <agent-name>] [--quiet] [--json]",
-    "  phigon-observer pair --code <one-time-code> --consent-profile <metadata|full> [--control-plane-url <url> --grpc-url <url>] [--name <machine-name>] [--accept-consent] [--json]",
+    "  phigon-observer pair --code <one-time-code> --consent-profile <metadata|full> [--control-plane-url <url> --grpc-url <url> [--server-ca-sha256 <fingerprint>]] [--name <machine-name>] [--accept-consent] [--json]",
     "  phigon-observer remove-machine [--yes] [--json]",
     "  phigon-observer run [--profile <metadata|full>]",
     "  phigon-observer help",
