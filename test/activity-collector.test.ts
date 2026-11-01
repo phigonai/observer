@@ -1035,6 +1035,63 @@ test("activity collector can hand source progress to a durable delivery spool", 
   }
 });
 
+test("source progress passes an event only after the spool is written", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-collector-flush-"));
+  const sourceRoot = join(directory, "sessions");
+  const source = { adapterId: "codex", roots: [sourceRoot] } as const;
+  await mkdir(sourceRoot, { recursive: true });
+  await writeFile(
+    join(sourceRoot, "codex.jsonl"),
+    `${JSON.stringify({
+      timestamp: "2026-07-24T10:10:00.000Z",
+      type: "event_msg",
+      payload: { type: "agent_message", message: "written before the checkpoint" },
+    })}\n`,
+    "utf8",
+  );
+  const config = loadConfig({
+    PHIGON_DATA_DIR: join(directory, "data"),
+    PHIGON_ACTIVITY_REPLAY_ON_FIRST_START: "true",
+    PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE: "100",
+  });
+  const credential = {
+    machineId: "5f1b4cb4-a77d-4f53-af66-197e184683f4",
+    tenantId: "7d1b4cb4-a77d-4f53-af66-197e184683f4",
+    credential: `phg_m_${"0".repeat(43)}`,
+    controlPlaneOrigin: "http://127.0.0.1:8080",
+    createdAt: "2026-07-24T00:00:00.000Z",
+  };
+  try {
+    let writable = false;
+    let flushedThrough = 0;
+    const delivered: EventEnvelope[] = [];
+    const collector = new ActivityCollector({
+      config,
+      credential,
+      initialSequence: 0n,
+      durableDelivery: true,
+      emit: (event) => delivered.push(event),
+      flushDelivery: () => {
+        if (!writable) throw new Error("disk refused the write");
+        flushedThrough = delivered.length;
+      },
+      sources: [source],
+    });
+    // The spool could not be written: the checkpoint stays pending.
+    await collector.scanOnce();
+    assert.ok(delivered.length > 0);
+    assert.equal(collector.metrics().pendingCheckpoints, 1);
+
+    // Once written, the next save commits it.
+    writable = true;
+    await collector.scanOnce();
+    assert.equal(flushedThrough, delivered.length);
+    assert.equal(collector.metrics().pendingCheckpoints, 0);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("activity collector lowers durable acknowledgement after a server restore", async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-collector-reset-"));
   const sourceRoot = join(directory, "sessions");

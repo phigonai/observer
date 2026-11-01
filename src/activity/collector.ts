@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readdir, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { create, toBinary } from "@bufbuild/protobuf";
 import { timestampFromDate } from "@bufbuild/protobuf/wkt";
@@ -54,14 +55,24 @@ import {
 import {
   type ActivitySourceCheckpoint,
   JSONLSourceReader,
+  fileReadThrough,
   type ActivitySource,
   type SourceFailure,
 } from "./source-reader.js";
+import { bridgeWritingSuffix, ingestedBridgeFile } from "./ingest.js";
+import { closedJournalSegments } from "../bridge-journal.js";
 import type { VendorActivityAdapter } from "./types.js";
 import { processKeyCapability } from "../discovery/process-identity.js";
 
 const maxEnvelopeBytes = 1 << 20;
 const maxPendingCheckpoints = 256;
+// Bridge files are cleaned up this often, and kept at most this long.
+const bridgePruneIntervalMs = 5 * 60_000;
+const bridgeFileRetentionMs = 7 * 86_400_000;
+// A closed journal segment untouched this long has no writer left.
+const closedSegmentQuietMs = 60_000;
+// Saved live checkpoints remembered while their events await acknowledgement.
+const retainedLiveCheckpoints = 8;
 export const historySyncQueueHeadroom = 1_024;
 const maxDraftsPerRecord = 32;
 
@@ -133,6 +144,12 @@ export type ActivityCollectorOptions = Readonly<{
   initialSequence: bigint;
   initialAcknowledgedSequence?: bigint;
   durableDelivery?: boolean;
+  /**
+   * Makes every event emitted so far durable, for example by writing the
+   * buffered telemetry spool. With durable delivery a source checkpoint
+   * moves past an unacknowledged event only after this succeeds.
+   */
+  flushDelivery?: () => void | Promise<void>;
   emit: (event: EventEnvelope) => void;
   sources?: readonly ActivitySource[];
   additionalSources?: () => Promise<readonly ActivitySource[]>;
@@ -209,6 +226,14 @@ export class ActivityCollector {
   #oversizedEvents = 0;
   #acknowledgedSequence: bigint;
   readonly #durableDelivery: boolean;
+  // Saved live-reader checkpoints, oldest first, with the sequence that
+  // their events end at. Bridge files they read through can be deleted once
+  // the server acknowledges that sequence.
+  #committedLive: ReadonlyArray<Readonly<{
+    cursors: ReadonlyMap<string, number>;
+    throughSequence: bigint;
+  }>> = [];
+  readonly #flushDelivery: () => void | Promise<void>;
   #pendingCheckpoints: ReadonlyArray<PendingCheckpoint> = [];
   #checkpointSave = Promise.resolve();
   readonly #sourceIdentitySaves: Promise<void>[] = [];
@@ -259,6 +284,7 @@ export class ActivityCollector {
       throw new Error("Initial activity acknowledgement is invalid.");
     }
     this.#durableDelivery = options.durableDelivery ?? false;
+    this.#flushDelivery = options.flushDelivery ?? (() => undefined);
   }
 
   updateInventory(inventory: AgentInventory): void {
@@ -280,6 +306,9 @@ export class ActivityCollector {
     if (acknowledgedSequence < 0n || allocationSequence < 0n) {
       throw new Error("Activity sequence must not be negative.");
     }
+    // The server lost acknowledgements: no saved checkpoint is known to be
+    // delivered any more.
+    this.#committedLive = [];
     this.#acknowledgedSequence = acknowledgedSequence;
     this.#lastSequence =
       allocationSequence < acknowledgedSequence
@@ -523,6 +552,7 @@ export class ActivityCollector {
   }
 
   async run(signal: AbortSignal): Promise<void> {
+    let prunedAt = 0;
     try {
       while (!signal.aborted) {
         try {
@@ -532,6 +562,11 @@ export class ActivityCollector {
           // other backpressure; the refused records are read again.
           if (!(error instanceof DeliveryRefusedError)) throw error;
         }
+        if (this.#clock().getTime() - prunedAt >= bridgePruneIntervalMs) {
+          prunedAt = this.#clock().getTime();
+          // Cleanup only frees disk space; it retries on the next pass.
+          await this.pruneBridgeFiles().catch(() => undefined);
+        }
         await abortableDelay(
           this.#config.activityScanIntervalMs,
           signal,
@@ -539,6 +574,58 @@ export class ActivityCollector {
       }
     } finally {
       this.close();
+    }
+  }
+
+  /**
+   * Deletes bridge files this observer is done with: an `ingest` file or a
+   * closed journal segment whose records were all read under a checkpoint
+   * the server has acknowledged through, or any of them after seven days.
+   * A file an `ingest` run is still writing, and each journal's newest
+   * segment, are never deleted while in use.
+   */
+  async pruneBridgeFiles(): Promise<void> {
+    const now = this.#clock().getTime();
+    const acknowledged = this.#acknowledgedSequence;
+    const settled = this.#committedLive.findLast(
+      (checkpoint) => checkpoint.throughSequence <= acknowledged,
+    );
+    for (const agent of activityBridgeAgents) {
+      const root = join(this.#config.dataDirectory, "bridges", agent.id);
+      let names: string[];
+      try {
+        names = await readdir(root);
+      } catch {
+        continue;
+      }
+      const present = new Set(names);
+      const closedSegments = new Set(closedJournalSegments(names));
+      for (const name of names) {
+        const ingested = ingestedBridgeFile.test(name);
+        if (!ingested && !closedSegments.has(name)) continue;
+        const path = join(root, name);
+        try {
+          const modifiedMs = (await stat(path)).mtimeMs;
+          const expired = now - modifiedMs >= bridgeFileRetentionMs;
+          const inUse = ingested
+            ? present.has(`${name}${bridgeWritingSuffix}`)
+            // A segment closes when its journal starts the next one; a
+            // writer that chose it just before may still be appending.
+            : now - modifiedMs < closedSegmentQuietMs;
+          if (
+            expired ||
+            (!inUse && settled !== undefined &&
+              await fileReadThrough(path, settled.cursors))
+          ) {
+            await unlink(path);
+            if (ingested) {
+              await unlink(`${path}${bridgeWritingSuffix}`).catch(() => undefined);
+            }
+          }
+        } catch {
+          // Gone, or locked by another program: retried on the next pass.
+        }
+      }
     }
   }
 
@@ -627,14 +714,32 @@ export class ActivityCollector {
     this.#checkpointSave = this.#checkpointSave
       .catch(() => undefined)
       .then(async () => {
-        const currentDurableThrough = this.#durableDelivery
-          ? this.#lastSequence
-          : this.#acknowledgedSequence;
+        let currentDurableThrough = this.#acknowledgedSequence;
+        if (this.#durableDelivery) {
+          const emittedThrough = this.#lastSequence;
+          try {
+            await this.#flushDelivery();
+            currentDurableThrough = emittedThrough;
+          } catch {
+            // Not written: only checkpoints the server acknowledged move.
+            // The rest stay pending for the next save, and delivery refuses
+            // new events until the spool can be written again.
+          }
+        }
         const committed = new Set<PendingCheckpoint>();
         for (const pending of eligible) {
           if (pending.throughSequence > currentDurableThrough) continue;
           await pending.reader.commit(pending.checkpoint);
           committed.add(pending);
+          if (pending.reader === this.#reader) {
+            this.#committedLive = [
+              ...this.#committedLive.slice(-(retainedLiveCheckpoints - 1)),
+              {
+                cursors: pending.checkpoint.cursors,
+                throughSequence: pending.throughSequence,
+              },
+            ];
+          }
         }
         this.#pendingCheckpoints = this.#pendingCheckpoints.filter(
           (candidate) => !committed.has(candidate),

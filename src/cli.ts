@@ -84,6 +84,7 @@ import { semanticDecision } from "./agentic-guardian.js";
 import { guardianRunnerPath } from "./guardian-native.js";
 import { GuardianProcessMonitor } from "./guardian-process-monitor.js";
 import { setTimeout as delay } from "node:timers/promises";
+import { ServerClock, describeClockSkew } from "./server-clock.js";
 import { StreamStateStore } from "./stream-state.js";
 import { connectionEnvironment } from "./connection-config.js";
 import { latestObserverVersion, newerVersion, offerObserverUpdate } from "./update.js";
@@ -565,6 +566,9 @@ export async function run(
           customAgentRegistry,
         });
         const userNotices = new UserNotices({ enabled: config.userNotices });
+        const serverClock = new ServerClock({
+          onLargeSkew: (offsetMs) => output.stdout(`${describeClockSkew(offsetMs)}\n`),
+        });
         const actionExecutor = new AgentActionExecutor({
           notices: userNotices,
           enabled: config.remoteActionsEnabled,
@@ -573,10 +577,12 @@ export async function run(
           dataDirectory: config.dataDirectory,
           inventory: async () =>
             (await discoveryEngine.discover(credential.machineId)).inventory,
+          serverNow: () => serverClock.now(),
         });
         const client = new ObserverStreamClient({
           config,
           actionExecutor,
+          serverClock,
           onHistorySync: async (syncCommand) => {
             const rejected = (detail: string) => create(HistorySyncResultSchema, {
               jobId: syncCommand.jobId,
@@ -606,7 +612,7 @@ export async function run(
               );
             }
             const expiresAt = timestampDate(syncCommand.expiresAt).getTime();
-            const remainingMs = expiresAt - Date.now();
+            const remainingMs = expiresAt - serverClock.now();
             if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
               return rejected("History sync command expired before execution.");
             }
@@ -765,6 +771,7 @@ export async function run(
             initialAcknowledgedSequence:
               client.metrics().lastAcknowledgedSequence,
             durableDelivery: true,
+            flushDelivery: () => client.flush(),
             policy: effectivePolicy,
             emit: (event) => client.enqueue(event),
             // The spool also has a byte budget; reaching it fails delivery
@@ -841,11 +848,18 @@ export async function run(
             catch { break; }
           }
         })();
-        await settleObserverTasks(
-          [streaming, discovering, collecting, monitoring, maintaining],
-          controller,
-          () => fatalPersistenceError,
-        );
+        try {
+          await settleObserverTasks(
+            [streaming, discovering, collecting, monitoring, maintaining],
+            controller,
+            () => fatalPersistenceError,
+          );
+        } finally {
+          // Write what the spool still buffers. Nothing depends on it:
+          // checkpoints only moved past written events, and a lost
+          // acknowledgement only sends an event again.
+          try { client.flush(); } catch { /* Read again on the next start. */ }
+        }
         output.stdout("Observer stopped.\n");
       } finally {
         process.removeListener("SIGINT", stop);
@@ -1308,7 +1322,7 @@ function helpText(): string {
     "The discover command reports a sanitized one-time local inventory.",
     "The ingest command accepts NDJSON on stdin for every supported bridge; use --agent custom --name <agent-name> for any other agent.",
     "The pair command shows the selected collection scope, requires machine-owner acceptance, and stores that evidence with the mode-0600 credential.",
-    "The remove-machine command unregisters only this paired machine, revokes its credential, and requires local confirmation.",
+    "The remove-machine command stops collection on this paired machine and revokes its credential; activity already collected stays until an administrator deletes the machine or it expires. It requires local confirmation.",
     "The run command maintains an authenticated, resumable telemetry stream; --profile applies the same portable local collection profile on Windows, macOS, and Linux.",
     "",
   ].join("\n");
@@ -1378,6 +1392,12 @@ function formatPairResult(
     `Machine: ${result.displayName} (${result.machineId})`,
     `Control plane: ${result.controlPlaneOrigin}`,
     "Machine credential: stored securely",
+    ...(result.replacedMachineId === undefined
+      ? []
+      : [
+          `Earlier machine: ${result.replacedMachineId} (the workspace no longer accepted its key)`,
+          "This computer was paired as a new machine. Activity the earlier machine had not delivered was moved to the retired-pairings folder in the data directory.",
+        ]),
     "",
   ].join("\n");
 }
@@ -1386,8 +1406,8 @@ function removeMachinePrompt(machineId: string): string {
   return [
     "Remove this machine from Phigon?",
     `Machine: ${machineId}`,
-    "This unregisters the machine and immediately revokes its observer credential.",
-    "Its stored telemetry and machine-scoped data will be durably purged; a minimal deletion tombstone plus consent and audit evidence remain according to retention policy.",
+    "Collection stops at once and this computer's observer key is revoked.",
+    "Activity already collected stays with your company until an administrator deletes this computer or it expires under the retention policy.",
     'Type "remove" to continue: ',
   ].join("\n");
 }
@@ -1396,11 +1416,14 @@ function formatRemoveMachineResult(
   result: Awaited<ReturnType<typeof removeMachine>>,
 ): string {
   return [
-    "Machine removed successfully.",
+    result.status === "already_removed"
+      ? "This machine was already removed from the workspace, or its key was revoked. The local copy is now cleaned up."
+      : "Machine removed successfully.",
     `Machine: ${result.machineId}`,
     `Control plane: ${result.controlPlaneOrigin}`,
+    "Collection: stopped; the observer key is revoked",
     "Machine credential: removed from this device",
-    "Stored machine telemetry: deletion scheduled",
+    "Collected activity: kept until an administrator deletes this computer or it expires",
     "Next step: pair again to reconnect this observer.",
     "",
   ].join("\n");

@@ -66,7 +66,9 @@ exactly what runs on your computers and what leaves them.
 | | Any other agent | [Register it](#custom-agents) | Bridge |
 
 *Built in* means the observer reads the agent's own records. *Bridge* means the
-agent (or a small wrapper) pipes NDJSON to `phigon-observer ingest`.
+agent (or a small wrapper) pipes NDJSON to `phigon-observer ingest`. The
+observer deletes each bridge file once the workspace has received it, and any
+bridge file after seven days.
 
 ## How it works
 
@@ -156,7 +158,7 @@ settings. A full description is in
 | `guardian status \| exec \| launch` | Guardian checks and managed execution. |
 | `authorize-action --action <a> --resource <r>` | Asks Guardian whether one action may run. |
 | `update [--check] [--yes]` | Checks for or installs a new release. |
-| `remove-machine` | Unregisters this computer and revokes its credential. |
+| `remove-machine` | Stops collection and revokes this computer's key. Activity already collected stays with the company until an administrator deletes the computer or it expires. |
 
 Run `phigon-observer help` for every flag.
 

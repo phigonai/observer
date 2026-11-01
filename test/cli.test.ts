@@ -932,6 +932,63 @@ test("remove-machine unregisters the paired machine before clearing its credenti
   }
 });
 
+test("remove-machine says collection stops and collected activity stays", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-cli-remove-"));
+  const server = createServer((_request, response) => {
+    response.writeHead(204);
+    response.end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    assert.ok(address !== null && typeof address === "object");
+    const origin = `http://127.0.0.1:${address.port}`;
+    await new FileCredentialStore(directory).save({
+      machineId: "machine-remove-3",
+      tenantId: "tenant-remove-3",
+      credential: `phg_m_${"k".repeat(43)}`,
+      controlPlaneOrigin: origin,
+      createdAt: "2026-08-09T00:00:00.000Z",
+    });
+    let stdout = "";
+    let stderr = "";
+    const exitCode = await run(
+      ["remove-machine"],
+      {
+        PHIGON_CONTROL_PLANE_URL: origin,
+        PHIGON_DATA_DIR: directory,
+      },
+      {
+        stdout: (value) => {
+          stdout += value;
+        },
+        stderr: (value) => {
+          stderr += value;
+        },
+      },
+      Readable.from(["remove\n"]),
+    );
+    assert.equal(exitCode, 0);
+    assert.equal(stderr, "");
+    assert.match(stdout, /Collection stops at once/u);
+    assert.match(stdout, /observer key is revoked/u);
+    assert.match(
+      stdout,
+      /already collected stays with your company until an administrator deletes this computer or it expires/u,
+    );
+    assert.match(
+      stdout,
+      /Collected activity: kept until an administrator deletes this computer or it expires/u,
+    );
+    assert.doesNotMatch(stdout, /purge|deletion scheduled/iu);
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("remove-machine keeps the local credential when the control plane fails", async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-cli-remove-"));
   const credential = `phg_m_${"f".repeat(43)}`;

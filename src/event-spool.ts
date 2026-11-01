@@ -10,8 +10,10 @@ import {
   chmodSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   readdirSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -24,12 +26,23 @@ import {
   type EventEnvelope,
 } from "./generated/phigon/v1/telemetry_pb.js";
 import { BoundedEventQueue, type QueueMetrics } from "./event-queue.js";
+import { streamStateFileName } from "./stream-state.js";
 
 const spoolVersion = 1;
 const spoolFileName = "telemetry-spool.jsonl";
 const defaultMaxSpoolBytes = 64 << 20;
-const compactAfterOperations = 1024;
+// Buffered records are written together, at most this long after the first.
+const flushDelayMs = 100;
+// A burst this large is written at once rather than held in memory.
+const flushAfterBytes = 1 << 20;
+// The spool is rewritten once records that no longer matter (acknowledged,
+// discarded or replaced events, and acknowledgements) outweigh the queued
+// events and pass this size, or a quarter of the budget if that is smaller.
+const compactAfterDeadBytes = 1 << 20;
 const scopedIDPattern = /^[A-Za-z0-9._:-]{1,128}$/u;
+const retiredPairingsDirectory = "retired-pairings";
+// Each retired spool can be as large as the spool budget.
+const retainedRetiredPairings = 3;
 
 type SpoolScope = Readonly<{
   tenantID: string;
@@ -63,20 +76,33 @@ type SpoolRecord = SpoolEvent | SpoolSequenceRecord;
  * An encrypted append-only delivery spool. The in-memory queue remains the hot
  * path, while this log makes unacknowledged events recoverable after an
  * observer restart without writing prompt or tool content as plaintext.
+ *
+ * Records are group-committed: they are buffered and written with one
+ * flushed append at most 100 ms later, or at once by `flush`. An event is
+ * durable only after a flush, so a source checkpoint may move past an event
+ * only after `flush` returns (the collector's `flushDelivery`). Events the
+ * server already acknowledged are safe either way, and a lost
+ * acknowledgement or discard record only sends an event again.
  */
 export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
   readonly #dataDirectory: string;
   readonly #path: string;
   readonly #maxBytes: number;
+  readonly #compactAfterDeadBytes: number;
   #scope: SpoolScope | undefined;
   #key: Buffer | undefined;
-  #operations = 0;
-  // Appends run synchronously on the event loop for every event and every
-  // acknowledgement. Prepare the private directory and secure the file once,
-  // and track the spool size here instead of stat-ing it before each append.
+  // Prepare the private directory and secure the file once, and track the
+  // spool size here instead of stat-ing it before each write.
   #directoryPrepared = false;
   #fileSecured = false;
   #size: number | undefined;
+  // Records accepted in memory but not yet written, oldest first.
+  #buffer: string[] = [];
+  #bufferBytes = 0;
+  #flushTimer: NodeJS.Timeout | undefined;
+  // Why the last write failed. A failed append can leave a partial record,
+  // so the next write rewrites the whole spool instead of appending.
+  #writeFailure: unknown;
 
   constructor(
     dataDirectory: string,
@@ -90,6 +116,38 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
     this.#dataDirectory = dataDirectory;
     this.#path = join(dataDirectory, spoolFileName);
     this.#maxBytes = maxBytes;
+    this.#compactAfterDeadBytes = Math.min(
+      compactAfterDeadBytes,
+      Math.max(1, Math.floor(maxBytes / 4)),
+    );
+  }
+
+  /**
+   * Writes every buffered record with one flushed append. Throws when the
+   * spool cannot be written; the records stay buffered and the next write
+   * retries them.
+   */
+  flush(): void {
+    if (this.#flushTimer !== undefined) {
+      clearTimeout(this.#flushTimer);
+      this.#flushTimer = undefined;
+    }
+    if (this.#writeFailure !== undefined) {
+      this.#compact();
+      return;
+    }
+    if (this.#buffer.length === 0) return;
+    const encoded = this.#buffer.join("");
+    try {
+      this.#appendToFile(encoded);
+    } catch (error) {
+      this.#writeFailure = error;
+      this.#size = undefined;
+      throw error;
+    }
+    this.#size = this.#currentSize() + this.#bufferBytes;
+    this.#buffer = [];
+    this.#bufferBytes = 0;
   }
 
   /**
@@ -104,7 +162,17 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
     });
   }
 
-  restore(tenantID: string, machineID: string, credential: string): void {
+  /**
+   * Loads the spool for this machine. A spool that an earlier pairing of
+   * this data directory left for another machine cannot be delivered as
+   * this one: it is moved aside with its stream cursor instead of stopping
+   * the observer, and the returned directory says where it went.
+   */
+  restore(
+    tenantID: string,
+    machineID: string,
+    credential: string,
+  ): string | undefined {
     validateScope(tenantID, machineID);
     if (!credential.startsWith("phg_m_") || credential.length > 256) {
       throw new Error("Telemetry spool credential is invalid.");
@@ -119,18 +187,28 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
       ) {
         throw new Error("Telemetry spool scope changed while the observer was running.");
       }
-      return;
+      return undefined;
     }
     this.#scope = scope;
     this.#key = key;
     try {
-      if (!existsSync(this.#path)) return;
+      if (!existsSync(this.#path)) return undefined;
       const metadata = statSync(this.#path);
       if (!metadata.isFile() || metadata.size > this.#maxBytes) {
         throw new Error("Telemetry spool exceeds its safe storage bound.");
       }
       const restored = new BoundedEventQueue<EventEnvelope>(this.metrics().capacity);
       const raw = readFileSync(this.#path, "utf8");
+      // Every record names its machine in plain text, so another machine's
+      // spool is told apart from a damaged one, which still stops here.
+      const owner = spoolOwner(raw);
+      if (
+        owner !== undefined &&
+        (owner.tenantID !== tenantID || owner.machineID !== machineID)
+      ) {
+        this.#size = undefined;
+        return retirePairingState(this.#dataDirectory, owner.machineID);
+      }
       const lines = raw.split("\n");
       const completeLines = lines.slice(0, -1);
       for (const line of completeLines) {
@@ -139,13 +217,14 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
         this.#restoreRecord(record, restored, Buffer.byteLength(line) + 1);
       }
       if (!raw.endsWith("\n") && (lines.at(-1)?.length ?? 0) > 0) {
-        // A crash can leave only the final append incomplete. It was never a
-        // durable event, so ignore that tail and compact the verified prefix.
+        // A crash can leave only the final write incomplete. Its records
+        // were never flushed, so no source checkpoint moved past them:
+        // ignore that tail and compact the verified prefix.
       }
       const sizes = this.#writeCompactedQueue(restored);
       this.replaceState(restored);
       this.reweigh(sizes);
-      this.#operations = 0;
+      return undefined;
     } catch (error) {
       this.#scope = undefined;
       this.#key = undefined;
@@ -166,16 +245,20 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
       );
     }
     validateEventScope(value, scope, sequence);
+    // While the disk refuses writes, refuse new events before they reach
+    // memory, as an unbuffered append did; the collector reads them again.
+    if (this.#writeFailure !== undefined) this.flush();
     const record = this.#encryptedRecord(value, sequence, coalesceKey);
     const bytes = this.#append(record);
     super.enqueue(value, sequence, coalesceKey, bytes);
     this.#compactIfNeeded();
   }
 
-  // Removals apply in memory before they are appended. On a full spool the
+  // Removals apply in memory before they are buffered. On a full spool the
   // compaction that makes room for the record then already leaves the
   // removed events out, so an acknowledgement can always drain the spool.
-  // A removal lost in a crash only sends the event again.
+  // A removal lost in a crash only sends the event again, so removals are
+  // written lazily with the next group of records.
   override acknowledge(throughSequence: bigint): void {
     if (throughSequence <= this.metrics().acknowledged) return;
     super.acknowledge(throughSequence);
@@ -296,17 +379,45 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
     };
   }
 
-  /** Append one record and return its stored size. */
+  /** Buffer one record for the next group write and return its stored size. */
   #append(record: SpoolRecord): number {
-    this.#prepareDirectory();
     const encoded = `${JSON.stringify(record)}\n`;
     const bytes = Buffer.byteLength(encoded);
-    if (this.#currentSize() + bytes > this.#maxBytes) {
+    if (this.#storedBytes() + bytes > this.#maxBytes) {
       this.#compact();
     }
-    if (this.#currentSize() + bytes > this.#maxBytes) {
+    if (this.#storedBytes() + bytes > this.#maxBytes) {
       throw new Error("Telemetry spool is full; collection stopped before data loss.");
     }
+    this.#buffer.push(encoded);
+    this.#bufferBytes += bytes;
+    if (this.#bufferBytes >= flushAfterBytes) {
+      this.#flushQuietly();
+    } else {
+      this.#flushTimer ??= setTimeout(() => {
+        this.#flushTimer = undefined;
+        this.#flushQuietly();
+      }, flushDelayMs).unref();
+    }
+    return bytes;
+  }
+
+  /**
+   * A write that runs outside a caller who could handle its failure. The
+   * failure is kept: the next event is refused until a write succeeds, and
+   * no source checkpoint moves past an unwritten event.
+   */
+  #flushQuietly(): void {
+    try {
+      this.flush();
+    } catch {
+      // Kept in #writeFailure; the next write retries.
+    }
+  }
+
+  /** One flushed append of `encoded`. */
+  #appendToFile(encoded: string): void {
+    this.#prepareDirectory();
     if (this.#currentSize() === 0) this.#fileSecured = false;
     const options = {
       encoding: "utf8",
@@ -328,9 +439,11 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
       chmodSync(this.#path, 0o600);
       this.#fileSecured = true;
     }
-    this.#size = this.#currentSize() + bytes;
-    this.#operations++;
-    return bytes;
+  }
+
+  /** The spool's size once the buffered records are written. */
+  #storedBytes(): number {
+    return this.#currentSize() + this.#bufferBytes;
   }
 
   #prepareDirectory(): void {
@@ -353,12 +466,17 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
   }
 
   #compactIfNeeded(): void {
-    if (this.#operations >= compactAfterOperations) this.#compact();
+    // A compaction rewrites the queued events, so rewriting only once the
+    // records it drops outweigh them keeps its cost proportional to the
+    // records appended since the last one.
+    const live = this.queuedBytes();
+    const dead = this.#storedBytes() - live;
+    if (dead >= this.#compactAfterDeadBytes && dead > live) this.#compact();
   }
 
+  /** Rewrite the spool from memory, which also writes every buffered record. */
   #compact(): void {
     this.reweigh(this.#writeCompactedQueue(this));
-    this.#operations = 0;
   }
 
   /** Rewrite the spool as `queue` and return each queued event's stored size. */
@@ -395,6 +513,14 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
       this.#directoryPrepared = true;
       this.#fileSecured = true;
       this.#size = Buffer.byteLength(encoded);
+      // Memory already holds every buffered record's effect.
+      this.#buffer = [];
+      this.#bufferBytes = 0;
+      this.#writeFailure = undefined;
+      if (this.#flushTimer !== undefined) {
+        clearTimeout(this.#flushTimer);
+        this.#flushTimer = undefined;
+      }
     } catch (error) {
       try {
         unlinkSync(temporaryPath);
@@ -423,6 +549,48 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
 }
 
 export function clearEventSpool(dataDirectory: string): void {
+  removeSpoolFiles(dataDirectory, true);
+}
+
+/**
+ * Moves what an earlier pairing of this data directory left behind out of
+ * the way, so a computer paired again as a new machine starts with an empty
+ * queue instead of refusing to read the old one. The encrypted spool, the
+ * stream cursor and `extraFiles` (such as the old credential, the only key
+ * that can still decrypt that spool) go to `retired-pairings/<time>-<machine>/`.
+ * Only the newest few pairings are kept. Returns that directory, or
+ * undefined when there was nothing to move.
+ */
+export function retirePairingState(
+  dataDirectory: string,
+  machineID: string | undefined,
+  extraFiles: readonly string[] = [],
+): string | undefined {
+  removeSpoolFiles(dataDirectory, false);
+  const present = [spoolFileName, streamStateFileName, ...extraFiles]
+    .filter((name) => existsSync(join(dataDirectory, name)));
+  if (present.length === 0) return undefined;
+  const root = join(dataDirectory, retiredPairingsDirectory);
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  chmodSync(root, 0o700);
+  // The time first, so names sort oldest first; Windows refuses ":" in names.
+  const stamp = new Date().toISOString().replace(/[:.]/gu, "-");
+  const label = (machineID ?? "unknown").replace(/[^A-Za-z0-9._-]/gu, "_");
+  const destination = mkdtempSync(join(root, `${stamp}-${label}-`));
+  for (const name of present) {
+    atomicReplaceSync(join(dataDirectory, name), join(destination, name));
+  }
+  const retired = readdirSync(root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort();
+  for (const name of retired.slice(0, -retainedRetiredPairings)) {
+    rmSync(join(root, name), { recursive: true, force: true });
+  }
+  return destination;
+}
+
+function removeSpoolFiles(dataDirectory: string, includeSpool: boolean): void {
   let names: string[];
   try {
     names = readdirSync(dataDirectory);
@@ -433,13 +601,38 @@ export function clearEventSpool(dataDirectory: string): void {
   for (const name of names) {
     const temporary =
       name.startsWith(`${spoolFileName}.`) && name.endsWith(".tmp");
-    if (name !== spoolFileName && !temporary) continue;
+    if (!temporary && !(includeSpool && name === spoolFileName)) continue;
     try {
       unlinkSync(join(dataDirectory, name));
     } catch (error) {
       if (!isNodeError(error) || error.code !== "ENOENT") throw error;
     }
   }
+}
+
+/** The machine that wrote a spool, from its first record. */
+function spoolOwner(
+  raw: string,
+): Readonly<{ tenantID: string; machineID: string }> | undefined {
+  const end = raw.indexOf("\n");
+  if (end < 0) return undefined;
+  let value: unknown;
+  try {
+    value = JSON.parse(raw.slice(0, end));
+  } catch {
+    return undefined;
+  }
+  if (
+    typeof value !== "object" || value === null ||
+    !("version" in value) || value.version !== spoolVersion ||
+    !("tenant_id" in value) || typeof value.tenant_id !== "string" ||
+    !("machine_id" in value) || typeof value.machine_id !== "string" ||
+    !scopedIDPattern.test(value.tenant_id) ||
+    !scopedIDPattern.test(value.machine_id)
+  ) {
+    return undefined;
+  }
+  return { tenantID: value.tenant_id, machineID: value.machine_id };
 }
 
 function parseRecord(line: string, scope: SpoolScope): SpoolRecord {

@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -97,6 +97,36 @@ test("enabled executor rejects an expired command before process discovery", asy
   assert.equal(result.state, RemoteActionResultState.EXPIRED);
   assert.equal(result.resultCode, "command_expired");
   assert.equal(inventoryReads, 0);
+});
+
+test("a stop request is timed by the server's clock when this computer's clock is off", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-agent-action-skew-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const skewed = (skewMs: number) => new AgentActionExecutor({
+    enabled: true,
+    machineID,
+    dataDirectory: directory,
+    inventory: async () => create(AgentInventorySchema, { machineId: machineID }),
+    serverNow: () => Date.now() + skewMs,
+  });
+  const request = (expiresAt: number) => create(AgentActionCommandSchema, {
+    actionId: randomUUID(),
+    idempotencyKey: randomUUID(),
+    machineId: machineID,
+    agentId: "agent-runtime",
+    processId: 42n,
+    expectedStartedAt: timestampFromDate(new Date(Date.now() - 10_000)),
+    expiresAt: timestampFromDate(new Date(expiresAt)),
+    action: RemoteActionType.STOP_AGENT,
+  });
+  // The server is ten minutes ahead: a request with a minute left on its
+  // clock is within the window, so it goes on to look for the target.
+  const ahead = await skewed(600_000).execute(request(Date.now() + 660_000));
+  assert.equal(ahead.resultCode, "stale_target");
+  // The server is five minutes ahead: what this clock calls a minute away
+  // has already expired.
+  const expired = await skewed(300_000).execute(request(Date.now() + 60_000));
+  assert.equal(expired.resultCode, "command_expired");
 });
 
 test("force stop signals only the exact freshly discovered process lifetime", async (t) => {

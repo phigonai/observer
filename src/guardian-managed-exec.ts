@@ -1,8 +1,8 @@
-import { makeDirectoryPrivate } from "./private-directory.js";
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, mkdir, open, unlink } from "node:fs/promises";
-import { join, resolve as resolvePath } from "node:path";
+import { open, unlink } from "node:fs/promises";
+import { resolve as resolvePath } from "node:path";
+import { SegmentedJournal, managedCommandJournal } from "./bridge-journal.js";
 import { guardianRunnerPath } from "./guardian-native.js";
 import { access } from "node:fs/promises";
 import { verifyExecutionManifest, type ExecutionManifest } from "./guardian-execution-manifest.js";
@@ -205,19 +205,13 @@ type ManagedCommandRecord = Readonly<{
 }>;
 
 class ManagedCommandJournal {
-  readonly #dataDirectory: string;
+  readonly #journal: SegmentedJournal;
 
   constructor(dataDirectory: string) {
-    this.#dataDirectory = dataDirectory;
+    this.#journal = new SegmentedJournal(dataDirectory, managedCommandJournal);
   }
 
   async append(record: ManagedCommandRecord): Promise<void> {
-    const directory = join(this.#dataDirectory, "bridges", "generic");
-    await mkdir(directory, { recursive: true, mode: 0o700 });
-    await makeDirectoryPrivate(this.#dataDirectory);
-    await chmod(join(this.#dataDirectory, "bridges"), 0o700);
-    await chmod(directory, 0o700);
-    const path = join(directory, "guardian-managed-commands.jsonl");
     const encoded = JSON.stringify({
       type: "phigon_managed_command",
       timestamp: new Date().toISOString(),
@@ -234,13 +228,7 @@ class ManagedCommandJournal {
     if (Buffer.byteLength(encoded, "utf8") > 96 << 10) {
       throw new Error("Managed command telemetry chunk exceeded 96 KiB.");
     }
-    const handle = await open(path, "a", 0o600);
-    try {
-      await handle.write(`${encoded}\n`);
-    } finally {
-      await handle.close();
-    }
-    await chmod(path, 0o600);
+    await this.#journal.append(encoded);
   }
 }
 

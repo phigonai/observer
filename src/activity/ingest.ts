@@ -13,6 +13,13 @@ import { activityBridgeAgent } from "./bridges.js";
 
 const maxLineBytes = 1 << 20;
 
+/** Beside a bridge file that an `ingest` run is still writing. */
+export const bridgeWritingSuffix = ".writing";
+
+/** A file written by one `ingest` run. */
+export const ingestedBridgeFile =
+  /^\d{1,16}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$/u;
+
 export type ActivityIngestResult = Readonly<{
   agent: string;
   agentName?: string;
@@ -52,7 +59,17 @@ export async function ingestActivityJSONL(options: Readonly<{
     agentRoot,
     `${Date.now()}-${randomUUID()}.jsonl`,
   );
-  const handle = await open(target, "wx", 0o600);
+  // The collector deletes bridge files it has delivered. This marker, which
+  // it does not read as activity, says the file may still grow.
+  const writing = `${target}${bridgeWritingSuffix}`;
+  await (await open(writing, "wx", 0o600)).close();
+  let handle;
+  try {
+    handle = await open(target, "wx", 0o600);
+  } catch (error) {
+    await unlink(writing);
+    throw error;
+  }
   let records = 0;
   let malformed = 0;
   let oversized = 0;
@@ -105,6 +122,7 @@ export async function ingestActivityJSONL(options: Readonly<{
     await handle.sync();
   } finally {
     await handle.close();
+    await unlink(writing).catch(() => undefined);
   }
   if (records === 0) {
     await unlink(target);

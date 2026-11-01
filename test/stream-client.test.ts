@@ -69,6 +69,7 @@ import {
   ObserverStreamClient,
   sanitizeEventForPolicy,
 } from "../src/stream-client.js";
+import { ServerClock } from "../src/server-clock.js";
 import { StreamStateStore } from "../src/stream-state.js";
 import {
   AgentActionCommandSchema,
@@ -528,6 +529,51 @@ test("observer renews the owner action capability manifest on heartbeats", async
   try {
     await client.run(controller.signal);
     assert.equal(manifests, 2);
+  } finally {
+    controller.abort();
+    await shutdownServer(server);
+    await rm(dataDirectory, { recursive: true, force: true });
+  }
+});
+
+test("the stream learns the server's clock from its acknowledgements and policy", async () => {
+  const dataDirectory = await mkdtemp(join(tmpdir(), "phigon-server-clock-"));
+  const machineId = "5f1b4cb4-a77d-4f53-af66-197e184683f4";
+  const server = new Server();
+  const controller = new AbortController();
+  const aheadMs = 600_000;
+  const serverStamp = () => timestampFromDate(new Date(Date.now() + aheadMs));
+  const implementation: UntypedServiceImplementation = {
+    streamTelemetry(
+      call: ServerDuplexStream<StreamTelemetryRequest, StreamTelemetryResponse>,
+    ) {
+      call.on("data", (request: StreamTelemetryRequest) => {
+        if (request.payload.case === "resume") {
+          const policy = policySnapshot(machineId);
+          if (policy.payload.case === "policy") policy.payload.value.effectiveAt = serverStamp();
+          call.write(policy);
+          const ack = acknowledgement(machineId, 0n);
+          if (ack.payload.case === "acknowledgement") ack.payload.value.receivedAt = serverStamp();
+          call.write(ack);
+        }
+        if (request.payload.case === "heartbeat") controller.abort();
+      });
+      call.on("end", () => call.end());
+    },
+  };
+  server.addService(observerServiceDefinition, implementation);
+  const port = await bindServer(server);
+  const skews: number[] = [];
+  const serverClock = new ServerClock({ onLargeSkew: (offset) => skews.push(offset) });
+  const client = new ObserverStreamClient({
+    config: streamConfig(dataDirectory, port),
+    credentialStore: testCredentialStore(machineId),
+    serverClock,
+  });
+  try {
+    await client.run(controller.signal);
+    assert.ok(Math.abs(serverClock.offsetMs() - aheadMs) < 5_000, `offset ${serverClock.offsetMs()}`);
+    assert.equal(skews.length, 1);
   } finally {
     controller.abort();
     await shutdownServer(server);

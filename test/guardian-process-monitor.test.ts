@@ -86,6 +86,72 @@ test("discovered agents require central containment authority and exact lifetime
   assert.equal(calls, 2, "shutdown must not dispatch new reviews");
 });
 
+test("an allowed process is asked about again only after a minute, a new policy or a new lifetime", async () => {
+  let now = Date.parse("2026-11-02T12:00:00.000Z");
+  let digest = "a".repeat(64);
+  const agent = (startedAt: string) => create(AgentIdentitySchema, {
+    agentId: "codex:1", processId: 42n, startedAt: timestampFromDate(new Date(startedAt)),
+    state: AgentState.RUNNING, capabilities: ["process-instance"],
+  });
+  let inventory = create(AgentInventorySchema, { machineId: "machine", agents: [agent("2026-11-02T11:00:00Z")] });
+  let calls = 0;
+  const reports: Record<string, unknown>[] = [];
+  const monitor = new GuardianProcessMonitor({
+    machineId: "machine", onStatus: () => undefined, now: () => now,
+    policyStore: { load: async () => ({ machineId: "machine", policyDigest: digest, defaultEffect: "allow", rules: [], receivedAt: new Date(now).toISOString() }) },
+    decisionClient: { decide: async () => { calls++; return { decision: "allow", reason: "Allowed.", risk: "low", confidence: 1, model: "policy-gateway", cached: false, latencyMs: 1, intervention: "none" }; } },
+    containment: { execute: async () => { throw new Error("An allowed process must not be stopped"); } },
+    journal: { append: async () => undefined },
+    coverageClient: { post: async (_path, body) => { reports.push(body as Record<string, unknown>); return {}; } },
+  });
+  const signal = new AbortController().signal;
+  for (let pass = 0; pass < 5; pass++) {
+    await monitor.review(inventory, signal);
+    now += 10_000;
+  }
+  assert.equal(calls, 1);
+  // Allowed on the first pass, unchanged since: one degraded report before
+  // the first decision and one active report after it.
+  assert.deepEqual(reports.map((report) => report["process_review"]), ["degraded", "active"]);
+  assert.equal(reports[1]?.["reviewed"], 1);
+
+  now += 20_000;
+  await monitor.review(inventory, signal);
+  assert.equal(calls, 2, "an allow is asked again after a minute");
+
+  digest = "b".repeat(64);
+  await monitor.review(inventory, signal);
+  assert.equal(calls, 3, "a new policy is asked again at once");
+
+  inventory = create(AgentInventorySchema, { machineId: "machine", agents: [agent("2026-11-02T12:01:00Z")] });
+  await monitor.review(inventory, signal);
+  assert.equal(calls, 4, "a reused process ID is a new process");
+});
+
+test("unchanged coverage is reported again once a minute and a change at once", async () => {
+  let now = Date.parse("2026-11-02T12:00:00.000Z");
+  const reports: Record<string, unknown>[] = [];
+  const monitor = new GuardianProcessMonitor({
+    machineId: "machine", onStatus: () => undefined, now: () => now,
+    policyStore: { load: async () => ({ machineId: "machine", policyDigest: "a".repeat(64), defaultEffect: "allow", rules: [], receivedAt: new Date(now).toISOString() }) },
+    decisionClient: { decide: async () => { throw new Error("No processes should be reviewed"); } },
+    containment: { execute: async () => { throw new Error("No processes should be stopped"); } },
+    journal: { append: async () => undefined },
+    coverageClient: { post: async (_path, body) => { reports.push(body as Record<string, unknown>); return {}; } },
+  });
+  const signal = new AbortController().signal;
+  for (let pass = 0; pass < 6; pass++) {
+    await monitor.review(create(AgentInventorySchema, { machineId: "machine", agents: [] }), signal);
+    now += 10_000;
+  }
+  assert.equal(reports.length, 1);
+  await monitor.review(create(AgentInventorySchema, { machineId: "machine", agents: [] }), signal);
+  assert.equal(reports.length, 2, "the server marks coverage stale after two minutes");
+  await monitor.review(create(AgentInventorySchema, { machineId: "machine", partial: true, agents: [] }), signal);
+  assert.equal(reports.length, 3);
+  assert.equal(reports[2]?.["process_review"], "degraded");
+});
+
 test("the person at the computer is told when Phigon stops a blocked agent, once per process", async () => {
   const started = new Date("2026-09-05T00:00:00Z");
   const inventory = create(AgentInventorySchema, { machineId: "machine", agents: [

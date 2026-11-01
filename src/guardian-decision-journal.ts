@@ -1,8 +1,6 @@
-import { makeDirectoryPrivate } from "./private-directory.js";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, open } from "node:fs/promises";
-import { join } from "node:path";
 import type { GuardianActionContext } from "./agentic-guardian.js";
+import { SegmentedJournal, guardianDecisionJournal } from "./bridge-journal.js";
 import type { GuardianIntervention } from "./action-policy.js";
 import type { GuardianContainmentResult } from "./guardian-containment.js";
 
@@ -28,19 +26,13 @@ export type GuardianDecisionRecord = Readonly<{
 }>;
 
 export class GuardianDecisionJournal {
-  readonly #dataDirectory: string;
+  readonly #journal: SegmentedJournal;
 
   constructor(dataDirectory: string) {
-    this.#dataDirectory = dataDirectory;
+    this.#journal = new SegmentedJournal(dataDirectory, guardianDecisionJournal);
   }
 
   async append(record: GuardianDecisionRecord): Promise<void> {
-    const directory = join(this.#dataDirectory, "bridges", "generic");
-    await mkdir(directory, { recursive: true, mode: 0o700 });
-    await makeDirectoryPrivate(this.#dataDirectory);
-    await chmod(join(this.#dataDirectory, "bridges"), 0o700);
-    await chmod(directory, 0o700);
-    const path = join(directory, "guardian-decisions.jsonl");
     const value = JSON.stringify({
       type: "phigon_guardian_decision",
       decision_id: randomUUID(),
@@ -69,13 +61,6 @@ export class GuardianDecisionJournal {
     if (Buffer.byteLength(value, "utf8") > 32 << 10) {
       throw new Error("Guardian decision record exceeded its storage bound.");
     }
-    const handle = await open(path, "a", 0o600);
-    try {
-      await handle.write(`${value}\n`);
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    await chmod(path, 0o600);
+    await this.#journal.append(value, { sync: true });
   }
 }

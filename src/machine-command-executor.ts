@@ -42,6 +42,8 @@ export type MachineCommandOptions = {
   agents?: () => Promise<RunningAgents>;
   /** Tells the person at this computer what Phigon did. */
   notices?: UserNotices;
+  /** The server's current time, which command expiry is measured in. */
+  serverNow?: () => number;
 };
 
 /** Separate machine-owner enrollment; durable claims prevent crash/retry execution. */
@@ -77,7 +79,8 @@ export class MachineCommandExecutor {
       return receipt(State.REJECTED, "invalid_command", "Machine command identity or capability is invalid.");
     }
     const expires = timestampDate(command.expiresAt).getTime();
-    if (!Number.isFinite(expires) || expires > Date.now() + 330_000) return receipt(State.EXPIRED, "command_expired", "Command is outside its approved execution window.");
+    const serverNow = this.#options.serverNow ?? Date.now;
+    if (!Number.isFinite(expires) || expires > serverNow() + 330_000) return receipt(State.EXPIRED, "command_expired", "Command is outside its approved execution window.");
     const spec = command.action === Action.RUN_COMMAND ? parseCommand(command.commandJson) : null;
     if ((command.action === Action.RUN_COMMAND && !spec) || (command.action !== Action.RUN_COMMAND && !["", "null"].includes(command.commandJson))) return receipt(State.REJECTED, "invalid_command", "Executable, arguments, or limits are invalid.");
     const digest = createHash("sha256").update(JSON.stringify([command.actionId, command.machineId, command.action, command.commandJson, command.reason, expires])).digest("hex");
@@ -87,7 +90,7 @@ export class MachineCommandExecutor {
       const stored = JSON.parse(await readFile(path, "utf8")) as { digest: string; receipt: string };
       return stored.digest === digest ? fromJsonString(AgentActionResultSchema, stored.receipt) : receipt(State.REJECTED, "idempotency_conflict", "This request key belongs to a different command.");
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    if (expires <= Date.now()) return receipt(State.EXPIRED, "command_expired", "Command expired before execution.");
+    if (expires <= serverNow()) return receipt(State.EXPIRED, "command_expired", "Command expired before execution.");
     await mkdir(directory, { recursive: true, mode: 0o700 });
     const uncertain = receipt(State.FAILED, "execution_interrupted", "Execution was claimed but no completion receipt is available. It will not be repeated automatically.");
     try {

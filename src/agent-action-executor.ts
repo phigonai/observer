@@ -40,6 +40,7 @@ export class AgentActionExecutor {
   readonly #claimsDirectory: string;
   readonly #processes: ProcessTreeControl;
   readonly #notices: UserNotices | undefined;
+  readonly #serverNow: () => number;
   #latestInventory: { inventory: AgentInventory; at: number } | undefined;
 
   constructor(options: {
@@ -51,9 +52,15 @@ export class AgentActionExecutor {
     processControl?: ProcessTreeControl;
     /** Tells the person at this computer what Phigon did. */
     notices?: UserNotices;
+    /**
+     * The server's current time. Command expiry is server time, so a
+     * computer clock that is off must not decide it.
+     */
+    serverNow?: () => number;
   }) {
     this.#enabled = options.enabled;
     this.#notices = options.notices;
+    this.#serverNow = options.serverNow ?? Date.now;
     this.#processes = options.processControl ?? defaultProcessTreeControl();
     this.#machineID = options.machineID;
     this.#inventory = options.inventory;
@@ -62,6 +69,7 @@ export class AgentActionExecutor {
     this.#commands = new MachineCommandExecutor({
       enabled: this.#commandsEnabled, machineID: options.machineID, dataDirectory: options.dataDirectory,
       agents: () => this.#runningAgents(),
+      serverNow: this.#serverNow,
       ...(options.notices === undefined ? {} : { notices: options.notices }),
     });
     this.#receipts = new ActionReceiptStore(
@@ -173,8 +181,8 @@ export class AgentActionExecutor {
       );
     }
     if (!this.#enabled) return await reject("executor_disabled", "Machine owner has not enabled remote agent actions.");
-    if (!Number.isFinite(timestampDate(command.expiresAt).getTime()) || timestampDate(command.expiresAt).getTime() > Date.now() + 330_000) return await reject("invalid_command", "Command expiry is outside the approved execution window.");
-    if (timestampDate(command.expiresAt).getTime() <= Date.now()) {
+    if (!Number.isFinite(timestampDate(command.expiresAt).getTime()) || timestampDate(command.expiresAt).getTime() > this.#serverNow() + 330_000) return await reject("invalid_command", "Command expiry is outside the approved execution window.");
+    if (timestampDate(command.expiresAt).getTime() <= this.#serverNow()) {
       return await reject(
         "command_expired",
         "The approved command expired before local execution.",
@@ -193,14 +201,14 @@ export class AgentActionExecutor {
       RemoteActionResultState.EXPIRED,
     );
     let inventory: AgentInventory;
-    const untilExpiry = expiresAt - Date.now();
+    const untilExpiry = expiresAt - this.#serverNow();
     try {
       inventory = await withDeadline(this.#inventory(), Math.min(untilExpiry, discoveryTimeoutMs));
     } catch (error) {
       // A timer can fire a millisecond before the clock reaches expiresAt, so
-      // a deadline set by the expiry counts as expiry even when Date.now() lags.
+      // a deadline set by the expiry counts as expiry even when the clock lags.
       const expiryDeadline = untilExpiry <= discoveryTimeoutMs && error instanceof Error && error.message === "deadline_exceeded";
-      if (expiryDeadline || Date.now() >= expiresAt) return await expired();
+      if (expiryDeadline || this.#serverNow() >= expiresAt) return await expired();
       return await reject(
         "target_unverified",
         "The observer could not list running agents, so the target could not be verified. Nothing was signalled.",
@@ -208,7 +216,7 @@ export class AgentActionExecutor {
         RemoteActionResultState.FAILED,
       );
     }
-    if (Date.now() >= expiresAt) return await expired();
+    if (this.#serverNow() >= expiresAt) return await expired();
     const target = inventory.agents.find((agent) =>
       agent.agentId === command.agentId &&
       agent.processId === command.processId &&

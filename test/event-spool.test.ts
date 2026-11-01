@@ -6,15 +6,19 @@ import {
   mkdtemp,
   open,
   readFile,
+  readdir,
   rm,
   stat,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import test from "node:test";
 import { hasByteHeadroom } from "../src/event-queue.js";
-import { FileBackedEventQueue } from "../src/event-spool.js";
+import {
+  FileBackedEventQueue,
+  retirePairingState,
+} from "../src/event-spool.js";
 import { PrivacyClass } from "../src/generated/phigon/v1/common_pb.js";
 import {
   EventEnvelopeSchema,
@@ -25,6 +29,7 @@ import {
 
 const tenantID = "7d1b4cb4-a77d-4f53-af66-197e184683f4";
 const machineID = "5f1b4cb4-a77d-4f53-af66-197e184683f4";
+const otherMachineID = "9a2c4cb4-a77d-4f53-af66-197e184683f4";
 const credential = `phg_m_${"a".repeat(43)}`;
 
 test("encrypted event spool survives restart without storing plaintext", async () => {
@@ -33,6 +38,7 @@ test("encrypted event spool survives restart without storing plaintext", async (
     const first = new FileBackedEventQueue(directory, 4);
     first.restore(tenantID, machineID, credential);
     first.enqueue(lifecycleEvent(1n, "private restart evidence"), 1n);
+    first.flush();
 
     const raw = await readFile(join(directory, "telemetry-spool.jsonl"), "utf8");
     assert.doesNotMatch(raw, /private restart evidence/u);
@@ -60,9 +66,9 @@ test("event spool keeps appending across compaction and a removed data directory
   const root = await mkdtemp(join(tmpdir(), "phigon-event-spool-append-"));
   const directory = join(root, "data");
   try {
-    const queue = new FileBackedEventQueue(directory, 2048);
+    // A small budget makes the acknowledged records worth compacting.
+    const queue = new FileBackedEventQueue(directory, 2048, 1 << 20);
     queue.restore(tenantID, machineID, credential);
-    // 1,101 appends cross the 1,024-operation compaction threshold.
     for (let sequence = 1n; sequence <= 600n; sequence++) {
       queue.enqueue(lifecycleEvent(sequence, "batch"), sequence);
     }
@@ -70,6 +76,7 @@ test("event spool keeps appending across compaction and a removed data directory
     for (let sequence = 601n; sequence <= 1_100n; sequence++) {
       queue.enqueue(lifecycleEvent(sequence, "batch"), sequence);
     }
+    queue.flush();
     const restarted = new FileBackedEventQueue(directory, 2048);
     restarted.restore(tenantID, machineID, credential);
     assert.equal(restarted.metrics().acknowledged, 500n);
@@ -80,6 +87,7 @@ test("event spool keeps appending across compaction and a removed data directory
 
     await rm(directory, { recursive: true, force: true });
     queue.enqueue(lifecycleEvent(1_101n, "after removal"), 1_101n);
+    queue.flush();
     const recreated = new FileBackedEventQueue(directory, 2048);
     recreated.restore(tenantID, machineID, credential);
     assert.deepEqual(recreated.pending().map((event) => event.sequence), [1_101n]);
@@ -92,7 +100,7 @@ test("event spool keeps appending across compaction and a removed data directory
   }
 });
 
-test("event spool persists policy replacement and rejects scope mismatch", async () => {
+test("event spool persists policy replacement", async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-event-spool-policy-"));
   try {
     const first = new FileBackedEventQueue(directory, 4);
@@ -105,16 +113,70 @@ test("event spool persists policy replacement and rejects scope mismatch", async
     const restarted = new FileBackedEventQueue(directory, 4);
     restarted.restore(tenantID, machineID, credential);
     assert.equal(eventReason(restarted.pending()[0]), "redacted");
-
-    const wrongTenant = new FileBackedEventQueue(directory, 4);
     assert.throws(
-      () => wrongTenant.restore(
-        "8d1b4cb4-a77d-4f53-af66-197e184683f4",
-        machineID,
-        credential,
-      ),
-      /scope/u,
+      () => restarted.restore(tenantID, otherMachineID, credential),
+      /scope changed while the observer was running/u,
     );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a spool left for another machine is moved aside instead of stopping the observer", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-event-spool-retire-"));
+  const path = join(directory, "telemetry-spool.jsonl");
+  try {
+    const previous = new FileBackedEventQueue(directory, 4);
+    previous.restore(tenantID, machineID, credential);
+    previous.enqueue(lifecycleEvent(1n, "earlier pairing"), 1n);
+    previous.flush();
+    const previousSpool = await readFile(path, "utf8");
+    await writeFile(join(directory, "stream-state.json"), "{}\n", "utf8");
+
+    // The data directory was paired again as a new machine.
+    const repaired = new FileBackedEventQueue(directory, 4);
+    const retired = repaired.restore(
+      tenantID,
+      otherMachineID,
+      `phg_m_${"b".repeat(43)}`,
+    );
+    assert.ok(retired !== undefined);
+    assert.equal(dirname(retired), join(directory, "retired-pairings"));
+    assert.match(basename(retired), new RegExp(`-${machineID}-`, "u"));
+    assert.equal(await readFile(join(retired, "telemetry-spool.jsonl"), "utf8"), previousSpool);
+    assert.equal(await readFile(join(retired, "stream-state.json"), "utf8"), "{}\n");
+    await assert.rejects(stat(path), { code: "ENOENT" });
+    assert.equal(repaired.metrics().depth, 0);
+
+    // The new machine's queue works and survives a restart.
+    repaired.enqueue(lifecycleEvent(1n, "new pairing", otherMachineID), 1n);
+    repaired.flush();
+    const restarted = new FileBackedEventQueue(directory, 4);
+    assert.equal(
+      restarted.restore(tenantID, otherMachineID, `phg_m_${"b".repeat(43)}`),
+      undefined,
+    );
+    assert.equal(eventReason(restarted.pending()[0]), "new pairing");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("only the newest retired pairings are kept", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-event-spool-retired-"));
+  try {
+    const kept: string[] = [];
+    for (let pairing = 0; pairing < 5; pairing++) {
+      await writeFile(join(directory, "telemetry-spool.jsonl"), "{}\n", "utf8");
+      const retired = retirePairingState(directory, `machine-${pairing}`);
+      assert.ok(retired !== undefined);
+      kept.push(basename(retired));
+    }
+    assert.deepEqual(
+      (await readdir(join(directory, "retired-pairings"))).sort(),
+      kept.slice(-3).sort(),
+    );
+    assert.equal(retirePairingState(directory, "machine-5"), undefined);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -127,6 +189,7 @@ test("event spool restore commits only after every durable record verifies", asy
     const writer = new FileBackedEventQueue(directory, 4);
     writer.restore(tenantID, machineID, credential);
     writer.enqueue(lifecycleEvent(1n, "verified evidence"), 1n);
+    writer.flush();
     const verified = await readFile(path, "utf8");
     await appendFile(path, "{\"corrupt\":true}\n", "utf8");
 
@@ -175,6 +238,7 @@ test("event spool reports its stored bytes across acknowledgement, compaction an
       queue.enqueue(lifecycleEvent(sequence, "x".repeat(200)), sequence);
     }
     // Before any acknowledgement the spool holds exactly the queued events.
+    queue.flush();
     const queued = queue.metrics().bytes ?? 0;
     assert.equal(queued, (await stat(path)).size);
     const lines = (await readFile(path, "utf8")).split("\n");
@@ -187,6 +251,7 @@ test("event spool reports its stored bytes across acknowledgement, compaction an
     queue.discard(3n);
     const kept = queue.metrics().bytes;
     assert.equal(kept, Buffer.byteLength(lines[1] ?? "") + 1);
+    queue.flush();
 
     const restarted = new FileBackedEventQueue(directory, 16, 64 << 10);
     restarted.restore(tenantID, machineID, credential);
@@ -211,6 +276,7 @@ test("collection stops by bytes before the spool budget, and a full spool still 
     for (let sequence = 1n; sequence <= 8n; sequence++) {
       measured.enqueue(large(sequence), sequence);
     }
+    measured.flush();
     const budget = (await stat(join(root, "measure", "telemetry-spool.jsonl"))).size;
 
     // Eight large events fill the budget exactly, far below the event count.
@@ -232,9 +298,114 @@ test("collection stops by bytes before the spool budget, and a full spool still 
     queue.acknowledge(4n);
     assert.equal(queue.metrics().depth, 4);
     assert.equal(hasByteHeadroom(queue.metrics()), true);
+    queue.flush();
     const restarted = new FileBackedEventQueue(join(root, "spool"), 1_024, budget);
     restarted.restore(tenantID, machineID, credential);
     assert.deepEqual(restarted.pending().map((event) => event.sequence), [5n, 6n, 7n, 8n]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("spool records are written together by flush or within 100 ms", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-event-spool-group-"));
+  const path = join(directory, "telemetry-spool.jsonl");
+  try {
+    const queue = new FileBackedEventQueue(directory, 16);
+    queue.restore(tenantID, machineID, credential);
+    queue.enqueue(lifecycleEvent(1n, "first"), 1n);
+    queue.enqueue(lifecycleEvent(2n, "second"), 2n);
+    queue.acknowledge(1n);
+    // Nothing is written yet: no event is durable before a flush.
+    await assert.rejects(stat(path), { code: "ENOENT" });
+
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const restarted = new FileBackedEventQueue(directory, 16);
+    restarted.restore(tenantID, machineID, credential);
+    assert.equal(restarted.metrics().acknowledged, 1n);
+    assert.deepEqual(restarted.pending().map((event) => event.sequence), [2n]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a torn write at the end of the spool is ignored on restore", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-event-spool-torn-"));
+  const path = join(directory, "telemetry-spool.jsonl");
+  try {
+    const queue = new FileBackedEventQueue(directory, 16);
+    queue.restore(tenantID, machineID, credential);
+    queue.enqueue(lifecycleEvent(1n, "durable"), 1n);
+    queue.enqueue(lifecycleEvent(2n, "durable"), 2n);
+    queue.flush();
+    const durable = await readFile(path, "utf8");
+    // A crash in the middle of the next group write leaves part of a record.
+    const lastRecord = durable.trimEnd().split("\n").at(-1) ?? "";
+    await appendFile(path, lastRecord.slice(0, 40), "utf8");
+
+    const restarted = new FileBackedEventQueue(directory, 16);
+    restarted.restore(tenantID, machineID, credential);
+    assert.deepEqual(restarted.pending().map((event) => event.sequence), [1n, 2n]);
+    assert.ok((await readFile(path, "utf8")).endsWith("\n"));
+    restarted.enqueue(lifecycleEvent(3n, "after the crash"), 3n);
+    restarted.flush();
+    const again = new FileBackedEventQueue(directory, 16);
+    again.restore(tenantID, machineID, credential);
+    assert.deepEqual(again.pending().map((event) => event.sequence), [1n, 2n, 3n]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("the spool is compacted once dead records outweigh the queued events", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-event-spool-dead-"));
+  const path = join(directory, "telemetry-spool.jsonl");
+  try {
+    // A 64 KiB budget compacts after 16 KiB of dead records.
+    const queue = new FileBackedEventQueue(directory, 16, 64 << 10);
+    queue.restore(tenantID, machineID, credential);
+    let largest = 0;
+    for (let sequence = 1n; sequence <= 400n; sequence++) {
+      queue.enqueue(lifecycleEvent(sequence, "z".repeat(200)), sequence);
+      queue.acknowledge(sequence);
+      if (sequence % 10n === 0n) {
+        queue.flush();
+        largest = Math.max(largest, (await stat(path)).size);
+      }
+    }
+    // About 230 KB was appended, but the file never held much more than
+    // the dead-record threshold.
+    assert.ok(largest < 24 << 10, `spool reached ${largest} bytes`);
+    const restarted = new FileBackedEventQueue(directory, 16, 64 << 10);
+    restarted.restore(tenantID, machineID, credential);
+    assert.equal(restarted.metrics().acknowledged, 400n);
+    assert.equal(restarted.metrics().depth, 0);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a failed spool write refuses new events until the whole spool can be rewritten", async () => {
+  const root = await mkdtemp(join(tmpdir(), "phigon-event-spool-failure-"));
+  const directory = join(root, "data");
+  try {
+    const queue = new FileBackedEventQueue(directory, 16);
+    queue.restore(tenantID, machineID, credential);
+    queue.enqueue(lifecycleEvent(1n, "buffered"), 1n);
+    // Something else now occupies the data directory's path.
+    await rm(directory, { recursive: true, force: true });
+    await writeFile(directory, "not a directory", "utf8");
+
+    assert.throws(() => queue.flush());
+    assert.throws(() => queue.enqueue(lifecycleEvent(2n, "refused"), 2n));
+    assert.deepEqual(queue.pending().map((event) => event.sequence), [1n]);
+
+    await rm(directory, { force: true });
+    queue.enqueue(lifecycleEvent(2n, "accepted"), 2n);
+    queue.flush();
+    const restarted = new FileBackedEventQueue(directory, 16);
+    restarted.restore(tenantID, machineID, credential);
+    assert.deepEqual(restarted.pending().map((event) => event.sequence), [1n, 2n]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -247,10 +418,14 @@ test("a queue without a byte budget always has byte headroom", () => {
   assert.equal(hasByteHeadroom({ ...base, bytes: 75, byteCapacity: 100 }), false);
 });
 
-function lifecycleEvent(sequence: bigint, reason: string): EventEnvelope {
+function lifecycleEvent(
+  sequence: bigint,
+  reason: string,
+  machine = machineID,
+): EventEnvelope {
   return create(EventEnvelopeSchema, {
     tenantId: tenantID,
-    machineId: machineID,
+    machineId: machine,
     agentId: "agent-test",
     sessionId: "session-test",
     sequence,
