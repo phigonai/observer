@@ -10,6 +10,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { AgentActionExecutor } from "../src/agent-action-executor.js";
 import { SystemEvidenceProvider } from "../src/discovery/system-evidence.js";
+import { UserNotices, type UserNotice } from "../src/user-notices.js";
 import {
   AgentActionCommandSchema,
   RemoteActionResultState,
@@ -111,14 +112,17 @@ test("force stop signals only the exact freshly discovered process lifetime", as
   const observed = evidence.status === "ok" ? evidence.value.find((entry) => entry.processId === child.pid) : undefined;
   assert.ok(observed, "the test process must have an OS-observed lifetime");
   const startedAt = observed.startedAt;
+  const notices: UserNotice[] = [];
   const executor = new AgentActionExecutor({
     enabled: true,
     machineID,
     dataDirectory: directory,
+    notices: new UserNotices({ enabled: true, send: async (notice) => { notices.push(notice); } }),
     inventory: async () => create(AgentInventorySchema, {
       machineId: machineID,
       agents: [create(AgentIdentitySchema, {
         agentId: "test-agent-runtime",
+        displayName: `Codex · PID ${child.pid}`,
         state: AgentState.RUNNING,
         processId: BigInt(child.pid!),
         startedAt: timestampFromDate(startedAt),
@@ -136,12 +140,18 @@ test("force stop signals only the exact freshly discovered process lifetime", as
       expectedStartedAt: timestampFromDate(startedAt),
       expiresAt: timestampFromDate(new Date(Date.now() + 60_000)),
       action: RemoteActionType.KILL_AGENT,
+      reason: "Phigon AI (Destructive commands): Codex ran rm -rf on the build folder.",
     });
     const [result, repeated] = await Promise.all([executor.execute(command), executor.execute(command)]);
     assert.deepEqual(repeated, result);
     assert.equal(result.state, RemoteActionResultState.SUCCEEDED);
     assert.equal(result.resultCode, "process_stopped");
     assert.equal(result.targetStillRunning, false);
+    // The person at the computer is told once, in plain words.
+    assert.deepEqual(notices, [{
+      title: "Codex was force-stopped by Phigon",
+      body: "Phigon AI (Destructive commands): Codex ran rm -rf on the build folder.",
+    }]);
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
   }

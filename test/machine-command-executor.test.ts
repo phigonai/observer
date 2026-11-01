@@ -7,7 +7,8 @@ import { join, resolve, sep } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { timestampFromDate } from "@bufbuild/protobuf/wkt";
 import { AgentActionCommandSchema, RemoteActionType as Action, RemoteActionResultState as State } from "../src/generated/phigon/v1/action_pb.js";
-import { MachineCommandExecutor, parseCommand, powerCommand, redactCommandOutput, runCommand, pruneCommandReceipts } from "../src/machine-command-executor.js";
+import { MachineCommandExecutor, parseCommand, powerCommand, programName, redactCommandOutput, runCommand, pruneCommandReceipts } from "../src/machine-command-executor.js";
+import { UserNotices, type UserNotice } from "../src/user-notices.js";
 
 test("receipt cleanup removes only expired recognized records and preserves unrelated files", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-receipt-retention-"));
@@ -29,9 +30,13 @@ test("remote command enrollment, exact request binding, and durable replay", asy
   const command = create(AgentActionCommandSchema, { actionId: randomUUID(), idempotencyKey: randomUUID(), machineId: machineID, agentId: "__machine__", processId: 0n, action: Action.RUN_COMMAND, expiresAt: timestampFromDate(new Date(Date.now() + 60_000)), reason: "Test harmless command", commandJson: JSON.stringify({ executable: process.execPath, arguments: ["-e", "require('node:fs').appendFileSync(process.argv[1], 'x'); console.log('verified: 42')", marker], timeout_seconds: 5 }) });
   const disabled = new MachineCommandExecutor({ enabled: false, machineID, dataDirectory: directory });
   assert.equal((await disabled.execute(command)).state, State.REJECTED);
-  const executor = new MachineCommandExecutor({ enabled: true, machineID, dataDirectory: directory });
+  const notices: UserNotice[] = [];
+  const executor = new MachineCommandExecutor({ enabled: true, machineID, dataDirectory: directory,
+    notices: new UserNotices({ enabled: true, send: async (notice) => { notices.push(notice); } }) });
   const [first, repeated] = await Promise.all([executor.execute(command), executor.execute(command)]);
   assert.equal(first.state, State.SUCCEEDED); assert.equal(first.exitCode, 0); assert.match(first.output, /verified: 42/u);
+  // The person at the computer is told once that Phigon ran something there.
+  assert.deepEqual(notices, [{ title: `Phigon ran ${programName(process.execPath)} on this computer`, body: "Test harmless command" }]);
   assert.deepEqual(repeated, first); assert.equal(await readFile(marker, "utf8"), "x");
   const restarted = new MachineCommandExecutor({ enabled: true, machineID, dataDirectory: directory });
   assert.deepEqual(await restarted.execute(command), first);
@@ -84,9 +89,12 @@ test("an executable the OS refuses to start gets a durable failure receipt, not 
   const machineID = randomUUID();
   const command = create(AgentActionCommandSchema, { actionId: randomUUID(), idempotencyKey: randomUUID(), machineId: machineID, agentId: "__machine__", processId: 0n,
     action: Action.RUN_COMMAND, expiresAt: timestampFromDate(new Date(Date.now() + 60_000)), commandJson: JSON.stringify({ executable, arguments: [], timeout_seconds: 5 }) });
-  const executor = new MachineCommandExecutor({ enabled: true, machineID, dataDirectory: directory });
+  const notices: UserNotice[] = [];
+  const executor = new MachineCommandExecutor({ enabled: true, machineID, dataDirectory: directory,
+    notices: new UserNotices({ enabled: true, send: async (notice) => { notices.push(notice); } }) });
   const first = await executor.execute(command);
   assert.equal(first.state, State.FAILED); assert.equal(first.resultCode, "command_not_started");
+  assert.deepEqual(notices, [], "nothing ran, so there is nothing to tell");
   assert.deepEqual(await new MachineCommandExecutor({ enabled: true, machineID, dataDirectory: directory }).execute(command), first);
 });
 

@@ -17,6 +17,7 @@ import { defaultProcessTreeControl, describeTreeOutcome, type ProcessTreeControl
 import { MachineCommandExecutor, machineActionTypes, pruneCommandReceipts } from "./machine-command-executor.js";
 import { atomicReplace } from "./atomic-replace.js";
 import type { RunningAgents } from "./system-inspection.js";
+import { noticeAgentName, type UserNotices } from "./user-notices.js";
 
 const executorVersion = "observer-agent-actions-v3";
 const receiptLimit = 256;
@@ -38,6 +39,7 @@ export class AgentActionExecutor {
   #queue: Promise<unknown> = Promise.resolve();
   readonly #claimsDirectory: string;
   readonly #processes: ProcessTreeControl;
+  readonly #notices: UserNotices | undefined;
   #latestInventory: { inventory: AgentInventory; at: number } | undefined;
 
   constructor(options: {
@@ -47,8 +49,11 @@ export class AgentActionExecutor {
     dataDirectory: string;
     inventory: ActionInventoryProvider;
     processControl?: ProcessTreeControl;
+    /** Tells the person at this computer what Phigon did. */
+    notices?: UserNotices;
   }) {
     this.#enabled = options.enabled;
+    this.#notices = options.notices;
     this.#processes = options.processControl ?? defaultProcessTreeControl();
     this.#machineID = options.machineID;
     this.#inventory = options.inventory;
@@ -57,6 +62,7 @@ export class AgentActionExecutor {
     this.#commands = new MachineCommandExecutor({
       enabled: this.#commandsEnabled, machineID: options.machineID, dataDirectory: options.dataDirectory,
       agents: () => this.#runningAgents(),
+      ...(options.notices === undefined ? {} : { notices: options.notices }),
     });
     this.#receipts = new ActionReceiptStore(
       join(options.dataDirectory, "agent-action-receipts.json"),
@@ -240,6 +246,12 @@ export class AgentActionExecutor {
       ...base, state, resultCode, detail, targetStillRunning, observedAt: timestampFromDate(new Date()),
     });
     await this.#receipts.put(receipt, digest, timestampDate(command.expiresAt).toISOString());
+    if (state === RemoteActionResultState.SUCCEEDED) {
+      this.#notices?.agentStopped({
+        key: command.actionId, agent: noticeAgentName(target.displayName),
+        forced: command.action === RemoteActionType.KILL_AGENT, reason: command.reason,
+      });
+    }
     return receipt;
   }
 }

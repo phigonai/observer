@@ -175,6 +175,7 @@ Settings are environment variables. The most common ones:
 | `PHIGON_<AGENT>_ACTIVITY_DIRS` | Extra record folders for an agent, e.g. `PHIGON_CLAUDE_ACTIVITY_DIRS`. |
 | `PHIGON_REMOTE_ACTIONS_ENABLED` | Opt in to administrator-approved agent stop and force stop. Off by default. |
 | `PHIGON_REMOTE_COMMANDS_ENABLED` | Opt in to administrator-reviewed system operations. Off by default. |
+| `PHIGON_USER_NOTICES` | Set to `false` to stop telling the person at the computer when Phigon stops an agent, runs a command or restarts it. On by default. |
 | `PHIGON_UPDATE_CHECK` | Set to `false` to turn off the once-a-day update check. |
 | `PHIGON_LOG_LEVEL` | Logging detail. |
 
@@ -213,8 +214,9 @@ Remote actions are off on every computer by default.
   A stop acts on one exact process lifetime (process ID plus start time, checked
   again just before anything is sent) and the child processes it started.
   Graceful stop sends `SIGTERM` on Linux and macOS; on Windows it asks the
-  agent's windows to close, and for a console agent, which Windows can only
-  end by force, it sends nothing and reports `graceful_stop_unsupported`.
+  agent's windows to close, and for a console agent it presses Ctrl+C in its
+  terminal, but only when nothing else shares that terminal; otherwise it
+  sends nothing and reports `terminal_shared`.
   Force stop is approved separately. Receipts say when the process had already
   exited, access was denied, or the agent or a child is still running. It does
   not enable shell access, file access, screen capture or general remote
@@ -228,6 +230,15 @@ Remote actions are off on every computer by default.
   space on the main drive, the observer version, and each running agent's
   name, process ID, CPU share, memory and run time, measured once over half a
   second. It never includes file contents, environment values or command lines.
+
+Whenever Phigon stops an agent on a computer, whether someone asked, Phigon AI
+decided or the agent is blocked, the person at that computer sees a system
+notification such as "Claude Code was stopped by Phigon", with the reason. The
+same goes for commands Phigon runs and a scheduled restart or shutdown. It uses
+the system's own notifications (a Windows toast, macOS Notification Center, or
+`notify-send` on Linux) and shows nothing when the observer runs without a
+desktop session, for example as a Windows service. `PHIGON_USER_NOTICES=false`
+turns it off.
 
 ## Guardian: checks before an agent acts
 
