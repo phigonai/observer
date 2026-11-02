@@ -5,6 +5,7 @@ import { claudeActivityAdapter } from "../src/activity/adapters/claude.js";
 import { clineActivityAdapter } from "../src/activity/adapters/cline.js";
 import { codexActivityAdapter } from "../src/activity/adapters/codex.js";
 import { copilotActivityAdapter } from "../src/activity/adapters/copilot.js";
+import { createOpenAICompatibleAdapter } from "../src/activity/adapters/openai-compatible.js";
 import { copilotChatActivityAdapter } from "../src/activity/adapters/copilot-chat.js";
 import { cursorActivityAdapter } from "../src/activity/adapters/cursor.js";
 import { factoryDroidActivityAdapter } from "../src/activity/adapters/factory-droid.js";
@@ -1089,6 +1090,47 @@ test("Claude injected user-turn text is not reported as a user prompt", () => {
     },
   }, context);
   assert.ok(injectedResult.some((draft) => draft.payload.case === "tool"));
+});
+
+test("Claude and OpenAI-style adapters forget the oldest of too many unanswered tool calls", () => {
+  const config = loadConfig({});
+  const context = {
+    sessionId: "session-unanswered-tools",
+    observedAt,
+    policy: new LocalPolicyEngine(config.policy),
+  };
+  const resultName = (drafts: readonly ActivityDraft[]) => {
+    const tool = drafts.find((draft) => draft.payload.case === "tool");
+    return tool?.payload.case === "tool" ? tool.payload.value.toolName : undefined;
+  };
+  const claude = {
+    request: (id: string) => claudeActivityAdapter.parse({
+      type: "assistant",
+      message: { role: "assistant", content: [{ type: "tool_use", id, name: `claude_${id}`, input: {} }] },
+    }, context),
+    result: (id: string) => resultName(claudeActivityAdapter.parse({
+      type: "user",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "ok" }] },
+    }, context)),
+  };
+  const compatibleAdapter = createOpenAICompatibleAdapter("generic-test", AgentKind.GENERIC, "Test agent");
+  const compatible = {
+    request: (id: string) => compatibleAdapter.parse({
+      role: "assistant",
+      tool_calls: [{ id, function: { name: `compatible_${id}`, arguments: "{}" } }],
+    }, context),
+    result: (id: string) => resultName(compatibleAdapter.parse({
+      role: "tool",
+      tool_call_id: id,
+      content: "ok",
+    }, context)),
+  };
+  for (const [prefix, adapter] of [["claude", claude], ["compatible", compatible]] as const) {
+    for (let index = 0; index <= 4_096; index++) adapter.request(`unanswered-${prefix}-${index}`);
+    // The oldest name was let go; the newest is still known.
+    assert.equal(adapter.result(`unanswered-${prefix}-0`), "tool");
+    assert.equal(adapter.result(`unanswered-${prefix}-4096`), `${prefix}_unanswered-${prefix}-4096`);
+  }
 });
 
 test("Copilot CLI session events become prompts, replies, commands, and file events", () => {

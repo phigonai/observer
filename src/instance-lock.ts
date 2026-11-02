@@ -3,6 +3,7 @@ import { mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { uptime } from "node:os";
 import { join } from "node:path";
 import { makeDirectoryPrivate } from "./private-directory.js";
+import { defaultProcessSampler } from "./system-inspection.js";
 
 const lockFileName = "observer.lock";
 // A lock file that is still empty or partly written may belong to an
@@ -10,6 +11,11 @@ const lockFileName = "observer.lock";
 const unreadableLockGraceMs = 10_000;
 // Clock and uptime rounding between the lock's time and the boot time.
 const bootToleranceMs = 60_000;
+// Between the operating system's start time for a process and the time the
+// observer wrote to its lock: start-up before Node's clock begins, the
+// one-second resolution of ps, and small clock corrections.
+const processStartToleranceMs = 10_000;
+const processStartReadTimeoutMs = 15_000;
 
 type LockRecord = Readonly<{ pid: number; started_at: string }>;
 
@@ -18,6 +24,11 @@ export type InstanceLockOptions = Readonly<{
   /** When this process started; written to the lock for diagnosis. */
   startedAt?: Date;
   isAlive?: (pid: number) => boolean;
+  /**
+   * When the running process with this ID started, in epoch milliseconds,
+   * or null when the operating system does not say.
+   */
+  processStartedAt?: (pid: number) => Promise<number | null>;
   /** When the computer last started, in epoch milliseconds. */
   bootedAt?: () => number;
   now?: () => number;
@@ -31,8 +42,9 @@ export class ObserverAlreadyRunningError extends Error {}
  * spool, cursors and saved state.
  *
  * The lock is a file created with the exclusive `wx` flag that names the
- * holder's process ID and start time. A lock whose process is gone, or that
- * was taken before the computer last started, is stale and is taken over.
+ * holder's process ID and start time. A lock whose process is gone, that was
+ * taken before the computer last started, or whose process ID now belongs to
+ * a process that started at another time, is stale and is taken over.
  */
 export class InstanceLock {
   readonly #path: string;
@@ -56,6 +68,7 @@ export class InstanceLock {
     const startedAt = options.startedAt ??
       new Date(Date.now() - Math.round(process.uptime() * 1_000));
     const isAlive = options.isAlive ?? processIsAlive;
+    const processStartedAt = options.processStartedAt ?? readProcessStartedAt;
     const bootedAt = options.bootedAt ?? (() => Date.now() - uptime() * 1_000);
     const now = options.now ?? Date.now;
     const path = join(dataDirectory, lockFileName);
@@ -91,7 +104,8 @@ export class InstanceLock {
         }
       } else if (
         Date.parse(holder.started_at) >= bootedAt() - bootToleranceMs &&
-        isAlive(holder.pid)
+        isAlive(holder.pid) &&
+        !(await processIDReused(holder, processStartedAt))
       ) {
         throw alreadyRunning(path, holder);
       }
@@ -162,6 +176,38 @@ function parseLock(raw: string): LockRecord | undefined {
     return undefined;
   }
   return { pid: value.pid, started_at: value.started_at };
+}
+
+/**
+ * After a hard kill the operating system can give the holder's process ID to
+ * an unrelated program. When its start time cannot be read, the holder is
+ * taken to be still running.
+ */
+async function processIDReused(
+  holder: LockRecord,
+  processStartedAt: (pid: number) => Promise<number | null>,
+): Promise<boolean> {
+  let startedAt: number | null;
+  try {
+    startedAt = await processStartedAt(holder.pid);
+  } catch {
+    return false;
+  }
+  return startedAt !== null && Number.isFinite(startedAt) &&
+    Math.abs(startedAt - Date.parse(holder.started_at)) > processStartToleranceMs;
+}
+
+async function readProcessStartedAt(pid: number): Promise<number | null> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), processStartReadTimeoutMs);
+  });
+  try {
+    const sample = await Promise.race([defaultProcessSampler()([pid], 0), timeout]);
+    return sample?.before.get(pid)?.startedAt ?? null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function processIsAlive(pid: number): boolean {

@@ -58,6 +58,7 @@ import {
   fileReadThrough,
   type ActivitySource,
   type SourceFailure,
+  type SourceRecord,
 } from "./source-reader.js";
 import { bridgeWritingSuffix, ingestedBridgeFile } from "./ingest.js";
 import { closedJournalSegments } from "../bridge-journal.js";
@@ -192,6 +193,21 @@ type CollectionPass = Readonly<{
   discoveredFiles: number;
 }>;
 
+type ConvertedRecord = Readonly<{
+  events: readonly EventEnvelope[];
+  /** Normalized drafts, which the rate limit counts. */
+  drafts: number;
+  oversized: number;
+}>;
+
+const sourceIdentityFailureKey = "agent identities";
+
+/** The kind of an error, never its message, which may quote a record. */
+function errorName(error: unknown): string {
+  const name = error instanceof Error ? error.name : "";
+  return /^[A-Za-z][A-Za-z0-9]{0,63}$/u.test(name) ? name : "unknown error";
+}
+
 export class ActivityCollector {
   readonly #config: ObserverConfig;
   readonly #credential: StoredMachineCredential;
@@ -210,6 +226,9 @@ export class ActivityCollector {
   readonly #onDeliveryRefused: (error: unknown) => void;
   readonly #onSourceFailure: (failure: SourceFailure) => void;
   readonly #reportedFailures = new WeakSet<SourceFailure>();
+  // Failures in a row of record conversion, per adapter, and of saving
+  // source identities. The keys are a fixed, small set.
+  readonly #collectionFailures = new Map<string, number>();
   #registeredSourcesFailing = false;
   #deliveryRefused = false;
   #refusedDeliveries = 0;
@@ -420,87 +439,27 @@ export class ActivityCollector {
     for (const record of scan.records) {
       const adapter = adapters.get(record.adapterId);
       if (adapter === undefined) continue;
-      const sessionID = reportedSessionID(
-        record.adapterId,
-        record.value,
-        record.sourceId,
-      );
-      const drafts = adapter.parse(record.value, {
-        sessionId: sessionID,
-        observedAt: record.observedAt,
-        policy: this.#policy,
-      });
-      const context = {
-        sessionId: sessionID,
-        observedAt: recordObservedAt(
-          record.value,
-          record.observedAt,
-        ),
-        policy: this.#policy,
-      };
-      const genericAgent = record.adapterId === "generic"
-        ? reportedGenericAgentIdentity(
-          record.value,
-          record.sourceDisplayName,
-        )
-        : undefined;
-      const nativeDraft = vendorDraft(
-        adapter.agentKind,
-        context,
-        genericAgent?.hint !== undefined
-          ? genericAgent.hint
-          : adapter.id,
-        vendorType(record.value),
-        record.value,
-      );
-      const candidateDrafts = [nativeDraft, ...drafts.slice(0, 31)];
-      const permittedDrafts =
-        !historical && record.initialReplay === true &&
-        this.#config.activityInitialReplayMode === "messages"
-          ? candidateDrafts.filter((draft) =>
-              draft.payload.case === "activity" &&
-              (
-                draft.payload.value.kind === ActivityKind.PROMPT ||
-                draft.payload.value.kind === ActivityKind.RESPONSE
-              )
-            )
-          : candidateDrafts;
+      let converted: ConvertedRecord;
+      try {
+        converted = this.#convertRecord(record, adapter, historical, now);
+      } catch (error) {
+        // A record this observer cannot convert is skipped like a malformed
+        // one: reading it again would fail the same way, and stopping
+        // would end collection from every source.
+        this.#malformedRecords++;
+        this.#reportCollectionFailure(
+          record.adapterId,
+          `one record could not be converted and was skipped (${errorName(error)})`,
+        );
+        continue;
+      }
+      this.#collectionFailures.delete(record.adapterId);
+      this.#oversizedEvents += converted.oversized;
       // A source record is atomic: never advance its cursor after dropping
       // part of its normalized activity. One record may use the final budget
       // plus a bounded burst; the next scan waits for replenishment.
-      if (!historical) this.#limiter.consume(now, permittedDrafts.length);
-      for (const [draftIndex, draft] of permittedDrafts.entries()) {
-        const nextSequence = this.#lastSequence + 1n;
-        const event = create(EventEnvelopeSchema, {
-          tenantId: this.#credential.tenantId,
-          machineId: this.#credential.machineId,
-          agentId: this.#agentID(
-            draft.agentKind,
-            record.adapterId,
-            record.sourceId,
-            record.value,
-            record.observedAt,
-            genericAgent?.displayName,
-          ),
-          sessionId: draft.sessionId,
-          sequence: nextSequence,
-          observedAt: timestampFromDate(
-            clampObservedAt(draft.observedAt, now),
-          ),
-          schemaVersion: 1,
-          privacyClass: draft.privacyClass,
-          sourceEventId: createHash("sha256")
-            .update(`${record.sourceRecordId}\u0000${draftIndex}\u0000${draft.payload.case}`)
-            .digest("hex"),
-          payload: draft.payload,
-        });
-        if (
-          toBinary(EventEnvelopeSchema, event).byteLength >
-          maxEnvelopeBytes
-        ) {
-          this.#oversizedEvents++;
-          continue;
-        }
+      if (!historical) this.#limiter.consume(now, converted.drafts);
+      for (const event of converted.events) {
         try {
           this.#emit(event);
         } catch (error) {
@@ -519,7 +478,7 @@ export class ActivityCollector {
             { cause: error },
           );
         }
-        this.#lastSequence = nextSequence;
+        this.#lastSequence = event.sequence;
         this.#emittedEvents++;
       }
     }
@@ -549,6 +508,119 @@ export class ActivityCollector {
       sourceRecords: scan.metrics.records,
       discoveredFiles: scan.metrics.discoveredFiles,
     };
+  }
+
+  /**
+   * The events for one source record, numbered from the next sequence, and
+   * how many normalized drafts they came from. Throws when the record cannot
+   * be converted; nothing is emitted for it then.
+   */
+  #convertRecord(
+    record: SourceRecord,
+    adapter: VendorActivityAdapter,
+    historical: boolean,
+    now: Date,
+  ): ConvertedRecord {
+    const sessionID = reportedSessionID(
+      record.adapterId,
+      record.value,
+      record.sourceId,
+    );
+    const drafts = adapter.parse(record.value, {
+      sessionId: sessionID,
+      observedAt: record.observedAt,
+      policy: this.#policy,
+    });
+    const context = {
+      sessionId: sessionID,
+      observedAt: recordObservedAt(
+        record.value,
+        record.observedAt,
+      ),
+      policy: this.#policy,
+    };
+    const genericAgent = record.adapterId === "generic"
+      ? reportedGenericAgentIdentity(
+        record.value,
+        record.sourceDisplayName,
+      )
+      : undefined;
+    const nativeDraft = vendorDraft(
+      adapter.agentKind,
+      context,
+      genericAgent?.hint !== undefined
+        ? genericAgent.hint
+        : adapter.id,
+      vendorType(record.value),
+      record.value,
+    );
+    const candidateDrafts = [nativeDraft, ...drafts.slice(0, 31)];
+    const permittedDrafts =
+      !historical && record.initialReplay === true &&
+      this.#config.activityInitialReplayMode === "messages"
+        ? candidateDrafts.filter((draft) =>
+            draft.payload.case === "activity" &&
+            (
+              draft.payload.value.kind === ActivityKind.PROMPT ||
+              draft.payload.value.kind === ActivityKind.RESPONSE
+            )
+          )
+        : candidateDrafts;
+    const events: EventEnvelope[] = [];
+    let oversized = 0;
+    for (const [draftIndex, draft] of permittedDrafts.entries()) {
+      const event = create(EventEnvelopeSchema, {
+        tenantId: this.#credential.tenantId,
+        machineId: this.#credential.machineId,
+        agentId: this.#agentID(
+          draft.agentKind,
+          record.adapterId,
+          record.sourceId,
+          record.value,
+          record.observedAt,
+          genericAgent?.displayName,
+        ),
+        sessionId: draft.sessionId,
+        sequence: this.#lastSequence + 1n + BigInt(events.length),
+        observedAt: timestampFromDate(
+          clampObservedAt(draft.observedAt, now),
+        ),
+        schemaVersion: 1,
+        privacyClass: draft.privacyClass,
+        sourceEventId: createHash("sha256")
+          .update(`${record.sourceRecordId}\u0000${draftIndex}\u0000${draft.payload.case}`)
+          .digest("hex"),
+        payload: draft.payload,
+      });
+      if (
+        toBinary(EventEnvelopeSchema, event).byteLength >
+        maxEnvelopeBytes
+      ) {
+        oversized++;
+        continue;
+      }
+      events.push(event);
+    }
+    return { events, drafts: permittedDrafts.length, oversized };
+  }
+
+  /**
+   * Says that collection work keeps failing, at the 1st, 2nd, 4th, 8th...
+   * failure in a row, so it stays visible without flooding the log. The
+   * message never includes activity content.
+   */
+  #reportCollectionFailure(key: string, message: string): void {
+    const failures = (this.#collectionFailures.get(key) ?? 0) + 1;
+    this.#collectionFailures.set(key, failures);
+    if ((failures & (failures - 1)) !== 0) return;
+    const now = this.#clock();
+    this.#onSourceFailure(Object.freeze({
+      adapterId: key,
+      failures,
+      message,
+      failedAt: now,
+      retryAt: now,
+    }));
   }
 
   async run(signal: AbortSignal): Promise<void> {
@@ -826,15 +898,31 @@ export class ActivityCollector {
       capabilities: ["activity", "source-isolated", "unattributed"],
     });
     this.#sourceIdentities.set(agentID, identity);
+    // An identity that could not be saved is forgotten, so the source's
+    // next record saves it again.
+    const forget = (error: unknown): never => {
+      if (this.#sourceIdentities.get(agentID) === identity) {
+        this.#sourceIdentities.delete(agentID);
+      }
+      throw error;
+    };
+    let save: Promise<void>;
     try {
-      this.#sourceIdentitySaves.push(
-        Promise.resolve(this.#onSourceIdentity(identity)),
-      );
+      save = Promise.resolve(this.#onSourceIdentity(identity)).catch(forget);
     } catch (error) {
-      this.#sourceIdentitySaves.push(Promise.reject(error));
+      save = Promise.reject(error).catch(forget);
     }
+    // Handled here too: a scan that stops early leaves the save for the
+    // next flush, and an unhandled rejection would end the process.
+    save.catch(() => undefined);
+    this.#sourceIdentitySaves.push(save);
   }
 
+  /**
+   * Waits for the identity saves this scan started. A failed save is
+   * reported and retried with a later record; it never stops collection,
+   * because the events already carry the agent ID.
+   */
   async #flushSourceIdentitySaves(): Promise<void> {
     const pending = this.#sourceIdentitySaves.splice(0);
     if (pending.length === 0) return;
@@ -843,7 +931,17 @@ export class ActivityCollector {
       (result): result is PromiseRejectedResult =>
         result.status === "rejected",
     );
-    if (failure !== undefined) throw failure.reason;
+    if (failure === undefined) {
+      this.#collectionFailures.delete(sourceIdentityFailureKey);
+      return;
+    }
+    const reason: unknown = failure.reason;
+    this.#reportCollectionFailure(
+      sourceIdentityFailureKey,
+      (reason instanceof Error ? reason.message : String(reason))
+        .replace(/\s+/gu, " ")
+        .slice(0, 200),
+    );
   }
 }
 

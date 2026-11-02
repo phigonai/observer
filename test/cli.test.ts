@@ -22,6 +22,7 @@ import {
 } from "../src/cli.js";
 import { FileActionPolicyStore } from "../src/action-policy.js";
 import { FileCredentialStore } from "../src/credential-store.js";
+import { InstanceLock } from "../src/instance-lock.js";
 import { CustomAgentRegistry } from "../src/custom-agent-registry.js";
 import { StreamStateStore } from "../src/stream-state.js";
 import { create } from "@bufbuild/protobuf";
@@ -975,6 +976,71 @@ test("remove-machine unregisters the paired machine before clearing its credenti
       credentialRemoved: true,
     });
   } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("remove-machine refuses while an observer is running and sends no request", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-cli-remove-running-"));
+  const credential = `phg_m_${"l".repeat(43)}`;
+  let requests = 0;
+  const server = createServer((_request, response) => {
+    requests++;
+    response.writeHead(204);
+    response.end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const running = await InstanceLock.acquire(directory);
+  try {
+    const address = server.address();
+    assert.ok(address !== null && typeof address === "object");
+    const origin = `http://127.0.0.1:${address.port}`;
+    const store = new FileCredentialStore(directory);
+    await store.save({
+      machineId: "machine-remove-running",
+      tenantId: "tenant-remove-running",
+      credential,
+      controlPlaneOrigin: origin,
+      createdAt: "2026-08-09T00:00:00.000Z",
+    });
+    const spoolPath = join(directory, "telemetry-spool.jsonl");
+    await writeFile(spoolPath, "encrypted fixture\n", "utf8");
+    const environment = {
+      PHIGON_CONTROL_PLANE_URL: origin,
+      PHIGON_DATA_DIR: directory,
+    };
+    let stderr = "";
+    const refused = await run(["remove-machine", "--yes", "--json"], environment, {
+      stdout: () => undefined,
+      stderr: (value) => {
+        stderr += value;
+      },
+    });
+    assert.equal(refused, 1);
+    assert.match(stderr, /observer is running with this data directory/u);
+    assert.match(stderr, /stop its service/u);
+    assert.doesNotMatch(stderr, new RegExp(credential, "u"));
+    assert.equal(requests, 0);
+    assert.equal((await store.load())?.credential, credential);
+    assert.equal(await readFile(spoolPath, "utf8"), "encrypted fixture\n");
+
+    // Once the observer stops, removal goes ahead and leaves no lock behind.
+    await running.release();
+    const removed = await run(["remove-machine", "--yes", "--json"], environment, {
+      stdout: () => undefined,
+      stderr: () => undefined,
+    });
+    assert.equal(removed, 0);
+    assert.equal(requests, 1);
+    assert.equal(await store.load(), null);
+    await assert.rejects(readFile(join(directory, "observer.lock"), "utf8"), {
+      code: "ENOENT",
+    });
+  } finally {
+    await running.release();
     await new Promise<void>((resolve, reject) => {
       server.close((error) => error ? reject(error) : resolve());
     });

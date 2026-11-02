@@ -25,22 +25,19 @@ export async function negotiateNativeCapabilities(
   const bounded = requested
     .slice(0, 64)
     .map((name) => normalizeName(name));
-  for (const specifier of [
-    "@phigon/native",
-    new URL("../../../../native/index.js", import.meta.url).href,
-  ]) {
-    try {
-      const loaded = await importer(specifier);
-      const module = nativeModule(loaded);
-      if (module === null) continue;
+  // Only by package name: the observer is published on its own, and a
+  // development checkout links the package in (see verify-adapters).
+  try {
+    const module = nativeModule(await importer("@phigon/native"));
+    if (module !== null) {
       const capabilities = module
         .negotiateCapabilities(bounded)
         .slice(0, 64)
         .map(validateCapability);
       return { nativeLoaded: true, capabilities };
-    } catch {
-      // Try the next packaged or repository-local native binding.
     }
+  } catch {
+    // Not installed, or not built for this platform.
   }
   return {
     nativeLoaded: false,

@@ -25,6 +25,9 @@ import type {
   VendorActivityAdapter,
 } from "../types.js";
 
+// A tool call whose result never arrives must not stay in memory forever.
+const maxTrackedToolCalls = 4_096;
+
 export function createOpenAICompatibleAdapter(
   id: string,
   agentKind: AgentKind,
@@ -113,7 +116,13 @@ export function createOpenAICompatibleAdapter(
           const name =
             stringField(call, "name") ||
             String(nestedField(call, "function", "name") ?? "tool");
-          if (callID !== "") toolNames.set(callID, name);
+          if (callID !== "") {
+            toolNames.set(callID, name);
+            if (toolNames.size > maxTrackedToolCalls) {
+              const oldest = toolNames.keys().next().value;
+              if (oldest !== undefined) toolNames.delete(oldest);
+            }
+          }
           drafts.push(...toolDrafts(agentKind, observedContext, {
             invocationId: callID,
             toolName: name,

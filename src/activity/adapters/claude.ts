@@ -24,6 +24,9 @@ import type {
   VendorActivityAdapter,
 } from "../types.js";
 
+// A tool call whose result never arrives must not stay in memory forever.
+const maxTrackedToolCalls = 4_096;
+
 class ClaudeActivityAdapter implements VendorActivityAdapter {
   readonly id = "claude";
   readonly agentKind = AgentKind.CLAUDE;
@@ -93,7 +96,13 @@ class ClaudeActivityAdapter implements VendorActivityAdapter {
         if (blockType === "tool_use") {
           const id = stringField(item, "id");
           const name = stringField(item, "name") || "tool";
-          if (id !== "") this.#toolNames.set(id, name);
+          if (id !== "") {
+            this.#toolNames.set(id, name);
+            if (this.#toolNames.size > maxTrackedToolCalls) {
+              const oldest = this.#toolNames.keys().next().value;
+              if (oldest !== undefined) this.#toolNames.delete(oldest);
+            }
+          }
           drafts.push(...toolDrafts(this.agentKind, observedContext, {
             invocationId: id,
             toolName: name,

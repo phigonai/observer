@@ -26,6 +26,29 @@ test("on Windows the data directory is restricted to its owner and SYSTEM, and n
   }
 });
 
+test("on Windows the owner is granted by account SID, so an account name icacls cannot look up still works", { skip: process.platform !== "win32" }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-private-sid-"));
+  // A service account such as LocalSystem sees names like these.
+  const saved = { domain: process.env["USERDOMAIN"], name: process.env["USERNAME"] };
+  process.env["USERDOMAIN"] = "WORKGROUP";
+  process.env["USERNAME"] = "PHIGON-TEST-NO-SUCH-ACCOUNT$";
+  try {
+    await makeDirectoryPrivate(directory);
+  } finally {
+    for (const [key, value] of [["USERDOMAIN", saved.domain], ["USERNAME", saved.name]] as const) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+  try {
+    const acl = aclFor(directory);
+    assert.match(acl, new RegExp(`${process.env["USERNAME"]}`, "iu"));
+    assert.doesNotMatch(acl, /Everyone|Authenticated Users|BUILTIN\\Users/u);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("storing a credential leaves it in a private directory", { skip: process.platform !== "win32" }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-private-credential-"));
   try {

@@ -9,6 +9,7 @@ import {
 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
+import { atomicReplace } from "./atomic-replace.js";
 
 export type StoredMachineCredential = Readonly<{
   machineId: string;
@@ -33,10 +34,15 @@ export const credentialFileName = "machine-credential.json";
 export class FileCredentialStore implements CredentialStore {
   readonly #dataDirectory: string;
   readonly #credentialPath: string;
+  readonly #rename: typeof rename;
 
-  constructor(dataDirectory: string) {
+  constructor(
+    dataDirectory: string,
+    options: Readonly<{ rename?: typeof rename }> = {},
+  ) {
     this.#dataDirectory = dataDirectory;
     this.#credentialPath = join(dataDirectory, credentialFileName);
+    this.#rename = options.rename ?? rename;
   }
 
   async save(value: StoredMachineCredential): Promise<void> {
@@ -50,7 +56,9 @@ export class FileCredentialStore implements CredentialStore {
         `${JSON.stringify(value)}\n`,
         { encoding: "utf8", flag: "wx", mode: 0o600 },
       );
-      await rename(temporaryPath, this.#credentialPath);
+      // Windows refuses a rename while antivirus or an indexer holds the
+      // file open; atomicReplace waits briefly and tries again.
+      await atomicReplace(temporaryPath, this.#credentialPath, this.#rename);
       await chmod(this.#credentialPath, 0o600);
     } catch (error) {
       try {

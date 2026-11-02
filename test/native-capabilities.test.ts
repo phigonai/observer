@@ -3,13 +3,17 @@ import test from "node:test";
 import { negotiateNativeCapabilities } from "../src/activity/native-capabilities.js";
 
 test("native capability negotiation fails closed when the module is absent", async () => {
+  const requested: string[] = [];
   const report = await negotiateNativeCapabilities(
     ["macOS Endpoint Security", "unknown"],
-    async () => {
+    async (specifier) => {
+      requested.push(specifier);
       throw new Error("not installed");
     },
   );
 
+  // Only the package: the published observer has nothing outside itself.
+  assert.deepEqual(requested, ["@phigon/native"]);
   assert.equal(report.nativeLoaded, false);
   assert.ok(report.capabilities.every((item) => !item.available));
   assert.ok(

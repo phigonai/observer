@@ -69,6 +69,56 @@ test("a lock left by a stopped process or before a restart is taken over", async
   }
 });
 
+test("a lock whose process ID now belongs to another program is taken over", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-instance-lock-reused-"));
+  const path = join(directory, "observer.lock");
+  const now = Date.now();
+  const bootedAt = () => now - 86_400_000;
+  try {
+    // This test's own process ID, alive, but recorded with a start time an
+    // hour before this process really started: an observer killed an hour
+    // ago whose ID was handed to another program.
+    await writeFile(path, JSON.stringify({
+      pid: process.pid,
+      started_at: new Date(now - process.uptime() * 1_000 - 3_600_000).toISOString(),
+    }));
+    const lock = await InstanceLock.acquire(directory, { bootedAt });
+    assert.equal(JSON.parse(await readFile(path, "utf8")).pid, process.pid);
+    await lock.release();
+
+    // A start time that matches, or one the system will not give, keeps
+    // the holder.
+    const startedAt = new Date(now - 60_000).toISOString();
+    await writeFile(path, JSON.stringify({ pid: 424_242, started_at: startedAt }));
+    for (const reading of [now - 60_500, null]) {
+      await assert.rejects(
+        InstanceLock.acquire(directory, {
+          isAlive: () => true,
+          bootedAt,
+          processStartedAt: () => Promise.resolve(reading),
+        }),
+        ObserverAlreadyRunningError,
+      );
+    }
+    await assert.rejects(
+      InstanceLock.acquire(directory, {
+        isAlive: () => true,
+        bootedAt,
+        processStartedAt: () => Promise.reject(new Error("unavailable")),
+      }),
+      ObserverAlreadyRunningError,
+    );
+    const takenOver = await InstanceLock.acquire(directory, {
+      isAlive: () => true,
+      bootedAt,
+      processStartedAt: () => Promise.resolve(now - 5_000),
+    });
+    await takenOver.release();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("releasing never removes a lock another observer took over", async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-instance-lock-owner-"));
   const path = join(directory, "observer.lock");

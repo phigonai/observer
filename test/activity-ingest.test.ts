@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import {
+  mkdir,
   mkdtemp,
   readFile,
   readdir,
   rm,
   stat,
+  writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -46,6 +49,61 @@ test("activity bridge stores only valid bounded source records", async () => {
       assert.equal((await stat(target)).mode & 0o777, 0o600);
       assert.equal((await stat(root)).mode & 0o777, 0o700);
     }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("ingest deletes the oldest bridge files once they pass the byte or file limit", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-ingest-cap-"));
+  try {
+    const bridges = join(directory, "bridges");
+    await mkdir(join(bridges, "cursor"), { recursive: true });
+    await mkdir(join(bridges, "generic"), { recursive: true });
+    // Files left while no observer ran, oldest first, across two bridges.
+    const name = (time: number) => `${time}-${randomUUID()}.jsonl`;
+    const oldest = join(bridges, "cursor", name(1_000));
+    const stillWriting = join(bridges, "generic", name(2_000));
+    const older = join(bridges, "generic", name(3_000));
+    const newer = join(bridges, "cursor", name(4_000));
+    for (const path of [oldest, stillWriting, older, newer]) {
+      await writeFile(path, `${"x".repeat(99)}\n`);
+    }
+    await writeFile(`${stillWriting}.writing`, "");
+    const unrelated = join(bridges, "generic", "guardian-decisions.jsonl");
+    await writeFile(unrelated, `${"x".repeat(999)}\n`);
+
+    const record = `${JSON.stringify({ role: "user", content: "x" })}\n`;
+    const ingest = (limits: Readonly<{ maxBytes?: number; maxFiles?: number }>) =>
+      ingestActivityJSONL({
+        agent: "cursor",
+        dataDirectory: directory,
+        input: Readable.from([record]),
+        limits,
+      });
+    const exists = (path: string) => stat(path).then(() => true, () => false);
+
+    // Five ingest files against a limit of four: only the oldest goes.
+    await ingest({ maxFiles: 4 });
+    assert.deepEqual(
+      await Promise.all([oldest, stillWriting, older, newer].map(exists)),
+      [false, true, true, true],
+    );
+    // 358 bytes against 260: the oldest file that is not still being
+    // written goes, and that is enough.
+    await ingest({ maxBytes: 260 });
+    assert.deepEqual(
+      await Promise.all([stillWriting, older, newer].map(exists)),
+      [true, false, true],
+    );
+    // Journals and the run's own file are never deleted for the limit.
+    assert.ok(await exists(unrelated));
+    await ingest({ maxBytes: 1 });
+    const left = (await readdir(join(bridges, "cursor"))).length +
+      (await readdir(join(bridges, "generic"))).length;
+    // The writing file, its marker, the journal and the newest run's file.
+    assert.equal(left, 4);
+    assert.ok(await exists(stillWriting));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

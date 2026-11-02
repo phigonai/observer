@@ -41,8 +41,20 @@ const flushAfterBytes = 1 << 20;
 const compactAfterDeadBytes = 1 << 20;
 const scopedIDPattern = /^[A-Za-z0-9._:-]{1,128}$/u;
 const retiredPairingsDirectory = "retired-pairings";
-// Each retired spool can be as large as the spool budget.
+const damagedSpoolsDirectory = "damaged-spools";
+// Each retired or damaged spool can be as large as the spool budget.
 const retainedRetiredPairings = 3;
+
+/**
+ * What `restore` did instead of loading the spool as it was:
+ * - `other_machine`: an earlier pairing's spool, moved to `directory`.
+ * - `damaged`: a spool that could not be read, moved to `directory`.
+ * - `over_capacity`: more events than the queue holds; the newest were kept
+ *   and `dropped` of the oldest were left out.
+ */
+export type SpoolRestoreNotice =
+  | Readonly<{ reason: "other_machine" | "damaged"; directory: string }>
+  | Readonly<{ reason: "over_capacity"; dropped: number }>;
 
 type SpoolScope = Readonly<{
   tenantID: string;
@@ -163,16 +175,26 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
   }
 
   /**
-   * Loads the spool for this machine. A spool that an earlier pairing of
-   * this data directory left for another machine cannot be delivered as
-   * this one: it is moved aside with its stream cursor instead of stopping
-   * the observer, and the returned directory says where it went.
+   * Loads the spool for this machine. None of these stops the observer, and
+   * the returned notice says which one happened:
+   * - A spool that an earlier pairing of this data directory left for
+   *   another machine cannot be delivered as this one: it is moved aside
+   *   with its stream cursor.
+   * - A spool that is too large to read safely, or holds a record that does
+   *   not verify before its last line, is moved aside on its own and the
+   *   queue starts empty. Its events were written before their sources'
+   *   checkpoints moved, so they are not read again; the moved copy keeps
+   *   them for an administrator.
+   * - A spool with more events than the queue holds, as after lowering
+   *   PHIGON_ACTIVITY_QUEUE_CAPACITY, keeps the newest events, as a full
+   *   queue does while running. The control plane records the skipped
+   *   sequence numbers as a gap.
    */
   restore(
     tenantID: string,
     machineID: string,
     credential: string,
-  ): string | undefined {
+  ): SpoolRestoreNotice | undefined {
     validateScope(tenantID, machineID);
     if (!credential.startsWith("phg_m_") || credential.length > 256) {
       throw new Error("Telemetry spool credential is invalid.");
@@ -195,26 +217,36 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
       if (!existsSync(this.#path)) return undefined;
       const metadata = statSync(this.#path);
       if (!metadata.isFile() || metadata.size > this.#maxBytes) {
-        throw new Error("Telemetry spool exceeds its safe storage bound.");
+        return this.#setAsideDamaged();
       }
       const restored = new BoundedEventQueue<EventEnvelope>(this.metrics().capacity);
       const raw = readFileSync(this.#path, "utf8");
       // Every record names its machine in plain text, so another machine's
-      // spool is told apart from a damaged one, which still stops here.
+      // spool is told apart from a damaged one.
       const owner = spoolOwner(raw);
       if (
         owner !== undefined &&
         (owner.tenantID !== tenantID || owner.machineID !== machineID)
       ) {
         this.#size = undefined;
-        return retirePairingState(this.#dataDirectory, owner.machineID);
+        const directory = retirePairingState(this.#dataDirectory, owner.machineID);
+        return directory === undefined
+          ? undefined
+          : { reason: "other_machine", directory };
       }
       const lines = raw.split("\n");
       const completeLines = lines.slice(0, -1);
-      for (const line of completeLines) {
-        if (line.length === 0) continue;
-        const record = parseRecord(line, scope);
-        this.#restoreRecord(record, restored, Buffer.byteLength(line) + 1);
+      // Events left out because the queue was full, until a later record
+      // acknowledges or discards them.
+      const dropped = new Set<bigint>();
+      try {
+        for (const line of completeLines) {
+          if (line.length === 0) continue;
+          const record = parseRecord(line, scope);
+          this.#restoreRecord(record, restored, Buffer.byteLength(line) + 1, dropped);
+        }
+      } catch {
+        return this.#setAsideDamaged();
       }
       if (!raw.endsWith("\n") && (lines.at(-1)?.length ?? 0) > 0) {
         // A crash can leave only the final write incomplete. Its records
@@ -224,7 +256,9 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
       const sizes = this.#writeCompactedQueue(restored);
       this.replaceState(restored);
       this.reweigh(sizes);
-      return undefined;
+      const acknowledged = restored.metrics().acknowledged;
+      const lost = [...dropped].filter((sequence) => sequence > acknowledged).length;
+      return lost === 0 ? undefined : { reason: "over_capacity", dropped: lost };
     } catch (error) {
       this.#scope = undefined;
       this.#key = undefined;
@@ -297,6 +331,7 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
     record: SpoolRecord,
     target: BoundedEventQueue<EventEnvelope>,
     bytes: number,
+    dropped: Set<bigint>,
   ): void {
     const sequence = parseSequence(record.sequence);
     if (record.operation === "acknowledge") {
@@ -305,13 +340,35 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
     }
     if (record.operation === "discard") {
       target.discard(sequence);
+      dropped.delete(sequence);
       return;
     }
     const event = this.#decrypt(record);
-    if (!target.canEnqueue(record.coalesce_key)) {
-      throw new Error("Telemetry spool contains more events than the configured queue capacity.");
+    if (
+      sequence > target.metrics().acknowledged &&
+      !target.canEnqueue(record.coalesce_key)
+    ) {
+      // A full queue makes room by leaving out its oldest event.
+      const oldest = target.metrics().oldestSequence;
+      if (oldest !== undefined) dropped.add(oldest);
     }
     target.enqueue(event, sequence, record.coalesce_key, bytes);
+  }
+
+  /** Moves an unreadable spool aside so the queue can start empty. */
+  #setAsideDamaged(): SpoolRestoreNotice {
+    this.#size = undefined;
+    removeSpoolFiles(this.#dataDirectory, false);
+    const directory = moveAside(
+      this.#dataDirectory,
+      damagedSpoolsDirectory,
+      "damaged",
+      [spoolFileName],
+    );
+    if (directory === undefined) {
+      throw new Error("Telemetry spool disappeared while it was being moved aside.");
+    }
+    return { reason: "damaged", directory };
   }
 
   #encryptedRecord(
@@ -567,24 +624,42 @@ export function retirePairingState(
   extraFiles: readonly string[] = [],
 ): string | undefined {
   removeSpoolFiles(dataDirectory, false);
-  const present = [spoolFileName, streamStateFileName, ...extraFiles]
-    .filter((name) => existsSync(join(dataDirectory, name)));
+  return moveAside(
+    dataDirectory,
+    retiredPairingsDirectory,
+    machineID ?? "unknown",
+    [spoolFileName, streamStateFileName, ...extraFiles],
+  );
+}
+
+/**
+ * Moves the `names` that exist into a new `<rootName>/<time>-<label>-*`
+ * directory and keeps only the newest few such directories. Returns the new
+ * directory, or undefined when there was nothing to move.
+ */
+function moveAside(
+  dataDirectory: string,
+  rootName: string,
+  label: string,
+  names: readonly string[],
+): string | undefined {
+  const present = names.filter((name) => existsSync(join(dataDirectory, name)));
   if (present.length === 0) return undefined;
-  const root = join(dataDirectory, retiredPairingsDirectory);
+  const root = join(dataDirectory, rootName);
   mkdirSync(root, { recursive: true, mode: 0o700 });
   chmodSync(root, 0o700);
   // The time first, so names sort oldest first; Windows refuses ":" in names.
   const stamp = new Date().toISOString().replace(/[:.]/gu, "-");
-  const label = (machineID ?? "unknown").replace(/[^A-Za-z0-9._-]/gu, "_");
-  const destination = mkdtempSync(join(root, `${stamp}-${label}-`));
+  const safeLabel = label.replace(/[^A-Za-z0-9._-]/gu, "_");
+  const destination = mkdtempSync(join(root, `${stamp}-${safeLabel}-`));
   for (const name of present) {
     atomicReplaceSync(join(dataDirectory, name), join(destination, name));
   }
-  const retired = readdirSync(root, { withFileTypes: true })
+  const kept = readdirSync(root, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name)
     .sort();
-  for (const name of retired.slice(0, -retainedRetiredPairings)) {
+  for (const name of kept.slice(0, -retainedRetiredPairings)) {
     rmSync(join(root, name), { recursive: true, force: true });
   }
   return destination;
