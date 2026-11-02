@@ -10,7 +10,7 @@
     "url": "git+https://github.com/phigonai/observer.git"
   },
   "bin": {
-    "phigon-observer": "dist/src/cli.js"
+    "phigon-observer": "dist/src/entry.js"
   },
   "files": [
     "dist/src",
@@ -24,7 +24,7 @@
     "THIRD_PARTY_NOTICES.md"
   ],
   "engines": {
-    "node": ">=24.0.0"
+    "node": ">=24.5.0"
   },
   "scripts": {
     "build": "node scripts/build.mjs",

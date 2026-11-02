@@ -2,8 +2,9 @@
 
 import { create, toJsonString } from "@bufbuild/protobuf";
 import { timestampDate, timestampFromDate } from "@bufbuild/protobuf/wkt";
-import { constants, realpathSync } from "node:fs";
+import { constants, readFileSync, realpathSync } from "node:fs";
 import { access, readFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import type { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
@@ -29,9 +30,11 @@ import { ingestActivityJSONL } from "./activity/ingest.js";
 import {
   consentedCollectionPolicy,
   contentOutsideProfileMessage,
+  dataDirectoryFrom,
   loadConfig,
   DEFAULT_CONTROL_PLANE_ORIGIN,
   type CollectionPolicy,
+  type ObserverConfig,
 } from "./config.js";
 import { FileCredentialStore } from "./credential-store.js";
 import {
@@ -67,9 +70,12 @@ import {
   type ConsentProfile,
 } from "./pair.js";
 import { removeMachine } from "./remove-machine.js";
-import { forgetServerAuthority, parseAuthorityFingerprint, pinServerAuthority } from "./server-authority.js";
+import { forgetServerAuthority, parseAuthorityFingerprint, pinServerAuthority, trustAuthority } from "./server-authority.js";
+import { readServiceSettings, startService, stopService, uninstallService } from "./service.js";
+import { runServiceCommand, serviceContext, type ServiceDependencies } from "./service-command.js";
+import { purgeDataDirectory, removeEmptyDataDirectory } from "./purge.js";
 import { hasByteHeadroom } from "./event-queue.js";
-import { InstanceLock, ObserverAlreadyRunningError } from "./instance-lock.js";
+import { InstanceLock, ObserverAlreadyRunningError, processIsAlive } from "./instance-lock.js";
 import { clearEventSpool } from "./event-spool.js";
 import { GuardianDecisionJournal } from "./guardian-decision-journal.js";
 import {
@@ -91,6 +97,23 @@ import { StreamStateStore } from "./stream-state.js";
 import { connectionEnvironment } from "./connection-config.js";
 import { latestObserverVersion, newerVersion, offerObserverUpdate } from "./update.js";
 import { UserNotices } from "./user-notices.js";
+import {
+  defaultMaxDeliveryAgeMinutes,
+  formatDoctorCheck,
+  runDoctorCheck,
+} from "./doctor-check.js";
+import {
+  proxyForUrl,
+  proxySettings,
+  useProxyFromEnvironment,
+  type ProxySetup,
+} from "./proxy.js";
+import {
+  RotatingLogFile,
+  levelledOutput,
+  logLevelFrom,
+  type LevelledOutput,
+} from "./observer-log.js";
 
 type Output = Readonly<{
   stdout: (value: string) => void;
@@ -107,8 +130,17 @@ export async function run(
   environment: NodeJS.ProcessEnv = process.env,
   output: Output = defaultOutput,
   input: Readable = process.stdin,
+  dependencies: ServiceDependencies = {},
 ): Promise<number> {
   const [command, ...flags] = argv;
+  let logged: LevelledOutput | undefined;
+  // A background service runs `run --service-settings <file>`; the file
+  // sits in the data directory and holds the settings it was installed with.
+  const serviceSettingsFile = command === "run" ? flagValue(flags, "--service-settings") : undefined;
+  const ownEnvironment = environment === process.env;
+  if (serviceSettingsFile !== undefined) {
+    environment = { ...environment, PHIGON_DATA_DIR: dirname(resolve(serviceSettingsFile)) };
+  }
 
   if (command === "--version" || command === "-v" || command === "version") {
     output.stdout(`${await readVersion()}\n`);
@@ -131,20 +163,51 @@ export async function run(
     command !== "pair" &&
     command !== "remove-machine" &&
     command !== "unpair" &&
+    command !== "service" &&
     command !== "run"
   ) {
     output.stderr(`Unknown command: ${command}\n\n${helpText()}`);
     return 2;
   }
 
+  if (command === "run") {
+    // A background service throws away what it prints, so `run` also keeps
+    // a log file in the data directory, at PHIGON_LOG_LEVEL.
+    const log = new RotatingLogFile(dataDirectoryFrom(environment), {
+      onFailure: (message) => output.stderr(message),
+    });
+    logged = levelledOutput(output, logLevelFrom(environment["PHIGON_LOG_LEVEL"]), log);
+    output = logged;
+  }
+
+  let callerEnvironment = environment;
+  let proxy: ProxySetup | undefined;
   try {
+    if (serviceSettingsFile !== undefined) {
+      const settings = await readServiceSettings(serviceSettingsFile);
+      environment = { ...environment, ...settings, PHIGON_DATA_DIR: dirname(resolve(serviceSettingsFile)) };
+      if (ownEnvironment) {
+        // PATH (to find agents) and the proxy variables (for grpc-js) are
+        // read from the process itself.
+        Object.assign(process.env, settings);
+      }
+      callerEnvironment = environment;
+      trustExtraCertificates(settings["NODE_EXTRA_CA_CERTS"], output);
+    }
     environment = command === "update" ? { PHIGON_DATA_DIR:environment["PHIGON_DATA_DIR"] } : await connectionEnvironment(environment, command === "pair" || command === "run" || command === "doctor" ? flags : []);
     const config = loadConfig(
       observabilityEnvironment(command, flags, environment),
     );
+    // Every HTTPS call and the telemetry stream go through the proxy that
+    // HTTPS_PROXY, HTTP_PROXY and NO_PROXY name, when there is one.
+    proxy = useProxyFromEnvironment(callerEnvironment, { streamUrl: config.grpcUrl });
+    if (proxy.notice !== undefined) output.stderr(`${proxy.notice}\n`);
     const version = await readVersion();
     const json = flags.includes("--json");
-    const interactive = input === process.stdin && process.stdin.isTTY === true && process.stdout.isTTY === true && !json;
+    // A background service has a console under conhost on Windows, but nobody
+    // reads it: it never prompts.
+    const interactive = input === process.stdin && process.stdin.isTTY === true && process.stdout.isTTY === true && !json &&
+      serviceSettingsFile === undefined;
     if (command === "update" || (interactive && (command === "pair" || command === "run") && environment["PHIGON_UPDATE_CHECK"] !== "false")) {
       const latest = await latestObserverVersion(config.dataDirectory, { force: command === "update" });
       if (command === "update" && (json || flags.includes("--check"))) {
@@ -162,6 +225,10 @@ export async function run(
     const customAgentRegistry = new CustomAgentRegistry(
       config.dataDirectory,
     );
+
+    if (command === "service") {
+      return await runServiceCommand(flags, config, callerEnvironment, output, json, dependencies);
+    }
 
     if (command === "guardian") {
       const subcommand = flags[0] ?? "status";
@@ -463,6 +530,9 @@ export async function run(
     }
 
     if (command === "remove-machine" || command === "unpair") {
+      if (flags.includes("--purge")) {
+        return await removeMachineAndPurge(config, callerEnvironment, flags, json, output, input, dependencies);
+      }
       const credentialStore = new FileCredentialStore(config.dataDirectory);
       const credential = await credentialStore.load();
       if (credential === null) {
@@ -482,8 +552,9 @@ export async function run(
         if (!(error instanceof ObserverAlreadyRunningError)) throw error;
         throw new Error(
           "A Phigon observer is running with this data directory. Stop it, " +
-            "or stop its service, and then run remove-machine again. No " +
-            "request was sent.",
+            "or stop its service (phigon-observer service uninstall), and then " +
+            "run remove-machine again; remove-machine --purge stops the service " +
+            "itself. No request was sent.",
         );
       }
       let result: Awaited<ReturnType<typeof removeMachine>>;
@@ -539,6 +610,21 @@ export async function run(
       const stop = () => controller.abort();
       process.once("SIGINT", stop);
       process.once("SIGTERM", stop);
+      // On Windows the service runs the observer under conhost, and ending
+      // the scheduled task ends only conhost; stop with it.
+      // A service's console can disappear before the observer has stopped;
+      // writing to it must not end the process, the log keeps the message.
+      const ignoreConsoleError = () => undefined;
+      if (serviceSettingsFile !== undefined) {
+        process.stdout.on("error", ignoreConsoleError);
+        process.stderr.on("error", ignoreConsoleError);
+      }
+      const stopWatchingParent = serviceSettingsFile !== undefined && process.platform === "win32"
+        ? watchParentProcess(process.ppid, () => {
+          output.stdout("The background service stopped, so the observer stops too.\n");
+          controller.abort();
+        })
+        : undefined;
       let instanceLock: InstanceLock | undefined;
       try {
         const credential = await new FileCredentialStore(
@@ -580,6 +666,10 @@ export async function run(
         // Before any queued activity, cursor or saved state is read. A
         // signal only aborts the tasks, so `finally` releases the lock.
         instanceLock = await InstanceLock.acquire(config.dataDirectory);
+        logged?.debug(
+          `Observer ${version} started for machine ${credential.machineId} ` +
+            `with the ${config.observabilityProfile} profile, using ${config.dataDirectory}.\n`,
+        );
         let effectivePolicy = intersectCollectionPolicy(
           config.policy,
           credential.consentProfile,
@@ -777,8 +867,17 @@ export async function run(
           notices: userNotices,
           onStatus: (message) => output.stdout(`${message}\n`),
         });
+        // Being stopped before the stream first connects is a normal stop.
+        const streamReady = async (): Promise<bigint | undefined> => {
+          try {
+            return await client.waitUntilReady(controller.signal);
+          } catch (error) {
+            if (controller.signal.aborted) return undefined;
+            throw error;
+          }
+        };
         const monitoring = (async () => {
-          await client.waitUntilReady(controller.signal);
+          if (await streamReady() === undefined) return;
           while (!controller.signal.aborted) {
             try {
               await processMonitor.review(latestDiscoveryInventory, controller.signal);
@@ -790,9 +889,8 @@ export async function run(
           }
         })();
         const collecting = (async () => {
-          const allocationSequence = await client.waitUntilReady(
-            controller.signal,
-          );
+          const allocationSequence = await streamReady();
+          if (allocationSequence === undefined) return;
           collector = new ActivityCollector({
             config,
             credential,
@@ -893,6 +991,9 @@ export async function run(
       } finally {
         process.removeListener("SIGINT", stop);
         process.removeListener("SIGTERM", stop);
+        stopWatchingParent?.();
+        process.stdout.removeListener("error", ignoreConsoleError);
+        process.stderr.removeListener("error", ignoreConsoleError);
         await instanceLock?.release();
       }
       return 0;
@@ -925,7 +1026,9 @@ export async function run(
         }
       }
       if (authority !== undefined) {
-        await pinServerAuthority(config.controlPlaneUrl, authority, config.dataDirectory);
+        await pinServerAuthority(config.controlPlaneUrl, authority, config.dataDirectory, undefined, {
+          proxy: proxyForUrl(config.controlPlaneUrl, proxySettings(callerEnvironment)),
+        });
       }
       let result: Awaited<ReturnType<typeof pairMachine>>;
       try {
@@ -950,6 +1053,15 @@ export async function run(
       return 0;
     }
 
+    if (flags.includes("--check")) {
+      const report = await runDoctorCheck({
+        config,
+        observerVersion: version,
+        maxDeliveryAgeMinutes: parseMaxDeliveryAge(flagValue(flags, "--max-delivery-age")),
+      });
+      output.stdout(json ? `${JSON.stringify(report, null, 2)}\n` : formatDoctorCheck(report));
+      return report.exitCode;
+    }
     const storedCredential = await new FileCredentialStore(
       config.dataDirectory,
     ).load();
@@ -986,8 +1098,10 @@ export async function run(
     return 0;
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error.";
-    output.stderr(`Observer command failed: ${message}\n`);
+    (logged?.error ?? output.stderr)(`Observer command failed: ${message}\n`);
     return 1;
+  } finally {
+    proxy?.restore();
   }
 }
 
@@ -1245,6 +1359,40 @@ async function runGuardedCommand(
   } finally { lifetime.abort(); await bridge?.close(); }
 }
 
+/**
+ * Calls `onGone` once the process `pid` has exited, checking every few
+ * seconds. Returns a function that stops watching.
+ */
+export function watchParentProcess(
+  pid: number,
+  onGone: () => void,
+  intervalMs = 5_000,
+  isAlive: (pid: number) => boolean = processIsAlive,
+): () => void {
+  const timer = setInterval(() => {
+    if (pid > 0 && isAlive(pid)) return;
+    clearInterval(timer);
+    onGone();
+  }, intervalMs);
+  timer.unref();
+  return () => clearInterval(timer);
+}
+
+/**
+ * NODE_EXTRA_CA_CERTS from the service settings. Node.js reads the variable
+ * only when it starts, so the service adds those authorities itself.
+ */
+function trustExtraCertificates(file: string | undefined, output: Output): void {
+  if (file === undefined || file === "") return;
+  try {
+    const certificates = readFileSync(file, "utf8")
+      .match(/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/gu) ?? [];
+    for (const certificate of certificates) trustAuthority(`${certificate}\n`);
+  } catch {
+    output.stderr(`The certificates in NODE_EXTRA_CA_CERTS (${file}) could not be read; HTTPS uses the system's authorities only.\n`);
+  }
+}
+
 export async function settleObserverTasks(
   tasks: readonly Promise<void>[],
   controller: AbortController,
@@ -1334,16 +1482,20 @@ function helpText(): string {
     "  phigon-observer agent list [--json]",
     "  phigon-observer agent remove --id <id> [--yes] [--json]",
     "  phigon-observer doctor [--profile <metadata|full>] [--json]",
+    "  phigon-observer doctor --check [--max-delivery-age <minutes>] [--json]",
     "  phigon-observer update [--check] [--yes] [--json]",
     "  phigon-observer --version",
     "  phigon-observer discover [--json]",
     "  phigon-observer ingest --agent <agent-id|custom> [--name <agent-name>] [--quiet] [--json]",
     "  phigon-observer pair --code <one-time-code> --consent-profile <metadata|full> [--control-plane-url <url> --grpc-url <url> [--server-ca-sha256 <fingerprint>]] [--name <machine-name>] [--accept-consent] [--json]",
-    "  phigon-observer remove-machine [--yes] [--json]",
+    "  phigon-observer remove-machine [--purge] [--yes] [--json]",
     "  phigon-observer run [--profile <metadata|full>]",
+    "  phigon-observer service install [--profile <metadata|full>] [--json]",
+    "  phigon-observer service uninstall [--json]",
+    "  phigon-observer service status [--json]",
     "  phigon-observer help",
     "",
-    "The doctor command validates local configuration without transmitting data.",
+    "The doctor command validates local configuration without transmitting data. With --check it also probes the control plane and exits non-zero when something needs attention: 3 not paired, 4 consent missing or outdated, 5 observer not running, 6 nothing delivered within --max-delivery-age minutes (default 15), 7 control plane unreachable.",
     "The agent commands manage dynamic local monitoring definitions for custom agents without changing observer code.",
     "The authorize-action command is a fail-closed decision point for managed gateways; it does not intercept actions performed outside that boundary. Stop/force-stop requires an administrator policy and exact process identity.",
     "The optional Guardian context file supplies bounded task_id, user_prompt, agent_plan, justification, and recent_activity fields for semantic review.",
@@ -1353,8 +1505,9 @@ function helpText(): string {
     "The discover command reports a sanitized one-time local inventory.",
     "The ingest command accepts NDJSON on stdin for every supported bridge; use --agent custom --name <agent-name> for any other agent.",
     "The pair command shows the selected collection scope, requires machine-owner acceptance, and stores that evidence with the mode-0600 credential.",
-    "The remove-machine command stops collection on this paired machine and revokes its credential; activity already collected stays until an administrator deletes the machine or it expires. It requires local confirmation.",
+    "The remove-machine command stops collection on this paired machine and revokes its credential; activity already collected stays until an administrator deletes the machine or it expires. It requires local confirmation. With --purge it also removes the background service and every file the observer keeps in the data directory.",
     "The run command maintains an authenticated, resumable telemetry stream; --profile applies the same portable local collection profile on Windows, macOS, and Linux.",
+    "The service commands run the observer in the background for the signed-in user (a Task Scheduler task, a LaunchAgent or a systemd user unit) with this data directory and these settings, starting it at sign-in and again if it stops. Install needs a paired computer with the owner's consent.",
     "",
   ].join("\n");
 }
@@ -1430,6 +1583,126 @@ function formatPairResult(
           "This computer was paired as a new machine. Activity the earlier machine had not delivered was moved to the retired-pairings folder in the data directory.",
         ]),
     "",
+  ].join("\n");
+}
+
+/**
+ * `remove-machine --purge`: the usual removal, then the background service
+ * and every file the observer keeps on this computer. The company's copy of
+ * the activity is not touched; only an administrator or retention removes it.
+ */
+async function removeMachineAndPurge(
+  config: ObserverConfig,
+  environment: NodeJS.ProcessEnv,
+  flags: readonly string[],
+  json: boolean,
+  output: Output,
+  input: Readable,
+  dependencies: ServiceDependencies,
+): Promise<number> {
+  const credentialStore = new FileCredentialStore(config.dataDirectory);
+  const credential = await credentialStore.load();
+  if (json && !flags.includes("--yes")) {
+    throw new Error("JSON machine removal requires --yes after reviewing the removal scope.");
+  }
+  if (!flags.includes("--yes")) {
+    output.stdout(purgePrompt(credential?.machineId, config.dataDirectory));
+    if (await readConfirmation(input) !== "remove") {
+      throw new Error("Machine removal was not confirmed. Nothing was changed.");
+    }
+  }
+  // The service would restart the observer this removes, so stop it first,
+  // and start it again if the removal fails.
+  let service: ReturnType<typeof serviceContext> | undefined;
+  try {
+    service = serviceContext(config, environment, dependencies);
+  } catch {
+    // No background service on this system; there is nothing to stop.
+  }
+  const serviceStopped = service !== undefined && await stopService(service);
+  const restartService = async () => {
+    if (serviceStopped && service !== undefined) await startService(service).catch(() => undefined);
+  };
+  if (serviceStopped) await waitForObserverToStop(config.dataDirectory, dependencies.stopTimeoutMs ?? 15_000);
+  let removalLock: InstanceLock;
+  try {
+    removalLock = await InstanceLock.acquire(config.dataDirectory);
+  } catch (error) {
+    await restartService();
+    if (!(error instanceof ObserverAlreadyRunningError)) throw error;
+    throw new Error(
+      "A Phigon observer is running with this data directory. Stop it, or stop its service, " +
+        "and then run remove-machine again. No request was sent.",
+    );
+  }
+  let result: Awaited<ReturnType<typeof removeMachine>> | undefined;
+  let purged: Awaited<ReturnType<typeof purgeDataDirectory>>;
+  try {
+    if (credential !== null) {
+      try {
+        result = await removeMachine({
+          config,
+          credential,
+          clearCredential: async () => {
+            clearEventSpool(config.dataDirectory);
+            await forgetServerAuthority(config.dataDirectory);
+            return await credentialStore.clear();
+          },
+        });
+      } catch (error) {
+        await removalLock.release();
+        await restartService();
+        throw error;
+      }
+    }
+    if (service !== undefined) await uninstallService(service);
+    purged = await purgeDataDirectory(config.dataDirectory, ["observer.lock"]);
+  } finally {
+    await removalLock.release();
+  }
+  const directoryRemoved = purged.leftBehind.length === 0 &&
+    await removeEmptyDataDirectory(config.dataDirectory);
+  const local = {
+    serviceRemoved: serviceStopped,
+    filesRemoved: purged.removed,
+    dataDirectory: config.dataDirectory,
+    dataDirectoryRemoved: directoryRemoved,
+    leftBehind: purged.leftBehind,
+  };
+  output.stdout(json
+    ? `${JSON.stringify({ ...(result ?? { status: "not_paired" }), purged: local }, null, 2)}\n`
+    : [
+        ...(result === undefined
+          ? ["This computer was not paired, so nothing was sent to a workspace."]
+          : [formatRemoveMachineResult(result).trimEnd()]),
+        `Background service: ${serviceStopped ? "removed" : "was not installed"}`,
+        directoryRemoved
+          ? `Local data: removed, with ${config.dataDirectory}`
+          : `Local data: removed from ${config.dataDirectory}${purged.leftBehind.length === 0 ? "" : `; ${purged.leftBehind.length} file(s) the observer did not create were left there`}`,
+        "To remove the program too, run: npm uninstall --global @phigon/observer",
+        "",
+      ].join("\n"));
+  return 0;
+}
+
+async function waitForObserverToStop(dataDirectory: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline && (await InstanceLock.inspect(dataDirectory)).running) {
+    await delay(250);
+  }
+}
+
+function purgePrompt(machineId: string | undefined, dataDirectory: string): string {
+  return [
+    "Remove this computer from Phigon and delete its local data?",
+    ...(machineId === undefined ? ["This computer is not paired."] : [
+      `Machine: ${machineId}`,
+      "Collection stops at once and this computer's observer key is revoked.",
+      "Activity already collected stays with your company until an administrator deletes this computer or it expires under the retention policy.",
+    ]),
+    "The background service is removed, and every file the observer keeps in",
+    `${dataDirectory} is deleted, including activity not yet delivered.`,
+    'Type "remove" to continue: ',
   ].join("\n");
 }
 
@@ -1620,8 +1893,8 @@ function observabilityEnvironment(
 ): NodeJS.ProcessEnv {
   const profile = flagValue(flags, "--profile");
   if (profile === undefined) return environment;
-  if (command !== "doctor" && command !== "run") {
-    throw new Error("--profile is supported only by doctor and run.");
+  if (command !== "doctor" && command !== "run" && !(command === "service" && flags[0] === "install")) {
+    throw new Error("--profile is supported only by doctor, run and service install.");
   }
   if (profile !== "metadata" && profile !== "full") {
     throw new Error("--profile must be metadata or full.");
@@ -1630,6 +1903,15 @@ function observabilityEnvironment(
     ...environment,
     PHIGON_OBSERVABILITY_PROFILE: profile,
   };
+}
+
+function parseMaxDeliveryAge(value: string | undefined): number {
+  if (value === undefined) return defaultMaxDeliveryAgeMinutes;
+  const minutes = Number(value);
+  if (!/^\d{1,5}$/u.test(value) || minutes < 1 || minutes > 10_080) {
+    throw new Error("--max-delivery-age must be a number of minutes from 1 to 10080.");
+  }
+  return minutes;
 }
 
 function parseConsentProfile(value: string | undefined): ConsentProfile {

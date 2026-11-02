@@ -161,3 +161,39 @@ test("a lock is released when its process exits, and a killed holder's lock is t
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("inspect tells whether an observer holds the directory without touching the lock", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-instance-lock-inspect-"));
+  const path = join(directory, "observer.lock");
+  try {
+    assert.deepEqual(await InstanceLock.inspect(directory), { running: false });
+
+    const held = await InstanceLock.acquire(directory);
+    const holder = await InstanceLock.inspect(directory);
+    assert.equal(holder.running, true);
+    assert.equal(holder.pid, process.pid);
+    const content = await readFile(path, "utf8");
+    await held.release();
+    assert.deepEqual(await InstanceLock.inspect(directory), { running: false });
+
+    // A stale lock is reported as not running and left in place.
+    await writeFile(path, content);
+    assert.deepEqual(await InstanceLock.inspect(directory, { isAlive: () => false }), { running: false });
+    assert.equal(await readFile(path, "utf8"), content);
+    assert.deepEqual(
+      await InstanceLock.inspect(directory, { bootedAt: () => Date.now() + 3_600_000 }),
+      { running: false },
+    );
+    assert.deepEqual(
+      await InstanceLock.inspect(directory, { processStartedAt: async () => Date.parse("2001-01-01T00:00:00Z") }),
+      { running: false },
+    );
+
+    // A lock still being written counts as running for a few seconds.
+    await writeFile(path, "");
+    assert.deepEqual(await InstanceLock.inspect(directory), { running: true });
+    assert.deepEqual(await InstanceLock.inspect(directory, { now: () => Date.now() + 60_000 }), { running: false });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

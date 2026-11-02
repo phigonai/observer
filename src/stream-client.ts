@@ -74,6 +74,7 @@ import {
 } from "./generated/phigon/v1/telemetry_pb.js";
 import type { ServerClock } from "./server-clock.js";
 import { StreamStateStore } from "./stream-state.js";
+import { noProxyForAll } from "./proxy.js";
 
 type StreamStatePersistence = Pick<StreamStateStore, "load" | "save">;
 
@@ -81,6 +82,8 @@ const streamMethod =
   "/phigon.v1.ObserverService/StreamTelemetry";
 const maxMessageBytes = 1 << 20;
 const policyReceiptRefreshMs = 5 * 60 * 1_000;
+/** How often an unchanged checkpoint is saved again while connected. */
+export const streamStateRefreshMs = 60 * 1_000;
 
 export type ObserverStreamMetrics = Readonly<{
   reconnects: number;
@@ -112,6 +115,8 @@ export type StreamClientOptions = Readonly<{
   /** Learns the server's time from the timestamps on its replies. */
   serverClock?: ServerClock;
   handshakeTimeoutMs?: number;
+  /** How often an unchanged checkpoint is saved again; tests shorten it. */
+  stateRefreshMs?: number;
   responseTimeoutMs?: number;
 }>;
 
@@ -135,6 +140,8 @@ export class ObserverStreamClient {
     | ((command: HistorySyncCommand) => Promise<HistorySyncResult>)
     | undefined;
   #reconnects = 0;
+  /** When the stream checkpoint was last saved; 0 before the first save. */
+  #stateSavedAt = 0;
   #acknowledgements = 0;
   #lastAcknowledgedSequence = 0n;
   #pumpEvents: (() => void) | undefined;
@@ -144,12 +151,14 @@ export class ObserverStreamClient {
   #establishedSinceConnect = false;
   readonly #readyWaiters = new Set<(sequence: bigint) => void>();
   readonly #handshakeTimeoutMs: number;
+  readonly #stateRefreshMs: number;
   readonly #responseTimeoutMs: number;
   readonly #serverClock: ServerClock | undefined;
 
   constructor(options: StreamClientOptions) {
     this.#serverClock = options.serverClock;
     this.#handshakeTimeoutMs = options.handshakeTimeoutMs ?? 20_000;
+    this.#stateRefreshMs = options.stateRefreshMs ?? streamStateRefreshMs;
     this.#responseTimeoutMs = options.responseTimeoutMs ?? Math.max(30_000, options.config.heartbeatIntervalMs * 3);
     this.#config = options.config;
     this.#credentialStore =
@@ -324,6 +333,9 @@ export class ObserverStreamClient {
         "grpc.max_send_message_length": maxMessageBytes,
         "grpc.keepalive_time_ms": 300_000,
         "grpc.keepalive_timeout_ms": 10_000,
+        // grpc-js reads grpc_proxy and no_proxy itself, but cannot read a
+        // NO_PROXY of "*", which turns the proxy off for every host.
+        ...(noProxyForAll(process.env) ? { "grpc.enable_http_proxy": 0 } : {}),
       },
     );
     const metadata = new Metadata();
@@ -543,6 +555,7 @@ export class ObserverStreamClient {
               await this.#onAcknowledgement(next.sequence);
             }
             await this.#stateStore.save(credential.machineId, next.sequence);
+            this.#stateSavedAt = Date.now();
           });
           saveState = pendingSave;
           void pendingSave.catch((error: unknown) => {
@@ -720,6 +733,9 @@ export class ObserverStreamClient {
             if (state.recoveryPending && acknowledgedResume === undefined && sequence === this.#lastAcknowledgedSequence) {
               persistAcknowledgement(sequence, false);
             }
+            // The first acknowledgement answers the resume; later ones that
+            // repeat the checkpoint answer heartbeats.
+            const heartbeatAnswer = acknowledgedResume !== undefined;
             acknowledgedResume ??= sequence;
             if (sequence < this.#lastAcknowledgedSequence) {
               try {
@@ -755,6 +771,15 @@ export class ObserverStreamClient {
                 if (sent <= sequence) inFlightSequences.delete(sent);
               }
               persistAcknowledgement(sequence, true);
+            } else if (
+              heartbeatAnswer &&
+              sequence === this.#lastAcknowledgedSequence &&
+              Date.now() - this.#stateSavedAt >= this.#stateRefreshMs
+            ) {
+              // The server answers every heartbeat with its checkpoint. Saving
+              // it now and then, even unchanged, records that this computer
+              // is still in touch, which `doctor --check` reads.
+              persistAcknowledgement(sequence, false);
             }
 
             completeResume();

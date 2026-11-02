@@ -16,7 +16,7 @@ let processUserSID: string | null | undefined;
  * USERNAME does not resolve for every account: services that run as
  * LocalSystem or a virtual account see names icacls cannot look up.
  */
-function currentUserSID(): string | undefined {
+export function currentUserSID(): string | undefined {
   if (processUserSID === undefined) {
     processUserSID = null;
     try {

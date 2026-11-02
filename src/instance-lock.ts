@@ -36,6 +36,13 @@ export type InstanceLockOptions = Readonly<{
 
 export class ObserverAlreadyRunningError extends Error {}
 
+/** Who holds a data directory, from `InstanceLock.inspect`. */
+export type InstanceLockHolder = Readonly<{
+  running: boolean;
+  pid?: number;
+  startedAt?: string;
+}>;
+
 /**
  * Holds a data directory for one running observer. Two `run` processes on
  * one directory would reuse sequence numbers and overwrite each other's
@@ -102,11 +109,7 @@ export class InstanceLock {
         if (now() - modifiedMs < unreadableLockGraceMs) {
           throw alreadyRunning(path, undefined);
         }
-      } else if (
-        Date.parse(holder.started_at) >= bootedAt() - bootToleranceMs &&
-        isAlive(holder.pid) &&
-        !(await processIDReused(holder, processStartedAt))
-      ) {
+      } else if (await holderIsLive(holder, isAlive, processStartedAt, bootedAt)) {
         throw alreadyRunning(path, holder);
       }
       // Stale. Remove it only while it is still the lock that was judged
@@ -118,6 +121,42 @@ export class InstanceLock {
       }
     }
     throw alreadyRunning(path, undefined);
+  }
+
+  /**
+   * Whether an observer holds this data directory now, judged the way
+   * `acquire` judges it, without taking or removing the lock.
+   */
+  static async inspect(
+    dataDirectory: string,
+    options: InstanceLockOptions = {},
+  ): Promise<InstanceLockHolder> {
+    const isAlive = options.isAlive ?? processIsAlive;
+    const processStartedAt = options.processStartedAt ?? readProcessStartedAt;
+    const bootedAt = options.bootedAt ?? (() => Date.now() - uptime() * 1_000);
+    const now = options.now ?? Date.now;
+    const path = join(dataDirectory, lockFileName);
+    let existing: string;
+    try {
+      existing = await readFile(path, "utf8");
+    } catch (error) {
+      if (isNodeError(error) && error.code === "ENOENT") return { running: false };
+      throw error;
+    }
+    const holder = parseLock(existing);
+    if (holder === undefined) {
+      try {
+        // Still being written by an observer that is starting.
+        return { running: now() - (await stat(path)).mtimeMs < unreadableLockGraceMs };
+      } catch (error) {
+        if (isNodeError(error) && error.code === "ENOENT") return { running: false };
+        throw error;
+      }
+    }
+    const running = await holderIsLive(holder, isAlive, processStartedAt, bootedAt);
+    return running
+      ? { running, pid: holder.pid, startedAt: holder.started_at }
+      : { running };
   }
 
   async release(): Promise<void> {
@@ -178,6 +217,18 @@ function parseLock(raw: string): LockRecord | undefined {
   return { pid: value.pid, started_at: value.started_at };
 }
 
+/** A holder that started since the computer last started and still runs. */
+async function holderIsLive(
+  holder: LockRecord,
+  isAlive: (pid: number) => boolean,
+  processStartedAt: (pid: number) => Promise<number | null>,
+  bootedAt: () => number,
+): Promise<boolean> {
+  return Date.parse(holder.started_at) >= bootedAt() - bootToleranceMs &&
+    isAlive(holder.pid) &&
+    !(await processIDReused(holder, processStartedAt));
+}
+
 /**
  * After a hard kill the operating system can give the holder's process ID to
  * an unrelated program. When its start time cannot be read, the holder is
@@ -210,7 +261,7 @@ async function readProcessStartedAt(pid: number): Promise<number | null> {
   }
 }
 
-function processIsAlive(pid: number): boolean {
+export function processIsAlive(pid: number): boolean {
   try {
     // Signal 0 checks that the process exists without touching it.
     process.kill(pid, 0);
