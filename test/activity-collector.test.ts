@@ -21,6 +21,7 @@ import {
 } from "../src/activity/collector.js";
 import { JSONLSourceReader, type SourceFailure } from "../src/activity/source-reader.js";
 import { loadConfig } from "../src/config.js";
+import { loadContentConfig } from "./content-config.js";
 import {
   ActivityKind,
   AgentKind,
@@ -198,7 +199,7 @@ test("activity collector throttles without losing source records and resolves di
   const emitted: EventEnvelope[] = [];
   const surfacedSources: AgentIdentity[] = [];
   let now = new Date("2026-07-24T10:10:00.000Z");
-  const config = loadConfig({
+  const config = loadContentConfig({
     PHIGON_DATA_DIR: dataDirectory,
     PHIGON_ACTIVITY_REPLAY_ON_FIRST_START: "true",
     PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE: "3",
@@ -380,7 +381,7 @@ test("activity collector leaves source cursors untouched while delivery is backp
   const emitted: EventEnvelope[] = [];
   let hasCapacity = false;
   const collector = new ActivityCollector({
-    config: loadConfig({
+    config: loadContentConfig({
       PHIGON_DATA_DIR: join(directory, "data"),
       PHIGON_ACTIVITY_REPLAY_ON_FIRST_START: "true",
       PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE: "100",
@@ -426,7 +427,7 @@ test("multiple source identity saves preserve the first persistence failure", as
   await mkdir(sourceRoot, { recursive: true });
   let callbacks = 0;
   const collector = new ActivityCollector({
-    config: loadConfig({
+    config: loadContentConfig({
       PHIGON_DATA_DIR: join(directory, "data"),
       PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE: "100",
       PHIGON_COLLECT_VENDOR_PAYLOAD: "true",
@@ -491,7 +492,7 @@ test("activity collector replaces stale agent identities on inventory refresh", 
   );
   const emitted: EventEnvelope[] = [];
   const collector = new ActivityCollector({
-    config: loadConfig({
+    config: loadContentConfig({
       PHIGON_DATA_DIR: dataDirectory,
       PHIGON_ACTIVITY_REPLAY_ON_FIRST_START: "true",
       PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE: "100",
@@ -685,7 +686,7 @@ test("the default sources deliver Gemini CLI, Cline CLI, Cursor, Factory Droid, 
   );
   const emitted: EventEnvelope[] = [];
   const collector = new ActivityCollector({
-    config: loadConfig({
+    config: loadContentConfig({
       PHIGON_DATA_DIR: join(directory, "data"),
       PHIGON_ACTIVITY_REPLAY_ON_FIRST_START: "true",
       PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE: "600",
@@ -837,7 +838,7 @@ test("Copilot records without process evidence remain source-isolated", async ()
   );
   const emitted: EventEnvelope[] = [];
   const collector = new ActivityCollector({
-    config: loadConfig({
+    config: loadContentConfig({
       PHIGON_DATA_DIR: dataDirectory,
       PHIGON_ACTIVITY_REPLAY_ON_FIRST_START: "true",
       PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE: "100",
@@ -920,7 +921,7 @@ test("activity collector commits source progress only through a server acknowled
     })}\n`,
     "utf8",
   );
-  const config = loadConfig({
+  const config = loadContentConfig({
     PHIGON_DATA_DIR: dataDirectory,
     PHIGON_ACTIVITY_REPLAY_ON_FIRST_START: "true",
     PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE: "100",
@@ -990,7 +991,7 @@ test("activity collector can hand source progress to a durable delivery spool", 
     })}\n`,
     "utf8",
   );
-  const config = loadConfig({
+  const config = loadContentConfig({
     PHIGON_DATA_DIR: dataDirectory,
     PHIGON_ACTIVITY_REPLAY_ON_FIRST_START: "true",
     PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE: "100",
@@ -1107,7 +1108,7 @@ test("activity collector lowers durable acknowledgement after a server restore",
     })}\n`,
     "utf8",
   );
-  const config = loadConfig({
+  const config = loadContentConfig({
     PHIGON_DATA_DIR: dataDirectory,
     PHIGON_ACTIVITY_REPLAY_ON_FIRST_START: "true",
     PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE: "100",
@@ -1173,7 +1174,7 @@ test("activity collector coalesces checkpoint snapshots during an outage", async
     "utf8",
   );
   const collector = new ActivityCollector({
-    config: loadConfig({
+    config: loadContentConfig({
       PHIGON_DATA_DIR: join(directory, "data"),
       PHIGON_ACTIVITY_REPLAY_ON_FIRST_START: "true",
       PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE: "100",
@@ -1219,7 +1220,7 @@ test("activity collector retains the checkpoint for a partially acknowledged sca
     message: { role: "assistant", content: "second pending record" },
   });
   await writeFile(sourceFile, `${firstRecord}\n`, "utf8");
-  const config = loadConfig({
+  const config = loadContentConfig({
     PHIGON_DATA_DIR: dataDirectory,
     PHIGON_ACTIVITY_REPLAY_ON_FIRST_START: "true",
     PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE: "100",
@@ -1290,7 +1291,7 @@ test("activity collector clamps future vendor clocks to the local observation ti
   );
   const emitted: EventEnvelope[] = [];
   const collector = new ActivityCollector({
-    config: loadConfig({
+    config: loadContentConfig({
       PHIGON_DATA_DIR: dataDirectory,
       PHIGON_ACTIVITY_REPLAY_ON_FIRST_START: "true",
       PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE: "100",
@@ -1353,7 +1354,7 @@ test("generic records without runtime evidence stay on source identity", async (
   );
   const emitted: EventEnvelope[] = [];
   const collector = new ActivityCollector({
-    config: loadConfig({
+    config: loadContentConfig({
       PHIGON_DATA_DIR: join(directory, "data"),
       PHIGON_ACTIVITY_REPLAY_ON_FIRST_START: "true",
       PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE: "100",
@@ -1453,7 +1454,7 @@ test("a source that fails is skipped with backoff while the others keep collecti
   })}\n`;
   await writeFile(join(sourceRoot, "codex.jsonl"), codexRecord("before the failure"), "utf8");
   let now = Date.parse("2026-11-01T12:00:00.000Z");
-  const config = loadConfig({
+  const config = loadContentConfig({
     PHIGON_DATA_DIR: dataDirectory,
     PHIGON_ACTIVITY_REPLAY_ON_FIRST_START: "true",
     PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE: "100",
@@ -1554,7 +1555,7 @@ async function refusalFixture(prefix: string) {
     emit: (event: EventEnvelope) => void,
     onDeliveryRefused?: (error: unknown) => void,
   ) => new ActivityCollector({
-    config: loadConfig({
+    config: loadContentConfig({
       PHIGON_DATA_DIR: join(directory, dataDirectory),
       PHIGON_ACTIVITY_REPLAY_ON_FIRST_START: "true",
       PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE: "100",

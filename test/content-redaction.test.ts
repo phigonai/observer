@@ -78,6 +78,40 @@ test("redaction covers token formats that command output already hid", () => {
   }
 });
 
+test("redaction covers Phigon keys, temporary cloud keys, signing secrets and webhooks", () => {
+  for (const token of [
+    // Phigon access key: phg_<12 base32>_<32 base32>.
+    ["phg", "_", filler("a", 6), "234567", "_", filler("b", 16), "abcdef7654322345"],
+    // Phigon license key: phl_<base64url payload>.<base64url signature>.
+    ["phl", "_", "eyJ2IjoxLCJpZCI6Im", filler("Q", 40), ".", filler("s", 40), "-_AbC12345", filler("z", 36)],
+    ["AS", "IA", "Q3EGRLMN", "4XKP7TZW"],
+    ["GOC", "SPX-", filler("k", 20), "_-Ab12Cd"],
+    ["wh", "sec_", filler("m", 24), "+/AbC123=="],
+    ["https://hooks.", "slack.com/services/", "T0", filler("A", 8), "/B0", filler("B", 8), "/", filler("c", 24)],
+  ].map((parts) => parts.join(""))) {
+    const safe = redactSecrets(`the token is ${token} today`);
+    assert.equal(safe, "the token is [REDACTED_SECRET] today", token.slice(0, 8));
+  }
+  const password = filler("v", 14);
+  for (const url of [`redis://:${password}@cache.internal:6379/0`, `amqp://:${password}@queue.internal`]) {
+    const safe = redactSecrets(url);
+    assert.match(safe, /REDACTED/u, url.slice(0, 8));
+    assert.ok(!safe.includes(password), safe);
+  }
+});
+
+test("new key formats leave lookalike words and addresses readable", () => {
+  for (const ordinary of [
+    "phg_status=ok and phl_note=see-docs",
+    "ASIA PACIFIC, ASIAN markets and ASIAPACIFIC_REGION",
+    "GOCSPX- is the prefix and whsec_ marks a signing secret",
+    "redis://cache.internal:6379/0 and https://example.com:8443/path",
+    "https://hooks.slack.com/ is Slack's webhook host",
+  ]) {
+    assert.equal(redactSecrets(ordinary), ordinary);
+  }
+});
+
 test("ordinary text and code keep their values", () => {
   for (const ordinary of [
     "PWD=/home/example\nOLDPWD=/tmp\nkey: display-name\nSSH_AUTH_SOCK=/tmp/agent.sock",
@@ -93,11 +127,34 @@ test("ordinary text and code keep their values", () => {
 });
 
 test("redaction stays linear on large single-token and dotted inputs", () => {
-  // A quadratic filter needs minutes for these; a linear one needs milliseconds.
-  for (const input of ["a".repeat(500_000), "a.".repeat(250_000), "ab_".repeat(200_000), "a://".repeat(100_000), "a-".repeat(250_000), "x_key=".repeat(80_000)]) {
-    const started = performance.now();
-    redactSecrets(input);
-    assert.ok(performance.now() - started < 2_000, `redaction of ${input.length} characters was too slow`);
+  // Compare n with 4n characters instead of a time budget, which a busy
+  // machine can miss: linear work grows about 4 times (up to 7 with garbage
+  // collection), quadratic 16 times. The fastest of several interleaved
+  // runs after a warm-up ignores pauses from other work.
+  const fastest = (small: string, large: string): [number, number] => {
+    let smallBest = Infinity;
+    let largeBest = Infinity;
+    redactSecrets(small);
+    for (let run = 0; run < 3; run++) {
+      let started = performance.now();
+      redactSecrets(small);
+      smallBest = Math.min(smallBest, performance.now() - started);
+      started = performance.now();
+      redactSecrets(large);
+      largeBest = Math.min(largeBest, performance.now() - started);
+      // A run this slow is far above timer noise; do not repeat it.
+      if (largeBest > 1_000) break;
+    }
+    return [smallBest, largeBest];
+  };
+  for (const [unit, count] of [["a", 500_000], ["a.", 250_000], ["ab_", 200_000], ["a://", 100_000], ["a-", 250_000], ["x_key=", 80_000], ["a://:", 80_000]] as const) {
+    const [small, large] = fastest(unit.repeat(count / 4), unit.repeat(count));
+    // Under 50 ms for the large input cannot be quadratic at this size
+    // (minutes), and keeps timer noise on tiny durations from deciding.
+    assert.ok(
+      large < 50 || large < small * 10,
+      `redaction of ${JSON.stringify(unit)} grew from ${small.toFixed(1)} ms to ${large.toFixed(1)} ms for 4 times the input`,
+    );
   }
 });
 

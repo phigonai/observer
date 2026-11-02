@@ -23,6 +23,7 @@ import type {
   VendorActivityAdapter,
 } from "../src/activity/types.js";
 import { loadConfig } from "../src/config.js";
+import { loadContentConfig } from "./content-config.js";
 import {
   ActivityKind,
   AgentKind,
@@ -62,7 +63,7 @@ test("vendor fixtures match the normalized golden event matrix", async () => {
 });
 
 test("enabled content is redacted locally before normalized output", async () => {
-  const config = loadConfig({
+  const config = loadContentConfig({
     PHIGON_COLLECT_PROMPT_CONTENT: "true",
     PHIGON_COLLECT_RESPONSE_CONTENT: "true",
     PHIGON_COLLECT_REASONING_CONTENT: "true",
@@ -119,7 +120,7 @@ test("OpenCode CLI JSON produces canonical tool and lifecycle events", async () 
 });
 
 test("OpenCode 2 session messages become prompts, reasoning, replies, tool calls and turn ends", () => {
-  const policy = new LocalPolicyEngine(loadConfig({
+  const policy = new LocalPolicyEngine(loadContentConfig({
     PHIGON_COLLECT_PROMPT_CONTENT: "true",
     PHIGON_COLLECT_RESPONSE_CONTENT: "true",
     PHIGON_COLLECT_REASONING_CONTENT: "true",
@@ -227,7 +228,7 @@ function activityOf(draft: ActivityDraft): readonly [ActivityKind | undefined, s
 }
 
 test("OpenCode database events preserve speaker roles and fail closed on conflict", () => {
-  const policy = new LocalPolicyEngine(loadConfig({
+  const policy = new LocalPolicyEngine(loadContentConfig({
     PHIGON_COLLECT_PROMPT_CONTENT: "true",
     PHIGON_COLLECT_RESPONSE_CONTENT: "true",
   }).policy);
@@ -364,7 +365,7 @@ test("Codex goal continuation metadata is not emitted as a user prompt", () => {
 });
 
 test("Codex response-item messages preserve explicitly reported speaker roles", () => {
-  const policy = new LocalPolicyEngine(loadConfig({
+  const policy = new LocalPolicyEngine(loadContentConfig({
     PHIGON_COLLECT_PROMPT_CONTENT: "true",
     PHIGON_COLLECT_RESPONSE_CONTENT: "true",
   }).policy);
@@ -546,7 +547,7 @@ test("Codex completed command and file-change items become terminal and file eve
 });
 
 test("Codex reasoning indexes only source-emitted readable summaries", () => {
-  const policy = new LocalPolicyEngine(loadConfig({
+  const policy = new LocalPolicyEngine(loadContentConfig({
     PHIGON_COLLECT_REASONING_CONTENT: "true",
   }).policy);
   const context = {
@@ -597,7 +598,7 @@ test("Codex reasoning indexes only source-emitted readable summaries", () => {
 });
 
 test("Codex web-search records preserve reported status and safe arguments", () => {
-  const policy = new LocalPolicyEngine(loadConfig({
+  const policy = new LocalPolicyEngine(loadContentConfig({
     PHIGON_COLLECT_COMMAND_ARGUMENTS: "true",
     PHIGON_COLLECT_BROWSER_URLS: "true",
   }).policy);
@@ -694,7 +695,7 @@ test("Codex tool outputs require explicit, consistent outcome evidence", () => {
 });
 
 test("nested tool content obeys every subordinate consent category", () => {
-  const policy = new LocalPolicyEngine(loadConfig({
+  const policy = new LocalPolicyEngine(loadContentConfig({
     PHIGON_COLLECT_COMMAND_ARGUMENTS: "true",
     PHIGON_COLLECT_TOOL_OUTPUT: "true",
   }).policy);
@@ -762,7 +763,7 @@ test("agent error records carry error severity", () => {
 });
 
 test("vendor-native records preserve source shape while removing secrets", () => {
-  const config = loadConfig({
+  const config = loadContentConfig({
     PHIGON_COLLECT_COMMAND_ARGUMENTS: "true",
     PHIGON_COLLECT_FILE_PATHS: "true",
     PHIGON_COLLECT_TOOL_OUTPUT: "true",
@@ -805,7 +806,7 @@ test("vendor-native records preserve source shape while removing secrets", () =>
 });
 
 test("vendor payload requires its subordinate content consents", () => {
-  const config = loadConfig({
+  const config = loadContentConfig({
     PHIGON_COLLECT_VENDOR_PAYLOAD: "true",
   });
   const result = new LocalPolicyEngine(config.policy).vendorRecord({
@@ -831,7 +832,7 @@ test("vendor payload requires its subordinate content consents", () => {
 });
 
 test("vendor payload fails closed on unclassified free-form strings", () => {
-  const config = loadConfig({
+  const config = loadContentConfig({
     PHIGON_COLLECT_VENDOR_PAYLOAD: "true",
   });
   const result = new LocalPolicyEngine(config.policy).vendorRecord({
@@ -853,7 +854,7 @@ test("vendor payload fails closed on unclassified free-form strings", () => {
 });
 
 test("vendor payload never bypasses reasoning consent through thinking blocks", () => {
-  const config = loadConfig({
+  const config = loadContentConfig({
     PHIGON_COLLECT_RESPONSE_CONTENT: "true",
     PHIGON_COLLECT_VENDOR_PAYLOAD: "true",
   });
@@ -952,7 +953,7 @@ test("OpenCode resumes speaker attribution from source database evidence", () =>
 });
 
 test("Guardian decision journals become structured authorization telemetry", () => {
-  const policy = new LocalPolicyEngine(loadConfig({
+  const policy = new LocalPolicyEngine(loadContentConfig({
     PHIGON_COLLECT_TOOL_OUTPUT: "true",
   }).policy);
   const contract = "Do not let this agent delete project files.";
@@ -994,7 +995,7 @@ test("Guardian decision journals become structured authorization telemetry", () 
 });
 
 test("managed execution journals become correlated command telemetry", () => {
-  const policy = new LocalPolicyEngine(loadConfig({
+  const policy = new LocalPolicyEngine(loadContentConfig({
     PHIGON_COLLECT_COMMAND_ARGUMENTS: "true",
     PHIGON_COLLECT_TOOL_OUTPUT: "true",
     PHIGON_COLLECT_TERMINAL_OUTPUT: "true",
@@ -2148,7 +2149,7 @@ test("text-editor sub-commands are file operations, not shell commands", () => {
 });
 
 test("command arrays and command batches become readable terminal commands", () => {
-  const policy = new LocalPolicyEngine(loadConfig({
+  const policy = new LocalPolicyEngine(loadContentConfig({
     PHIGON_COLLECT_COMMAND_ARGUMENTS: "true",
   }).policy);
   const context = { sessionId: "session-argv", observedAt, policy };
@@ -2211,7 +2212,7 @@ test("structured custom tools derive terminal, filesystem, browser, and Git sign
 });
 
 test("metadata categories fail closed before canonical evidence is emitted", () => {
-  const config = loadConfig({
+  const config = loadContentConfig({
     PHIGON_COLLECT_FILE_METADATA: "false",
     PHIGON_COLLECT_BROWSER_METADATA: "false",
   });

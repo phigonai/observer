@@ -186,7 +186,7 @@ Settings are environment variables. The most common ones:
 | `PHIGON_CONTROL_PLANE_URL`, `PHIGON_GRPC_URL` | Endpoints for a self-hosted workspace. Pairing saves them; the stream refuses to send credentials anywhere else. |
 | `PHIGON_TLS_CA_FILE` | A private certificate authority for gRPC. Use `NODE_EXTRA_CA_CERTS` for HTTPS. Pairing with `--server-ca-sha256` sets up both for you. |
 | `PHIGON_TLS_CLIENT_CERT_FILE`, `PHIGON_TLS_CLIENT_KEY_FILE` | Client certificate, when the workspace requires mutual TLS. |
-| `PHIGON_COLLECT_*` | Turns individual content categories off (or on, within the workspace policy). |
+| `PHIGON_COLLECT_*` | Turns individual content categories off. Content can be turned on only under `--profile full` on a computer whose owner consented to full activity; otherwise `run` refuses to start. |
 | `PHIGON_REDACT_PATH_PATTERNS` | Extra file path patterns to redact. |
 | `PHIGON_<AGENT>_ACTIVITY_DIRS` | Extra record folders for an agent, e.g. `PHIGON_CLAUDE_ACTIVITY_DIRS`. |
 | `PHIGON_REMOTE_ACTIONS_ENABLED` | Opt in to administrator-approved agent stop and force stop. Off by default. |

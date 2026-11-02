@@ -133,6 +133,56 @@ test("portable profile flags fail closed outside doctor and run", async () => {
   assert.match(stderr, /supported only by doctor and run/u);
 });
 
+test("run collects no content on a computer whose owner consented to metadata only", { timeout: 10_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-cli-consent-"));
+  try {
+    await new FileCredentialStore(directory).save({
+      machineId: "machine-consent",
+      tenantId: "tenant-consent",
+      credential: `phg_m_${"c".repeat(43)}`,
+      controlPlaneOrigin: "http://127.0.0.1:9",
+      createdAt: "2026-11-02T00:00:00.000Z",
+      consentProfile: "metadata",
+      consentPolicyVersion: "observer-policy-v1",
+      consentedAt: "2026-11-02T00:00:00.000Z",
+    });
+    const attempts: readonly (readonly string[])[] = [
+      ["run"],
+      ["run", "--profile", "metadata"],
+      ["run", "--profile", "full"],
+    ];
+    for (const args of attempts) {
+      let stdout = "";
+      let stderr = "";
+      const exitCode = await run(
+        [...args],
+        {
+          PHIGON_CONTROL_PLANE_URL: "http://127.0.0.1:9",
+          PHIGON_GRPC_URL: "http://127.0.0.1:9",
+          PHIGON_DATA_DIR: directory,
+          PHIGON_UPDATE_CHECK: "false",
+          PHIGON_COLLECT_PROMPT_CONTENT: "true",
+        },
+        {
+          stdout: (value) => { stdout += value; },
+          stderr: (value) => { stderr += value; },
+        },
+      );
+      assert.equal(exitCode, 1, args.join(" "));
+      assert.equal(stdout, "", args.join(" "));
+      assert.match(
+        stderr,
+        args.includes("full")
+          ? /outside the consented metadata profile/u
+          : /PHIGON_COLLECT_PROMPT_CONTENT turns on content collection, which needs the full activity profile/u,
+        args.join(" "),
+      );
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("authorize-action rejects a credential from another control-plane origin", async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-cli-action-origin-"));
   let stdout = "";

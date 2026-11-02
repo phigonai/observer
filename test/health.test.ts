@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { loadConfig } from "../src/config.js";
+import { loadContentConfig } from "./content-config.js";
 import { createHealthSnapshot } from "../src/health.js";
 
 test("createHealthSnapshot reports pairing without exposing token values", () => {
@@ -69,7 +70,7 @@ test("createHealthSnapshot identifies the default profile as metadata only", () 
 
 test("createHealthSnapshot reports explicit content collection", () => {
   const health = createHealthSnapshot(
-    loadConfig({ PHIGON_COLLECT_PROMPT_CONTENT: "true" }),
+    loadContentConfig({ PHIGON_COLLECT_PROMPT_CONTENT: "true" }),
     "0.1.0",
   );
 
