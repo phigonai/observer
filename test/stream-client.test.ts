@@ -1120,8 +1120,15 @@ test("per-event acknowledgements are persisted in coalesced order without a writ
       save: async (_machineId, sequence) => {
         concurrentSaves++;
         maxConcurrentSaves = Math.max(maxConcurrentSaves, concurrentSaves);
-        // A flushed atomic replace takes milliseconds on a real disk.
-        await new Promise((resolve) => setTimeout(resolve, 5));
+        // A flushed atomic replace is slow next to the stream. Hold the
+        // first save until the client has received every acknowledgement,
+        // so the test does not depend on how fast a busy machine runs it.
+        while (
+          !controller.signal.aborted &&
+          client.metrics().lastAcknowledgedSequence < BigInt(total)
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, 1));
+        }
         concurrentSaves--;
         saved.push(sequence);
         order.push(`save ${sequence}`);
@@ -1153,8 +1160,9 @@ test("per-event acknowledgements are persisted in coalesced order without a writ
         order.indexOf(`commit ${sequence}`) < order.indexOf(`save ${sequence}`),
       );
     }
+    // Acknowledgements that arrive during a save collapse into one more.
     assert.ok(
-      saved.length < total / 4,
+      saved.length <= 2,
       `expected coalesced cursor writes, saw ${saved.length} for ${total} acknowledgements`,
     );
   } finally {
@@ -1201,6 +1209,11 @@ test("observer bounds in-flight events by count when sequences contain gaps", as
               request.payload.value.sequence,
             ),
           );
+        }
+        // The one acknowledgement frees one slot: 16 + 1 events. Watch
+        // for a further event only once all of those have arrived, so a
+        // slow machine cannot end the window early.
+        if (received === 17) {
           observationTimer = setTimeout(() => controller.abort(), 150);
         }
       });
@@ -1226,12 +1239,14 @@ test("observer bounds in-flight events by count when sequences contain gaps", as
     },
   });
 
+  const deadline = setTimeout(() => controller.abort(), 10_000);
   try {
     await client.run(controller.signal);
     assert.equal(received, 17);
     assert.equal(maxOutstanding, 16);
     assert.deepEqual(acknowledged, [1_000n]);
   } finally {
+    clearTimeout(deadline);
     if (observationTimer !== undefined) clearTimeout(observationTimer);
     controller.abort();
     await shutdownServer(server);

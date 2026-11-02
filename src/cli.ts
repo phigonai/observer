@@ -27,6 +27,8 @@ import {
 } from "./activity/collector.js";
 import { ingestActivityJSONL } from "./activity/ingest.js";
 import {
+  consentedCollectionPolicy,
+  contentOutsideProfileMessage,
   loadConfig,
   DEFAULT_CONTROL_PLANE_ORIGIN,
   type CollectionPolicy,
@@ -552,10 +554,18 @@ export async function run(
             "Full-content collection is outside the consented metadata profile.",
           );
         }
+        if (config.contentSettingsOutsideProfile.length > 0) {
+          throw new Error(
+            contentOutsideProfileMessage(config.contentSettingsOutsideProfile),
+          );
+        }
         // Before any queued activity, cursor or saved state is read. A
         // signal only aborts the tasks, so `finally` releases the lock.
         instanceLock = await InstanceLock.acquire(config.dataDirectory);
-        let effectivePolicy = intersectCollectionPolicy(config.policy);
+        let effectivePolicy = intersectCollectionPolicy(
+          config.policy,
+          credential.consentProfile,
+        );
         let collector: ActivityCollector | undefined;
         let resolveCollector: ((value: ActivityCollector) => void) | undefined;
         const collectorReady = new Promise<ActivityCollector>((resolve) => {
@@ -639,6 +649,7 @@ export async function run(
           onPolicy: (policy) => {
             effectivePolicy = intersectCollectionPolicy(
               config.policy,
+              credential.consentProfile,
               policy,
             );
             collector?.updatePolicy(effectivePolicy);
@@ -1232,9 +1243,11 @@ export async function settleObserverTasks(
 }
 
 function intersectCollectionPolicy(
-  local: CollectionPolicy,
+  configured: CollectionPolicy,
+  consentProfile: ConsentProfile | undefined,
   server?: WireCollectionPolicy,
 ): CollectionPolicy {
+  const local = consentedCollectionPolicy(configured, consentProfile);
   return Object.freeze({
     promptContent: local.promptContent &&
       server?.promptContent === true,

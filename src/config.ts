@@ -83,6 +83,11 @@ export type ObserverConfig = Readonly<{
   tlsClientCertFile: string | undefined;
   tlsClientKeyFile: string | undefined;
   policy: CollectionPolicy;
+  /**
+   * `PHIGON_COLLECT_*` settings that asked for content outside the full
+   * profile. Their categories stay off in `policy`; `run` refuses to start.
+   */
+  contentSettingsOutsideProfile: readonly string[];
 }>;
 
 const defaultPolicy: CollectionPolicy = Object.freeze({
@@ -196,9 +201,6 @@ export function loadConfig(
   const observabilityProfile = parseObservabilityProfile(
     environment["PHIGON_OBSERVABILITY_PROFILE"] ?? "metadata",
   );
-  const profilePolicy =
-    observabilityProfile === "full" ? fullPolicy : defaultPolicy;
-
   const logLevel = parseLogLevel(
     environment["PHIGON_LOG_LEVEL"] ?? "info",
   );
@@ -214,6 +216,8 @@ export function loadConfig(
       "PHIGON_TLS_CLIENT_CERT_FILE and PHIGON_TLS_CLIENT_KEY_FILE must be configured together.",
     );
   }
+
+  const collection = collectionPolicy(environment, observabilityProfile);
 
   return Object.freeze({
     controlPlaneUrl,
@@ -366,134 +370,8 @@ export function loadConfig(
     tlsCaFile: environment["PHIGON_TLS_CA_FILE"]?.trim() || undefined,
     tlsClientCertFile,
     tlsClientKeyFile,
-    policy: Object.freeze({
-      ...profilePolicy,
-      promptContent: policyFlag(
-        environment,
-        "PROMPT_CONTENT",
-        profilePolicy.promptContent,
-      ),
-      responseContent: policyFlag(
-        environment,
-        "RESPONSE_CONTENT",
-        profilePolicy.responseContent,
-      ),
-      reasoningContent: policyFlag(
-        environment,
-        "REASONING_CONTENT",
-        profilePolicy.reasoningContent,
-      ),
-      commandArguments: policyFlag(
-        environment,
-        "COMMAND_ARGUMENTS",
-        profilePolicy.commandArguments,
-      ),
-      terminalOutput: policyFlag(
-        environment,
-        "TERMINAL_OUTPUT",
-        profilePolicy.terminalOutput,
-      ),
-      filePaths: policyFlag(
-        environment,
-        "FILE_PATHS",
-        profilePolicy.filePaths,
-      ),
-      fileContent: policyFlag(
-        environment,
-        "FILE_CONTENT",
-        profilePolicy.fileContent,
-      ),
-      browserUrls: policyFlag(
-        environment,
-        "BROWSER_URLS",
-        profilePolicy.browserUrls,
-      ),
-      browserContent: policyFlag(
-        environment,
-        "BROWSER_CONTENT",
-        profilePolicy.browserContent,
-      ),
-      networkEndpoints: policyFlag(
-        environment,
-        "NETWORK_ENDPOINTS",
-        profilePolicy.networkEndpoints,
-      ),
-      gitPatchContent: policyFlag(
-        environment,
-        "GIT_PATCH_CONTENT",
-        profilePolicy.gitPatchContent,
-      ),
-      environmentValues: policyFlag(
-        environment,
-        "ENVIRONMENT_VALUES",
-        profilePolicy.environmentValues,
-      ),
-      toolOutput: policyFlag(
-        environment,
-        "TOOL_OUTPUT",
-        profilePolicy.toolOutput,
-      ),
-      vendorPayload: policyFlag(
-        environment,
-        "VENDOR_PAYLOAD",
-        profilePolicy.vendorPayload,
-      ),
-      processMetadata: policyFlag(
-        environment,
-        "PROCESS_METADATA",
-        profilePolicy.processMetadata,
-      ),
-      processArguments: policyFlag(
-        environment,
-        "PROCESS_ARGUMENTS",
-        profilePolicy.processArguments,
-      ),
-      fileMetadata: policyFlag(
-        environment,
-        "FILE_METADATA",
-        profilePolicy.fileMetadata,
-      ),
-      fileDiffs: policyFlag(
-        environment,
-        "FILE_DIFFS",
-        profilePolicy.fileDiffs,
-      ),
-      networkMetadata: policyFlag(
-        environment,
-        "NETWORK_METADATA",
-        profilePolicy.networkMetadata,
-      ),
-      networkContent: policyFlag(
-        environment,
-        "NETWORK_CONTENT",
-        profilePolicy.networkContent,
-      ),
-      browserMetadata: policyFlag(
-        environment,
-        "BROWSER_METADATA",
-        profilePolicy.browserMetadata,
-      ),
-      mcpArguments: policyFlag(
-        environment,
-        "MCP_ARGUMENTS",
-        profilePolicy.mcpArguments,
-      ),
-      mcpOutput: policyFlag(
-        environment,
-        "MCP_OUTPUT",
-        profilePolicy.mcpOutput,
-      ),
-      modelPrompts: policyFlag(
-        environment,
-        "MODEL_PROMPTS",
-        profilePolicy.modelPrompts,
-      ),
-      modelResponses: policyFlag(
-        environment,
-        "MODEL_RESPONSES",
-        profilePolicy.modelResponses,
-      ),
-    }),
+    policy: collection.policy,
+    contentSettingsOutsideProfile: collection.refused,
   });
 }
 
@@ -562,15 +440,107 @@ function parseBoundedPositiveInteger(
   return parsed;
 }
 
-function policyFlag(
+/** The `PHIGON_COLLECT_*` setting that narrows or widens each category. */
+export const COLLECTION_SETTINGS: Readonly<Record<keyof CollectionPolicy, string>> =
+  Object.freeze({
+    promptContent: "PHIGON_COLLECT_PROMPT_CONTENT",
+    responseContent: "PHIGON_COLLECT_RESPONSE_CONTENT",
+    reasoningContent: "PHIGON_COLLECT_REASONING_CONTENT",
+    commandArguments: "PHIGON_COLLECT_COMMAND_ARGUMENTS",
+    terminalOutput: "PHIGON_COLLECT_TERMINAL_OUTPUT",
+    filePaths: "PHIGON_COLLECT_FILE_PATHS",
+    fileContent: "PHIGON_COLLECT_FILE_CONTENT",
+    browserUrls: "PHIGON_COLLECT_BROWSER_URLS",
+    browserContent: "PHIGON_COLLECT_BROWSER_CONTENT",
+    networkEndpoints: "PHIGON_COLLECT_NETWORK_ENDPOINTS",
+    gitPatchContent: "PHIGON_COLLECT_GIT_PATCH_CONTENT",
+    environmentValues: "PHIGON_COLLECT_ENVIRONMENT_VALUES",
+    toolOutput: "PHIGON_COLLECT_TOOL_OUTPUT",
+    vendorPayload: "PHIGON_COLLECT_VENDOR_PAYLOAD",
+    processMetadata: "PHIGON_COLLECT_PROCESS_METADATA",
+    processArguments: "PHIGON_COLLECT_PROCESS_ARGUMENTS",
+    fileMetadata: "PHIGON_COLLECT_FILE_METADATA",
+    fileDiffs: "PHIGON_COLLECT_FILE_DIFFS",
+    networkMetadata: "PHIGON_COLLECT_NETWORK_METADATA",
+    networkContent: "PHIGON_COLLECT_NETWORK_CONTENT",
+    browserMetadata: "PHIGON_COLLECT_BROWSER_METADATA",
+    mcpArguments: "PHIGON_COLLECT_MCP_ARGUMENTS",
+    mcpOutput: "PHIGON_COLLECT_MCP_OUTPUT",
+    modelPrompts: "PHIGON_COLLECT_MODEL_PROMPTS",
+    modelResponses: "PHIGON_COLLECT_MODEL_RESPONSES",
+  });
+
+const collectionCategories = Object.freeze(
+  Object.keys(COLLECTION_SETTINGS) as (keyof CollectionPolicy)[],
+);
+
+/**
+ * Categories that carry what people and agents wrote, ran or read: every
+ * category the metadata profile leaves off. They are collected only under
+ * the full profile on a computer whose owner consented to full activity.
+ */
+export const CONTENT_COLLECTION_CATEGORIES: readonly (keyof CollectionPolicy)[] =
+  Object.freeze(collectionCategories.filter((category) => !defaultPolicy[category]));
+
+function collectionPolicy(
   environment: NodeJS.ProcessEnv,
-  suffix: string,
-  fallback: boolean,
-): boolean {
-  return parseBoolean(
-    environment[`PHIGON_COLLECT_${suffix}`] ?? String(fallback),
-    `PHIGON_COLLECT_${suffix}`,
-  );
+  profile: ObservabilityProfile,
+): Readonly<{ policy: CollectionPolicy; refused: readonly string[] }> {
+  const profilePolicy = profile === "full" ? fullPolicy : defaultPolicy;
+  const policy = Object.fromEntries(
+    collectionCategories.map((category) => [
+      category,
+      parseBoolean(
+        environment[COLLECTION_SETTINGS[category]] ??
+          String(profilePolicy[category]),
+        COLLECTION_SETTINGS[category],
+      ),
+    ]),
+  ) as Record<keyof CollectionPolicy, boolean>;
+  const refused: string[] = [];
+  if (profile !== "full") {
+    // A COLLECT setting can only narrow the metadata profile; content
+    // needs the full profile, which `run` accepts only with full consent.
+    for (const category of CONTENT_COLLECTION_CATEGORIES) {
+      if (!policy[category]) continue;
+      policy[category] = false;
+      refused.push(COLLECTION_SETTINGS[category]);
+    }
+  }
+  return Object.freeze({
+    policy: Object.freeze(policy),
+    refused: Object.freeze(refused),
+  });
+}
+
+/**
+ * Explains why `run` refuses to start when a `PHIGON_COLLECT_*` setting
+ * turns on content outside the full activity profile. Names only settings.
+ */
+export function contentOutsideProfileMessage(
+  settings: readonly string[],
+): string {
+  return `${settings.join(", ")} ${
+    settings.length === 1 ? "turns" : "turn"
+  } on content collection, which needs the full activity profile. ` +
+    "Run with --profile full on a computer whose owner consented to full activity, or remove the setting.";
+}
+
+/**
+ * Keeps every content category off unless the machine owner consented to
+ * full activity. Applied wherever the effective policy is computed, so a
+ * local setting or a server policy can never widen what the owner agreed to.
+ */
+export function consentedCollectionPolicy(
+  policy: CollectionPolicy,
+  consentProfile: ObservabilityProfile | undefined,
+): CollectionPolicy {
+  if (consentProfile === "full") return policy;
+  const restricted: Record<keyof CollectionPolicy, boolean> = { ...policy };
+  for (const category of CONTENT_COLLECTION_CATEGORIES) {
+    restricted[category] = false;
+  }
+  return Object.freeze(restricted);
 }
 
 function parseObservabilityProfile(value: string): ObservabilityProfile {

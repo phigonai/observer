@@ -2,7 +2,14 @@ import assert from "node:assert/strict";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { loadConfig } from "../src/config.js";
+import {
+  COLLECTION_SETTINGS,
+  CONTENT_COLLECTION_CATEGORIES,
+  consentedCollectionPolicy,
+  contentOutsideProfileMessage,
+  loadConfig,
+} from "../src/config.js";
+import { loadContentConfig } from "./content-config.js";
 
 test("loadConfig connects zero-configuration installs to Phigon production", () => {
   const config = loadConfig({});
@@ -127,8 +134,95 @@ test("loadConfig validates observability throughput settings", () => {
   );
 });
 
-test("loadConfig enables content only through explicit policy flags", () => {
+test("every category the metadata profile leaves off counts as content", () => {
+  assert.deepEqual([...CONTENT_COLLECTION_CATEGORIES].sort(), [
+    "browserContent",
+    "browserUrls",
+    "commandArguments",
+    "environmentValues",
+    "fileContent",
+    "fileDiffs",
+    "filePaths",
+    "gitPatchContent",
+    "mcpArguments",
+    "mcpOutput",
+    "modelPrompts",
+    "modelResponses",
+    "networkContent",
+    "networkEndpoints",
+    "processArguments",
+    "promptContent",
+    "reasoningContent",
+    "responseContent",
+    "terminalOutput",
+    "toolOutput",
+    "vendorPayload",
+  ]);
+});
+
+test("loadConfig keeps content off outside the full activity profile", () => {
+  for (const category of CONTENT_COLLECTION_CATEGORIES) {
+    const setting = COLLECTION_SETTINGS[category];
+    for (const profile of [undefined, "metadata"]) {
+      const config = loadConfig({
+        ...(profile === undefined
+          ? {}
+          : { PHIGON_OBSERVABILITY_PROFILE: profile }),
+        [setting]: "true",
+      });
+      assert.equal(config.policy[category], false, setting);
+      assert.deepEqual(config.contentSettingsOutsideProfile, [setting]);
+    }
+  }
   const config = loadConfig({
+    PHIGON_COLLECT_PROMPT_CONTENT: "true",
+    PHIGON_COLLECT_TOOL_OUTPUT: "1",
+  });
+  assert.deepEqual(config.contentSettingsOutsideProfile, [
+    "PHIGON_COLLECT_PROMPT_CONTENT",
+    "PHIGON_COLLECT_TOOL_OUTPUT",
+  ]);
+  assert.equal(
+    contentOutsideProfileMessage(config.contentSettingsOutsideProfile),
+    "PHIGON_COLLECT_PROMPT_CONTENT, PHIGON_COLLECT_TOOL_OUTPUT turn on content collection, which needs the full activity profile. " +
+      "Run with --profile full on a computer whose owner consented to full activity, or remove the setting.",
+  );
+
+  // Narrowing the metadata profile stays allowed and is not reported.
+  const narrowed = loadConfig({
+    PHIGON_COLLECT_PROMPT_CONTENT: "false",
+    PHIGON_COLLECT_PROCESS_METADATA: "false",
+  });
+  assert.equal(narrowed.policy.promptContent, false);
+  assert.equal(narrowed.policy.processMetadata, false);
+  assert.equal(narrowed.policy.fileMetadata, true);
+  assert.deepEqual(narrowed.contentSettingsOutsideProfile, []);
+
+  const full = loadContentConfig({ PHIGON_COLLECT_PROMPT_CONTENT: "true" });
+  assert.equal(full.policy.promptContent, true);
+  assert.deepEqual(full.contentSettingsOutsideProfile, []);
+});
+
+test("the effective policy drops content the machine owner did not consent to", () => {
+  const full = loadConfig({
+    PHIGON_OBSERVABILITY_PROFILE: "full",
+    PHIGON_COLLECT_ENVIRONMENT_VALUES: "true",
+  }).policy;
+  for (const consent of [undefined, "metadata"] as const) {
+    const restricted = consentedCollectionPolicy(full, consent);
+    for (const category of CONTENT_COLLECTION_CATEGORIES) {
+      assert.equal(restricted[category], false, `${category} (${consent})`);
+    }
+    assert.equal(restricted.processMetadata, true);
+    assert.equal(restricted.fileMetadata, true);
+    assert.equal(restricted.networkMetadata, true);
+    assert.equal(restricted.browserMetadata, true);
+  }
+  assert.deepEqual(consentedCollectionPolicy(full, "full"), full);
+});
+
+test("loadConfig enables content only through explicit policy flags", () => {
+  const config = loadContentConfig({
     PHIGON_COLLECT_PROMPT_CONTENT: "true",
     PHIGON_COLLECT_TOOL_OUTPUT: "1",
     PHIGON_COLLECT_VENDOR_PAYLOAD: "true",
@@ -363,7 +457,7 @@ test("loadConfig requires paired mutual-TLS client files", () => {
 });
 
 test("loadConfig accepts case-insensitive, padded boolean overrides", () => {
-  const config = loadConfig({ PHIGON_COLLECT_PROMPT_CONTENT: " True ", PHIGON_COLLECT_TOOL_OUTPUT: "FALSE" });
+  const config = loadConfig({ PHIGON_OBSERVABILITY_PROFILE: "full", PHIGON_COLLECT_PROMPT_CONTENT: " True ", PHIGON_COLLECT_TOOL_OUTPUT: "FALSE" });
   assert.equal(config.policy.promptContent, true);
   assert.equal(config.policy.toolOutput, false);
   assert.throws(() => loadConfig({ PHIGON_COLLECT_PROMPT_CONTENT: "maybe" }), /must be true or false/u);
