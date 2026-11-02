@@ -1,5 +1,6 @@
 import type { ObserverConfig } from "./config.js";
 import { FileCredentialStore, type StoredMachineCredential } from "./credential-store.js";
+import { consentHealth, type ObserverConsentHealth } from "./health.js";
 import { InstanceLock, type InstanceLockHolder } from "./instance-lock.js";
 import { OBSERVER_CONSENT_POLICY_VERSION } from "./pair.js";
 import { StreamStateStore } from "./stream-state.js";
@@ -35,6 +36,8 @@ export type DoctorCheckReport = Readonly<{
   dataDirectory: string;
   controlPlaneOrigin: string;
   maxDeliveryAgeMinutes: number;
+  /** How this computer consented, when it is paired with this server. */
+  consent?: ObserverConsentHealth;
   checks: readonly DoctorCheck[];
   checkedAt: string;
 }>;
@@ -86,20 +89,28 @@ export async function runDoctorCheck(options: DoctorCheckOptions): Promise<Docto
     checks.push(fail("paired", error instanceof Error ? error.message : "Stored pairing data could not be read."));
   }
 
-  if (credential === null) {
+  const consent = credential === null ? undefined : consentHealth(credential);
+  if (credential === null || consent === undefined) {
     checks.push(skip("consent", "Needs pairing first."));
   } else if (
     credential.consentProfile === undefined ||
     credential.consentPolicyVersion !== OBSERVER_CONSENT_POLICY_VERSION
   ) {
+    // A company's consent is stored only with its profile, so this is an
+    // owner's consent from before profiles, or from an older policy.
     checks.push(fail(
       "consent",
       "The owner's consent is missing or out of date. Pair again with --consent-profile metadata or --consent-profile full.",
     ));
   } else {
+    const when = credential.consentedAt === undefined ? "" : ` on ${credential.consentedAt}`;
     checks.push(pass(
       "consent",
-      `The owner consented to the ${credential.consentProfile} profile${credential.consentedAt === undefined ? "" : ` on ${credential.consentedAt}`}.`,
+      consent.source === "company"
+        ? `Your company consented for this computer to the ${credential.consentProfile} profile${
+          consent.enrollmentCodeLabel === undefined ? " with an enrollment code" : ` with the enrollment code "${consent.enrollmentCodeLabel}"`
+        }${when}.`
+        : `The owner consented to the ${credential.consentProfile} profile${when}.`,
     ));
   }
 
@@ -144,6 +155,7 @@ export async function runDoctorCheck(options: DoctorCheckOptions): Promise<Docto
     dataDirectory: config.dataDirectory,
     controlPlaneOrigin: config.controlPlaneUrl.origin,
     maxDeliveryAgeMinutes: maxAge,
+    ...(consent === undefined ? {} : { consent }),
     checks: Object.freeze(checks),
     checkedAt: now.toISOString(),
   });

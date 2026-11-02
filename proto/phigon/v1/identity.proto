@@ -74,4 +74,7 @@ message Heartbeat {
   uint64 coalesced_events = 9;
   // Highest sequence durably acknowledged by the control plane.
   uint64 acknowledged_sequence = 10;
+  // The observer that sent this heartbeat. Only version is set; older
+  // observers leave the field out.
+  BuildInfo observer_build = 11;
 }

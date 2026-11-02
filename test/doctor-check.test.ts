@@ -221,3 +221,50 @@ test("doctor --check reaches a company server through its pinned authority", asy
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("doctor says whether the owner or the company consented, with the code's label", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-doctor-consent-"));
+  const environment = { PHIGON_DATA_DIR: directory, PHIGON_CONTROL_PLANE_URL: origin };
+  const doctor = async (args: readonly string[]): Promise<string> => {
+    let stdout = "";
+    await run(["doctor", ...args], environment, { stdout: (value) => { stdout += value; }, stderr: () => undefined });
+    return stdout;
+  };
+  try {
+    const store = new FileCredentialStore(directory);
+    await store.save(paired());
+    const owner = await check(directory);
+    assert.equal(owner.checks[1]?.detail, "The owner consented to the metadata profile on 2026-11-01T00:00:00.000Z.");
+    assert.deepEqual(owner.consent, {
+      source: "owner", profile: "metadata", policyVersion: "observer-policy-v1", consentedAt: "2026-11-01T00:00:00.000Z",
+    });
+    assert.match(await doctor([]), /^Consent: given by the computer's owner, at pairing, for the metadata profile$/mu);
+    assert.equal((JSON.parse(await doctor(["--json"])) as { consent?: { source: string } }).consent?.source, "owner");
+
+    await store.save(paired({ consentSource: "company", enrollmentCodeLabel: "Engineering laptops", consentProfile: "full" }));
+    const company = await check(directory);
+    assert.equal(
+      company.checks[1]?.detail,
+      'Your company consented for this computer to the full profile with the enrollment code "Engineering laptops" on 2026-11-01T00:00:00.000Z.',
+    );
+    assert.equal(company.consent?.source, "company");
+    assert.equal(company.consent?.enrollmentCodeLabel, "Engineering laptops");
+    assert.match(await doctor([]), /^Consent: given by your company, with the enrollment code "Engineering laptops", for the full profile$/mu);
+    const health = JSON.parse(await doctor(["--json"])) as { consent?: Record<string, string> };
+    assert.deepEqual(health.consent, {
+      source: "company", profile: "full", policyVersion: "observer-policy-v1",
+      consentedAt: "2026-11-01T00:00:00.000Z", enrollmentCodeLabel: "Engineering laptops",
+    });
+
+    await store.save(paired({ consentSource: "company", consentPolicyVersion: "observer-policy-v1" }));
+    assert.match((await check(directory)).checks[1]?.detail ?? "", /^Your company consented .* with an enrollment code on /u);
+
+    await store.save({
+      machineId: "machine-doctor", tenantId: "tenant-doctor", credential,
+      controlPlaneOrigin: origin, createdAt: "2026-11-01T00:00:00.000Z",
+    });
+    assert.match(await doctor([]), /^Consent: none current \(last given by the computer's owner, at pairing\)$/mu);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

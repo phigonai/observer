@@ -151,6 +151,8 @@ test("service settings keep what the observer needs and never a secret", async (
     PHIGON_DATA_DIR: "/elsewhere",
     PHIGON_MACHINE_TOKEN: "do-not-copy",
     PHIGON_SECRET_THING: "do-not-copy",
+    // An enrollment script may still have the code set when it installs.
+    PHIGON_ENROLLMENT_CODE: "do-not-copy",
     Path: "C:\\Windows;C:\\Tools",
     HTTPS_PROXY: "http://proxy.example:3128",
     no_proxy: "internal.example",

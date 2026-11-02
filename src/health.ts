@@ -1,5 +1,6 @@
 import { arch, hostname, platform, release } from "node:os";
 import type { ObserverConfig } from "./config.js";
+import { consentSourceOf, type StoredMachineCredential } from "./credential-store.js";
 
 const metadataOnlyCategories = new Set([
   "processMetadata",
@@ -13,6 +14,39 @@ export type ObserverStreamCursorHealth = Readonly<{
   acknowledgedSequence: string;
   updatedAt: string;
 }>;
+
+/**
+ * How this computer consented: its owner at pairing, or its company with an
+ * enrollment code. `profile` is missing when no current consent is stored.
+ */
+export type ObserverConsentHealth = Readonly<{
+  source: "owner" | "company";
+  profile?: "metadata" | "full";
+  policyVersion?: string;
+  consentedAt?: string;
+  enrollmentCodeLabel?: string;
+}>;
+
+/** The consent a stored credential records, for doctor. */
+export function consentHealth(credential: StoredMachineCredential): ObserverConsentHealth {
+  return Object.freeze({
+    source: consentSourceOf(credential),
+    ...(credential.consentProfile === undefined ? {} : { profile: credential.consentProfile }),
+    ...(credential.consentPolicyVersion === undefined ? {} : { policyVersion: credential.consentPolicyVersion }),
+    ...(credential.consentedAt === undefined ? {} : { consentedAt: credential.consentedAt }),
+    ...(credential.enrollmentCodeLabel === undefined ? {} : { enrollmentCodeLabel: credential.enrollmentCodeLabel }),
+  });
+}
+
+/** One line saying how the computer consented. */
+export function describeConsent(consent: ObserverConsentHealth): string {
+  const who = consent.source === "company"
+    ? `your company, with the enrollment code${consent.enrollmentCodeLabel === undefined ? "" : ` "${consent.enrollmentCodeLabel}"`}`
+    : "the computer's owner, at pairing";
+  return consent.profile === undefined
+    ? `none current (last given by ${who})`
+    : `given by ${who}, for the ${consent.profile} profile`;
+}
 
 export type ObserverHealth = Readonly<{
   status: "ready" | "needs-pairing";
@@ -39,6 +73,8 @@ export type ObserverHealth = Readonly<{
   }>;
   streamCursor?: ObserverStreamCursorHealth;
   streamCursorIssue?: string;
+  /** How this computer consented, when it is paired. */
+  consent?: ObserverConsentHealth;
   checkedAt: string;
 }>;
 
@@ -48,6 +84,7 @@ export function createHealthSnapshot(
   now: Date = new Date(),
   streamCursor?: ObserverStreamCursorHealth,
   streamCursorIssue?: string,
+  consent?: ObserverConsentHealth,
 ): ObserverHealth {
   return Object.freeze({
     status: config.machineTokenConfigured ? "ready" : "needs-pairing",
@@ -82,6 +119,7 @@ export function createHealthSnapshot(
       ? {}
       : { streamCursor: Object.freeze(streamCursor) }),
     ...(streamCursorIssue === undefined ? {} : { streamCursorIssue }),
+    ...(consent === undefined ? {} : { consent }),
     checkedAt: now.toISOString(),
   });
 }

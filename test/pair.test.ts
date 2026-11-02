@@ -79,6 +79,7 @@ test("pairMachine exchanges a code and persists only the machine credential", as
     assert.equal(stored?.machineId, result.machineId);
     assert.equal(stored?.consentProfile, "metadata");
     assert.equal(stored?.consentPolicyVersion, "observer-policy-v1");
+    assert.equal(stored?.consentSource, "owner");
     assert.equal(
       stored?.tenantId,
       "7d1b4cb4-a77d-4f53-af66-197e184683f4",

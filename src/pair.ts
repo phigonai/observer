@@ -13,14 +13,15 @@ import { InstanceLock } from "./instance-lock.js";
 export const OBSERVER_CONSENT_POLICY_VERSION = "observer-policy-v1";
 export type ConsentProfile = "metadata" | "full";
 
-type PairingMachine = Readonly<{
+export type PairingMachine = Readonly<{
   id: string;
   tenant_id: string;
   display_name: string;
   state: string;
 }>;
 
-type PairingResponse = Readonly<{
+/** What the pairing exchange and an enrollment both answer with. */
+export type ConnectedMachine = Readonly<{
   machine: PairingMachine;
   credential: string;
 }>;
@@ -38,9 +39,25 @@ export type PairResult = Readonly<{
   replacedMachineId?: string;
 }>;
 
-type ExchangeOutcome =
-  | Readonly<{ paired: PairingResponse }>
-  | Readonly<{ message: string; credentialRejected: boolean }>;
+/**
+ * One exchange with the control plane. A failure other than a stored key
+ * the server refused is `credentialRejected: false`, and its error is
+ * thrown as is.
+ */
+export type ExchangeOutcome<T extends ConnectedMachine> =
+  | Readonly<{ paired: T }>
+  | Readonly<{ error: Error; credentialRejected: boolean }>;
+
+/** The consent evidence a connection stores with the machine credential. */
+export type ConsentEvidence = Pick<
+  StoredMachineCredential,
+  | "consentProfile"
+  | "consentPolicyVersion"
+  | "consentedAt"
+  | "consentSource"
+  | "enrollmentCodeId"
+  | "enrollmentCodeLabel"
+>;
 
 export type PairOptions = Readonly<{
   config: ObserverConfig;
@@ -56,9 +73,6 @@ export async function pairMachine(options: PairOptions): Promise<PairResult> {
   if (code.length === 0) {
     throw new Error("Pairing code is required.");
   }
-  const installationID = await loadOrCreateInstallationID(
-    options.config.dataDirectory,
-  );
   if (
     options.config.observabilityProfile === "full" &&
     options.consentProfile !== "full"
@@ -72,40 +86,74 @@ export async function pairMachine(options: PairOptions): Promise<PairResult> {
     options.config.controlPlaneUrl,
   );
   const fetcher = options.fetcher ?? fetch;
+  const connected = await connectMachine<ConnectedMachine>({
+    config: options.config,
+    endpoint,
+    fetcher,
+    ...(options.credentialStore === undefined ? {} : { credentialStore: options.credentialStore }),
+    exchange: (installationID, existingCredential) => exchangePairing(fetcher, endpoint, {
+      code,
+      installation_id: installationID,
+      display_name: options.displayName?.trim() || hostname(),
+      hostname: hostname(),
+      operating_system: normalizedOperatingSystem(),
+      architecture: arch(),
+      consent: {
+        granted: true,
+        profile: options.consentProfile,
+        policy_version: OBSERVER_CONSENT_POLICY_VERSION,
+      },
+      ...(existingCredential === undefined ? {} : { existing_credential: existingCredential }),
+    }),
+    evidence: (_paired, at) => ({
+      consentProfile: options.consentProfile,
+      consentPolicyVersion: OBSERVER_CONSENT_POLICY_VERSION,
+      consentedAt: at,
+      consentSource: "owner",
+    }),
+  });
+  return connected.result;
+}
+
+export type ConnectOptions<T extends ConnectedMachine> = Readonly<{
+  config: ObserverConfig;
+  endpoint: URL;
+  fetcher: typeof fetch;
+  credentialStore?: CredentialStore;
+  /** Exchanges a code for this installation, with the stored key if any. */
+  exchange: (installationID: string, existingCredential?: string) => Promise<ExchangeOutcome<T>>;
+  /** The consent evidence to store with the credential `paired` returned. */
+  evidence: (paired: T, at: string) => ConsentEvidence;
+}>;
+
+/**
+ * Connects this computer with a code, keeping its machine when the server
+ * still accepts its stored key: pairing again, or enrolling, renews consent
+ * and keeps the same machine, so its queued activity stays deliverable.
+ * When the server no longer accepts the key, the computer connects as a
+ * new machine and its old queue moves aside.
+ */
+export async function connectMachine<T extends ConnectedMachine>(
+  options: ConnectOptions<T>,
+): Promise<Readonly<{ paired: T; result: PairResult }>> {
+  const dataDirectory = options.config.dataDirectory;
+  const installationID = await loadOrCreateInstallationID(dataDirectory);
   const credentialStore = options.credentialStore ??
-    new FileCredentialStore(options.config.dataDirectory);
+    new FileCredentialStore(dataDirectory);
   const previous = await credentialStore.load();
-  if (previous !== null && previous.controlPlaneOrigin !== endpoint.origin) {
+  if (previous !== null && previous.controlPlaneOrigin !== options.endpoint.origin) {
     throw new Error("The stored machine belongs to a different control plane. Use a separate data directory to pair another workspace.");
   }
-  const request = {
-    code,
-    installation_id: installationID,
-    display_name: options.displayName?.trim() || hostname(),
-    hostname: hostname(),
-    operating_system: normalizedOperatingSystem(),
-    architecture: arch(),
-    consent: {
-      granted: true,
-      profile: options.consentProfile,
-      policy_version: OBSERVER_CONSENT_POLICY_VERSION,
-    },
-  };
-  let paired: PairingResponse | undefined;
+  let paired: T | undefined;
   if (previous !== null) {
-    // Pairing again with the stored key renews consent and keeps the same
-    // machine, so its queued activity stays deliverable.
-    const renewal = await exchangePairing(fetcher, endpoint, {
-      ...request,
-      existing_credential: previous.credential,
-    });
+    const renewal = await options.exchange(installationID, previous.credential);
     if ("paired" in renewal) {
       paired = renewal.paired;
     } else if (!renewal.credentialRejected) {
-      throw new Error(renewal.message);
+      throw renewal.error;
     } else if (
       await credentialStillAccepted(
-        fetcher,
+        options.fetcher,
         options.config.controlPlaneUrl,
         previous.credential,
       )
@@ -115,7 +163,6 @@ export async function pairMachine(options: PairOptions): Promise<PairResult> {
     }
   }
 
-  const dataDirectory = options.config.dataDirectory;
   let lock: InstanceLock | undefined;
   try {
     if (paired === undefined || !sameMachine(previous, paired)) {
@@ -136,11 +183,11 @@ export async function pairMachine(options: PairOptions): Promise<PairResult> {
         ...(replacing ? [installationFileName] : []),
       ]);
       if (paired === undefined) {
-        const installation_id = replacing
+        const freshInstallationID = replacing
           ? await loadOrCreateInstallationID(dataDirectory)
           : installationID;
-        const fresh = await exchangePairing(fetcher, endpoint, { ...request, installation_id });
-        if (!("paired" in fresh)) throw new Error(fresh.message);
+        const fresh = await options.exchange(freshInstallationID);
+        if (!("paired" in fresh)) throw fresh.error;
         paired = fresh.paired;
       }
     }
@@ -152,9 +199,7 @@ export async function pairMachine(options: PairOptions): Promise<PairResult> {
       controlPlaneOrigin: options.config.controlPlaneUrl.origin,
       grpcOrigin: options.config.grpcUrl.origin,
       createdAt: pairedAt,
-      consentProfile: options.consentProfile,
-      consentPolicyVersion: OBSERVER_CONSENT_POLICY_VERSION,
-      consentedAt: pairedAt,
+      ...options.evidence(paired, pairedAt),
     });
   } finally {
     await lock?.release();
@@ -162,18 +207,21 @@ export async function pairMachine(options: PairOptions): Promise<PairResult> {
 
   const replaced = previous !== null && previous.machineId !== paired.machine.id;
   return Object.freeze({
-    machineId: paired.machine.id,
-    displayName: paired.machine.display_name,
-    state: paired.machine.state,
-    controlPlaneOrigin: options.config.controlPlaneUrl.origin,
-    credentialStored: true,
-    ...(replaced ? { replacedMachineId: previous.machineId } : {}),
+    paired,
+    result: Object.freeze({
+      machineId: paired.machine.id,
+      displayName: paired.machine.display_name,
+      state: paired.machine.state,
+      controlPlaneOrigin: options.config.controlPlaneUrl.origin,
+      credentialStored: true,
+      ...(replaced ? { replacedMachineId: previous.machineId } : {}),
+    }),
   });
 }
 
 function sameMachine(
   previous: StoredMachineCredential | null,
-  paired: PairingResponse,
+  paired: ConnectedMachine,
 ): boolean {
   return previous !== null &&
     previous.machineId === paired.machine.id &&
@@ -185,7 +233,7 @@ async function exchangePairing(
   fetcher: typeof fetch,
   endpoint: URL,
   body: Readonly<Record<string, unknown>>,
-): Promise<ExchangeOutcome> {
+): Promise<ExchangeOutcome<ConnectedMachine>> {
   let response: Response;
   try {
     response = await fetcher(endpoint, {
@@ -212,12 +260,8 @@ async function exchangePairing(
   if (!response.ok) {
     const failure = await apiError(response);
     return {
-      message: failure.message ?? `Pairing failed with HTTP ${response.status}.`,
-      // The exchange answers a key it no longer accepts with HTTP 400 and
-      // "machine credential is invalid".
-      credentialRejected: failure.code === "invalid_credential" ||
-        (response.status === 400 &&
-          /^machine credential is (?:invalid|revoked)\b/iu.test(failure.message ?? "")),
+      error: new Error(failure.message ?? `Pairing failed with HTTP ${response.status}.`),
+      credentialRejected: credentialRejected(response.status, failure),
     };
   }
   let value: unknown;
@@ -228,11 +272,28 @@ async function exchangePairing(
     // print fragments. The server supports retries for this installation.
     throw new Error("The pairing response was incomplete or invalid. Retry with the same code before it expires; keep the existing data directory.");
   }
-  return { paired: parsePairingResponse(value) };
+  if (!isConnectedMachine(value)) {
+    throw new Error("Control plane returned an invalid pairing response.");
+  }
+  return { paired: value };
 }
 
 /**
- * Whether the server still accepts a stored key. Only a key the server
+ * Whether a failed exchange refused the stored key. The server answers a
+ * key it no longer accepts with HTTP 400 and "machine credential is
+ * invalid".
+ */
+export function credentialRejected(
+  status: number,
+  failure: Readonly<{ code?: string; message?: string }>,
+): boolean {
+  return failure.code === "invalid_credential" ||
+    (status === 400 &&
+      /^machine credential is (?:invalid|revoked)\b/iu.test(failure.message ?? ""));
+}
+
+/**
+ * Whether a server still accepts a stored key. Only a key the server
  * itself calls invalid or revoked, because an administrator removed the
  * computer or revoked the key, may be set aside for a new pairing.
  */
@@ -273,32 +334,28 @@ async function credentialStillAccepted(
   );
 }
 
-function parsePairingResponse(value: unknown): PairingResponse {
-  if (
-    typeof value !== "object" ||
-    value === null ||
-    !("credential" in value) ||
-    typeof value.credential !== "string" ||
-    !value.credential.startsWith("phg_m_") ||
-    !("machine" in value) ||
-    typeof value.machine !== "object" ||
-    value.machine === null ||
-    !("id" in value.machine) ||
-    typeof value.machine.id !== "string" ||
-    !("tenant_id" in value.machine) ||
-    typeof value.machine.tenant_id !== "string" ||
-    !("display_name" in value.machine) ||
-    typeof value.machine.display_name !== "string" ||
-    !("state" in value.machine) ||
-    typeof value.machine.state !== "string"
-  ) {
-    throw new Error("Control plane returned an invalid pairing response.");
-  }
-  return value as PairingResponse;
+/** A response with a machine and a machine credential. */
+export function isConnectedMachine(value: unknown): value is ConnectedMachine {
+  return typeof value === "object" &&
+    value !== null &&
+    "credential" in value &&
+    typeof value.credential === "string" &&
+    value.credential.startsWith("phg_m_") &&
+    "machine" in value &&
+    typeof value.machine === "object" &&
+    value.machine !== null &&
+    "id" in value.machine &&
+    typeof value.machine.id === "string" &&
+    "tenant_id" in value.machine &&
+    typeof value.machine.tenant_id === "string" &&
+    "display_name" in value.machine &&
+    typeof value.machine.display_name === "string" &&
+    "state" in value.machine &&
+    typeof value.machine.state === "string";
 }
 
 /** The `{ error: { code, message } }` body of a failed control-plane call. */
-async function apiError(
+export async function apiError(
   response: Response,
 ): Promise<Readonly<{ code?: string; message?: string }>> {
   try {
@@ -326,7 +383,7 @@ async function apiError(
   return {};
 }
 
-function normalizedOperatingSystem(): "macos" | "linux" | "windows" {
+export function normalizedOperatingSystem(): "macos" | "linux" | "windows" {
   const value = platform();
   if (value === "darwin") return "macos";
   if (value === "win32") return "windows";

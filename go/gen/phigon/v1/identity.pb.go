@@ -364,8 +364,11 @@ type Heartbeat struct {
 	CoalescedEvents uint64 `protobuf:"varint,9,opt,name=coalesced_events,json=coalescedEvents,proto3" json:"coalesced_events,omitempty"`
 	// Highest sequence durably acknowledged by the control plane.
 	AcknowledgedSequence uint64 `protobuf:"varint,10,opt,name=acknowledged_sequence,json=acknowledgedSequence,proto3" json:"acknowledged_sequence,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// The observer that sent this heartbeat. Only version is set; older
+	// observers leave the field out.
+	ObserverBuild *BuildInfo `protobuf:"bytes,11,opt,name=observer_build,json=observerBuild,proto3" json:"observer_build,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Heartbeat) Reset() {
@@ -468,6 +471,13 @@ func (x *Heartbeat) GetAcknowledgedSequence() uint64 {
 	return 0
 }
 
+func (x *Heartbeat) GetObserverBuild() *BuildInfo {
+	if x != nil {
+		return x.ObserverBuild
+	}
+	return nil
+}
+
 var File_phigon_v1_identity_proto protoreflect.FileDescriptor
 
 const file_phigon_v1_identity_proto_rawDesc = "" +
@@ -509,7 +519,7 @@ const file_phigon_v1_identity_proto_rawDesc = "" +
 	"observedAt\x120\n" +
 	"\x06agents\x18\x03 \x03(\v2\x18.phigon.v1.AgentIdentityR\x06agents\x12\x18\n" +
 	"\apartial\x18\x04 \x01(\bR\apartial\x12\x18\n" +
-	"\anotices\x18\x05 \x03(\tR\anotices\"\xb2\x03\n" +
+	"\anotices\x18\x05 \x03(\tR\anotices\"\xef\x03\n" +
 	"\tHeartbeat\x12\x1d\n" +
 	"\n" +
 	"machine_id\x18\x01 \x01(\tR\tmachineId\x12;\n" +
@@ -523,7 +533,8 @@ const file_phigon_v1_identity_proto_rawDesc = "" +
 	"\x0edropped_events\x18\b \x01(\x04R\rdroppedEvents\x12)\n" +
 	"\x10coalesced_events\x18\t \x01(\x04R\x0fcoalescedEvents\x123\n" +
 	"\x15acknowledged_sequence\x18\n" +
-	" \x01(\x04R\x14acknowledgedSequenceB8Z6github.com/phigonai/observer/go/gen/phigon/v1;phigonv1b\x06proto3"
+	" \x01(\x04R\x14acknowledgedSequence\x12;\n" +
+	"\x0eobserver_build\x18\v \x01(\v2\x14.phigon.v1.BuildInfoR\robserverBuildB8Z6github.com/phigonai/observer/go/gen/phigon/v1;phigonv1b\x06proto3"
 
 var (
 	file_phigon_v1_identity_proto_rawDescOnce sync.Once
@@ -561,11 +572,12 @@ var file_phigon_v1_identity_proto_depIdxs = []int32{
 	9,  // 7: phigon.v1.AgentInventory.observed_at:type_name -> google.protobuf.Timestamp
 	1,  // 8: phigon.v1.AgentInventory.agents:type_name -> phigon.v1.AgentIdentity
 	9,  // 9: phigon.v1.Heartbeat.observed_at:type_name -> google.protobuf.Timestamp
-	10, // [10:10] is the sub-list for method output_type
-	10, // [10:10] is the sub-list for method input_type
-	10, // [10:10] is the sub-list for extension type_name
-	10, // [10:10] is the sub-list for extension extendee
-	0,  // [0:10] is the sub-list for field type_name
+	6,  // 10: phigon.v1.Heartbeat.observer_build:type_name -> phigon.v1.BuildInfo
+	11, // [11:11] is the sub-list for method output_type
+	11, // [11:11] is the sub-list for method input_type
+	11, // [11:11] is the sub-list for extension type_name
+	11, // [11:11] is the sub-list for extension extendee
+	0,  // [0:11] is the sub-list for field type_name
 }
 
 func init() { file_phigon_v1_identity_proto_init() }

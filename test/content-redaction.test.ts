@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
 import test from "node:test";
 import { credentialEnvironmentName, credentialName, redactSecrets } from "../src/content-redaction.js";
 
@@ -84,6 +85,9 @@ test("redaction covers Phigon keys, temporary cloud keys, signing secrets and we
     ["phg", "_", filler("a", 6), "234567", "_", filler("b", 16), "abcdef7654322345"],
     // Phigon license key: phl_<base64url payload>.<base64url signature>.
     ["phl", "_", "eyJ2IjoxLCJpZCI6Im", filler("Q", 40), ".", filler("s", 40), "-_AbC12345", filler("z", 36)],
+    // Phigon enrollment code: phe_<32 base64url characters>.
+    ["phe", "_", randomBytes(24).toString("base64url")],
+    ["phe", "_", filler("x", 10), "-_", filler("Y", 20)],
     ["AS", "IA", "Q3EGRLMN", "4XKP7TZW"],
     ["GOC", "SPX-", filler("k", 20), "_-Ab12Cd"],
     ["wh", "sec_", filler("m", 24), "+/AbC123=="],
@@ -103,6 +107,7 @@ test("redaction covers Phigon keys, temporary cloud keys, signing secrets and we
 test("new key formats leave lookalike words and addresses readable", () => {
   for (const ordinary of [
     "phg_status=ok and phl_note=see-docs",
+    "phe_enrollment_codes_table and phe_ alone stay readable",
     "ASIA PACIFIC, ASIAN markets and ASIAPACIFIC_REGION",
     "GOCSPX- is the prefix and whsec_ marks a signing secret",
     "redis://cache.internal:6379/0 and https://example.com:8443/path",
@@ -147,7 +152,7 @@ test("redaction stays linear on large single-token and dotted inputs", () => {
     }
     return [smallBest, largeBest];
   };
-  for (const [unit, count] of [["a", 500_000], ["a.", 250_000], ["ab_", 200_000], ["a://", 100_000], ["a-", 250_000], ["x_key=", 80_000], ["a://:", 80_000]] as const) {
+  for (const [unit, count] of [["a", 500_000], ["a.", 250_000], ["ab_", 200_000], ["a://", 100_000], ["a-", 250_000], ["x_key=", 80_000], ["a://:", 80_000], ["phe_", 100_000]] as const) {
     const [small, large] = fastest(unit.repeat(count / 4), unit.repeat(count));
     // Under 50 ms for the large input cannot be quadratic at this size
     // (minutes), and keeps timer noise on tiny durations from deciding.
