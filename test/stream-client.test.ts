@@ -1657,7 +1657,13 @@ test("a connected observer saves its unchanged checkpoint now and then, not on e
     },
   });
   const port = await bindServer(server);
-  const runWith = async (stateRefreshMs: number, heartbeatsWanted: number) => {
+  // Stops once `done` holds; the observer may still be handling the reply to
+  // the last heartbeat the server counted, so wait for what is asserted.
+  const runWith = async (
+    stateRefreshMs: number,
+    heartbeatsWanted: number,
+    done: (saved: readonly string[]) => boolean = () => true,
+  ) => {
     const saved: string[] = [];
     heartbeats = 0;
     const controller = new AbortController();
@@ -1672,7 +1678,7 @@ test("a connected observer saves its unchanged checkpoint now and then, not on e
       },
     });
     const watcher = setInterval(() => {
-      if (heartbeats >= heartbeatsWanted) controller.abort();
+      if (heartbeats >= heartbeatsWanted && done(saved)) controller.abort();
     }, 20);
     const deadline = setTimeout(() => controller.abort(), 15_000);
     try {
@@ -1688,7 +1694,8 @@ test("a connected observer saves its unchanged checkpoint now and then, not on e
     // Saved once when the stream connects; heartbeats within a minute add nothing.
     assert.deepEqual(await runWith(60_000, 3), ["7"]);
     // Once the interval passes, the next heartbeat saves it again.
-    assert.ok((await runWith(0, 3)).length >= 3);
+    const refreshed = await runWith(0, 3, (saved) => saved.length >= 3);
+    assert.ok(refreshed.length >= 3, `saved ${refreshed.length} times`);
   } finally {
     await shutdownServer(server);
     await rm(dataDirectory, { recursive: true, force: true });
