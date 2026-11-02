@@ -30,6 +30,13 @@ export {
   type PairResult,
 } from "./pair.js";
 export {
+  EnrollmentError,
+  enrollMachine,
+  enrollmentExitCodes,
+  type EnrollOptions,
+  type EnrollResult,
+} from "./enroll.js";
+export {
   BoundedEventQueue,
   type QueueMetrics,
 } from "./event-queue.js";

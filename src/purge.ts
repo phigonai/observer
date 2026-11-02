@@ -10,6 +10,7 @@ const observerFiles = new Set([
   "action-policy.json",
   "activity-cursors.json",
   "agent-action-receipts.json",
+  "collection-notice.json",
   "custom-agents.json",
   "historical-agent-identities.json",
   "installation-id",

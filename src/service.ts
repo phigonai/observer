@@ -273,8 +273,12 @@ const settingNames = new Set([
   "XDG_CONFIG_HOME", "XDG_DATA_HOME", "FLATPAK_XDG_DATA_HOME", "GOOSE_PATH_ROOT",
 ]);
 
-/** Names that may hold a secret are never copied, even from PHIGON_*. */
-const secretName = /TOKEN|SECRET|PASSWORD|PASSPHRASE|CREDENTIAL/u;
+/**
+ * Names that may hold a secret are never copied, even from PHIGON_*. That
+ * includes PHIGON_ENROLLMENT_CODE, which an enrollment script may still
+ * have set when it installs the service.
+ */
+const secretName = /TOKEN|SECRET|PASSWORD|PASSPHRASE|CREDENTIAL|ENROLLMENT/u;
 
 function allowedSetting(name: string): boolean {
   if (name === "PHIGON_DATA_DIR") return false;

@@ -536,6 +536,54 @@ test("observer renews the owner action capability manifest on heartbeats", async
   }
 });
 
+test("every heartbeat says which observer version sent it, and an unusable version is left out", async () => {
+  for (const [observerVersion, expected] of [
+    ["8.4.0", "8.4.0"],
+    [" 8.4.0-rc.1 ", "8.4.0-rc.1"],
+    ["8.4.0 beta", undefined],
+    ["9".repeat(65), undefined],
+    [undefined, undefined],
+  ] as const) {
+    const dataDirectory = await mkdtemp(join(tmpdir(), "phigon-heartbeat-version-"));
+    const machineId = "5f1b4cb4-a77d-4f53-af66-197e184683f4";
+    const server = new Server();
+    const controller = new AbortController();
+    const reported: Array<string | undefined> = [];
+    const implementation: UntypedServiceImplementation = {
+      streamTelemetry(
+        call: ServerDuplexStream<StreamTelemetryRequest, StreamTelemetryResponse>,
+      ) {
+        call.on("data", (request: StreamTelemetryRequest) => {
+          if (request.payload.case === "resume") {
+            call.write(policySnapshot(machineId));
+            call.write(acknowledgement(machineId, 0n));
+          }
+          if (request.payload.case === "heartbeat") {
+            reported.push(request.payload.value.observerBuild?.version);
+            if (reported.length === 2) controller.abort();
+          }
+        });
+        call.on("end", () => call.end());
+      },
+    };
+    server.addService(observerServiceDefinition, implementation);
+    const port = await bindServer(server);
+    const client = new ObserverStreamClient({
+      config: streamConfig(dataDirectory, port),
+      credentialStore: testCredentialStore(machineId),
+      ...(observerVersion === undefined ? {} : { observerVersion }),
+    });
+    try {
+      await client.run(controller.signal);
+      assert.deepEqual(reported, [expected, expected], String(observerVersion));
+    } finally {
+      controller.abort();
+      await shutdownServer(server);
+      await rm(dataDirectory, { recursive: true, force: true });
+    }
+  }
+});
+
 test("the stream learns the server's clock from its acknowledgements and policy", async () => {
   const dataDirectory = await mkdtemp(join(tmpdir(), "phigon-server-clock-"));
   const machineId = "5f1b4cb4-a77d-4f53-af66-197e184683f4";

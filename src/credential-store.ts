@@ -21,7 +21,26 @@ export type StoredMachineCredential = Readonly<{
   consentProfile?: "metadata" | "full";
   consentPolicyVersion?: string;
   consentedAt?: string;
+  /**
+   * Who consented: the computer's owner at pairing, or the company with an
+   * enrollment code. Credentials saved before enrollment codes existed have
+   * none and are the owner's.
+   */
+  consentSource?: ConsentSource;
+  /** The enrollment code the company consented with, by ID and label. */
+  enrollmentCodeId?: string;
+  enrollmentCodeLabel?: string;
 }>;
+
+export type ConsentSource = "owner" | "company";
+
+/** Who consented for this computer; the owner unless the company did. */
+export function consentSourceOf(credential: StoredMachineCredential): ConsentSource {
+  return credential.consentSource ?? "owner";
+}
+
+/** The longest enrollment code label kept, in characters. */
+export const maxEnrollmentCodeLabelLength = 100;
 
 export interface CredentialStore {
   save(value: StoredMachineCredential): Promise<void>;
@@ -139,6 +158,19 @@ function validateCredential(
       value.consentPolicyVersion !== "observer-policy-v1" ||
       !("consentedAt" in value) ||
       typeof value.consentedAt !== "string")
+  ) {
+    throw new Error("Stored machine consent evidence is invalid.");
+  }
+  if (
+    ("consentSource" in value &&
+      (value.consentSource !== "owner" && value.consentSource !== "company")) ||
+    // The company's consent is recorded only with its profile.
+    ("consentSource" in value && value.consentSource === "company" && !hasConsent) ||
+    ("enrollmentCodeId" in value &&
+      (typeof value.enrollmentCodeId !== "string" || value.enrollmentCodeId.length > 64)) ||
+    ("enrollmentCodeLabel" in value &&
+      (typeof value.enrollmentCodeLabel !== "string" ||
+        value.enrollmentCodeLabel.length > maxEnrollmentCodeLabelLength))
   ) {
     throw new Error("Stored machine consent evidence is invalid.");
   }

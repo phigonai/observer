@@ -61,7 +61,9 @@ import type {
   CollectionPolicy as WireCollectionPolicy,
 } from "./generated/phigon/v1/policy_pb.js";
 import {
+  consentHealth,
   createHealthSnapshot,
+  describeConsent,
   type ObserverStreamCursorHealth,
 } from "./health.js";
 import {
@@ -69,6 +71,13 @@ import {
   pairMachine,
   type ConsentProfile,
 } from "./pair.js";
+import {
+  EnrollmentError,
+  checkedEnrollmentCode,
+  enrollMachine,
+  enrollmentCodeVariable,
+  type EnrollResult,
+} from "./enroll.js";
 import { removeMachine } from "./remove-machine.js";
 import { forgetServerAuthority, parseAuthorityFingerprint, pinServerAuthority, trustAuthority } from "./server-authority.js";
 import { readServiceSettings, startService, stopService, uninstallService } from "./service.js";
@@ -97,6 +106,7 @@ import { StreamStateStore } from "./stream-state.js";
 import { connectionEnvironment } from "./connection-config.js";
 import { latestObserverVersion, newerVersion, offerObserverUpdate } from "./update.js";
 import { UserNotices } from "./user-notices.js";
+import { announceCompanyCollection } from "./collection-notice.js";
 import {
   defaultMaxDeliveryAgeMinutes,
   formatDoctorCheck,
@@ -204,11 +214,14 @@ export async function run(
     if (proxy.notice !== undefined) output.stderr(`${proxy.notice}\n`);
     const version = await readVersion();
     const json = flags.includes("--json");
+    // The company's code a device management script enrolls with. It never
+    // prompts, so it is never offered an update either.
+    const enrollmentCode = command === "pair" ? enrollmentCodeFrom(flags, callerEnvironment) : undefined;
     // A background service has a console under conhost on Windows, but nobody
     // reads it: it never prompts.
     const interactive = input === process.stdin && process.stdin.isTTY === true && process.stdout.isTTY === true && !json &&
       serviceSettingsFile === undefined;
-    if (command === "update" || (interactive && (command === "pair" || command === "run") && environment["PHIGON_UPDATE_CHECK"] !== "false")) {
+    if (command === "update" || (interactive && ((command === "pair" && enrollmentCode === undefined) || command === "run") && environment["PHIGON_UPDATE_CHECK"] !== "false")) {
       const latest = await latestObserverVersion(config.dataDirectory, { force: command === "update" });
       if (command === "update" && (json || flags.includes("--check"))) {
         output.stdout(`${JSON.stringify({ current: version, latest, updateAvailable: latest !== null && newerVersion(version, latest), status: latest === null ? "unavailable" : "checked" })}\n`);
@@ -701,6 +714,7 @@ export async function run(
           config,
           actionExecutor,
           serverClock,
+          observerVersion: version,
           onHistorySync: async (syncCommand) => {
             const rejected = (detail: string) => create(HistorySyncResultSchema, {
               jobId: syncCommand.jobId,
@@ -891,6 +905,16 @@ export async function run(
         const collecting = (async () => {
           const allocationSequence = await streamReady();
           if (allocationSequence === undefined) return;
+          // Collection starts now. Where the company consented, tell the
+          // person at the computer; a notice never holds collection up.
+          void announceCompanyCollection({
+            dataDirectory: config.dataDirectory,
+            credential,
+            profile: config.observabilityProfile,
+            notices: userNotices,
+          }).then((outcome) => {
+            if (outcome === "shown") output.stdout("Told the person at this computer that Phigon is recording AI agent activity.\n");
+          }, () => output.stderr("The start-of-collection notice could not be remembered; it is shown again on the next start.\n"));
           collector = new ActivityCollector({
             config,
             credential,
@@ -999,6 +1023,13 @@ export async function run(
       return 0;
     }
 
+    if (command === "pair" && enrollmentCode !== undefined) {
+      if (config.controlPlaneUrl.origin !== DEFAULT_CONTROL_PLANE_ORIGIN && !config.grpcEndpointConfigured) {
+        throw new Error("Custom workspaces require --grpc-url alongside --control-plane-url (or PHIGON_GRPC_URL). Copy both endpoints from your workspace's Connect machine dialog.");
+      }
+      return await enrollWithCode(enrollmentCode, flags, config, callerEnvironment, json, version, output);
+    }
+
     if (command === "pair") {
       if (config.controlPlaneUrl.origin !== DEFAULT_CONTROL_PLANE_ORIGIN && !config.grpcEndpointConfigured) {
         throw new Error("Custom workspaces require --grpc-url alongside --control-plane-url (or PHIGON_GRPC_URL). Copy both endpoints from your workspace's Connect machine dialog.");
@@ -1091,6 +1122,7 @@ export async function run(
       new Date(),
       streamCursor,
       streamCursorIssue,
+      storedCredential === null ? undefined : consentHealth(storedCredential),
     );
     output.stdout(
       json ? `${JSON.stringify(health, null, 2)}\n` : formatHealth(health),
@@ -1099,10 +1131,109 @@ export async function run(
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error.";
     (logged?.error ?? output.stderr)(`Observer command failed: ${message}\n`);
+    if (error instanceof EnrollmentError) {
+      if (flags.includes("--json")) {
+        output.stdout(`${JSON.stringify({
+          enrolled: false,
+          error: { code: error.code, message: error.message },
+          exitCode: error.exitCode,
+        }, null, 2)}\n`);
+      }
+      return error.exitCode;
+    }
     return 1;
   } finally {
     proxy?.restore();
   }
+}
+
+/**
+ * The enrollment code from --enrollment-code or PHIGON_ENROLLMENT_CODE, or
+ * undefined for an owner's pairing. The value is never repeated in errors.
+ */
+function enrollmentCodeFrom(flags: readonly string[], environment: NodeJS.ProcessEnv): string | undefined {
+  const flagGiven = flags.some((flag) => flag === "--enrollment-code" || flag.startsWith("--enrollment-code="));
+  const fromFlag = flagValue(flags, "--enrollment-code");
+  if (flagGiven && (fromFlag === undefined || fromFlag.trim() === "")) {
+    throw new Error(`--enrollment-code needs the code. Device management scripts should set ${enrollmentCodeVariable} instead, which keeps it out of process lists.`);
+  }
+  const fromEnvironment = environment[enrollmentCodeVariable]?.trim() || undefined;
+  const code = fromFlag ?? fromEnvironment;
+  if (code === undefined) return undefined;
+  if (flags.some((flag) => flag === "--code" || flag.startsWith("--code="))) {
+    throw new Error(`Use either --code with a one-time pairing code, or an enrollment code (--enrollment-code or ${enrollmentCodeVariable}), not both.`);
+  }
+  if (flags.some((flag) => flag === "--accept-consent" || flag === "--consent-profile" || flag.startsWith("--consent-profile="))) {
+    throw new Error("With an enrollment code your company has chosen the collection profile and given consent. Remove --consent-profile and --accept-consent.");
+  }
+  return code;
+}
+
+/**
+ * `pair` with an enrollment code: no prompt, the company's consent, and a
+ * distinct exit code for each failure a device management script can act on.
+ */
+async function enrollWithCode(
+  code: string,
+  flags: readonly string[],
+  config: ObserverConfig,
+  environment: NodeJS.ProcessEnv,
+  json: boolean,
+  version: string,
+  output: Output,
+): Promise<number> {
+  // Checked before anything is pinned or sent.
+  const enrollmentCode = checkedEnrollmentCode(code);
+  const displayName = flagValue(flags, "--name");
+  const authorityFlag = flagValue(flags, "--server-ca-sha256");
+  const authority = authorityFlag === undefined ? undefined : parseAuthorityFingerprint(authorityFlag);
+  if (authority !== undefined) {
+    await pinServerAuthority(config.controlPlaneUrl, authority, config.dataDirectory, undefined, {
+      proxy: proxyForUrl(config.controlPlaneUrl, proxySettings(environment)),
+    });
+  }
+  let result: Awaited<ReturnType<typeof enrollMachine>>;
+  try {
+    result = await enrollMachine({
+      config,
+      code: enrollmentCode,
+      observerVersion: version,
+      ...(displayName === undefined ? {} : { displayName }),
+      onRetry: (waitMs) => output.stderr(
+        `The Phigon server is busy. Trying again in ${Math.ceil(waitMs / 1_000)} seconds.\n`,
+      ),
+    });
+  } catch (error) {
+    // An authority pinned for an enrollment that failed is not kept.
+    if (authority !== undefined && await new FileCredentialStore(config.dataDirectory).load() === null) {
+      await forgetServerAuthority(config.dataDirectory);
+    }
+    throw error;
+  }
+  const warning = config.observabilityProfile === "full" && result.consent.profile !== "full"
+    ? "Your company's code covers the metadata profile only, so the observer does not start with PHIGON_OBSERVABILITY_PROFILE=full. Set it to metadata, or ask for a full-activity code."
+    : undefined;
+  if (warning !== undefined) output.stderr(`${warning}\n`);
+  output.stdout(json ? `${JSON.stringify({ enrolled: true, ...result }, null, 2)}\n` : formatEnrollResult(result));
+  return 0;
+}
+
+function formatEnrollResult(result: EnrollResult): string {
+  return [
+    "Computer enrolled.",
+    `Machine: ${result.displayName} (${result.machineId})`,
+    `Control plane: ${result.controlPlaneOrigin}`,
+    `Consent: given by your company${result.consent.enrollmentCodeLabel === undefined ? "" : ` with the enrollment code "${result.consent.enrollmentCodeLabel}"`}, ${result.consent.profile} profile`,
+    "Machine credential: stored securely",
+    ...(result.replacedMachineId === undefined
+      ? []
+      : [
+          `Earlier machine: ${result.replacedMachineId} (the workspace no longer accepted its key)`,
+          "This computer was enrolled as a new machine. Activity the earlier machine had not delivered was moved to the retired-pairings folder in the data directory.",
+        ]),
+    "Next step: phigon-observer service install",
+    "",
+  ].join("\n");
 }
 
 type PresentedGuardianDecision = Readonly<{
@@ -1488,6 +1619,8 @@ function helpText(): string {
     "  phigon-observer discover [--json]",
     "  phigon-observer ingest --agent <agent-id|custom> [--name <agent-name>] [--quiet] [--json]",
     "  phigon-observer pair --code <one-time-code> --consent-profile <metadata|full> [--control-plane-url <url> --grpc-url <url> [--server-ca-sha256 <fingerprint>]] [--name <machine-name>] [--accept-consent] [--json]",
+    "  PHIGON_ENROLLMENT_CODE=<code> phigon-observer pair [--control-plane-url <url> --grpc-url <url> [--server-ca-sha256 <fingerprint>]] [--name <machine-name>] [--json]",
+    "  phigon-observer pair --enrollment-code <code> [same options]",
     "  phigon-observer remove-machine [--purge] [--yes] [--json]",
     "  phigon-observer run [--profile <metadata|full>]",
     "  phigon-observer service install [--profile <metadata|full>] [--json]",
@@ -1505,6 +1638,7 @@ function helpText(): string {
     "The discover command reports a sanitized one-time local inventory.",
     "The ingest command accepts NDJSON on stdin for every supported bridge; use --agent custom --name <agent-name> for any other agent.",
     "The pair command shows the selected collection scope, requires machine-owner acceptance, and stores that evidence with the mode-0600 credential.",
+    "With a company's enrollment code (phe_...), pair asks nothing: the company has given consent and chosen the profile, which the observer stores and keeps collection within. Prefer PHIGON_ENROLLMENT_CODE to --enrollment-code, which shows in process lists. The code is never printed or stored. A busy server is retried a few times. Exit codes: 20 try again later, 21 the code expired, was revoked, is used up or outdated, 22 not a valid code, 23 this computer already used this code, 24 already connected to this workspace. Then run phigon-observer service install.",
     "The remove-machine command stops collection on this paired machine and revokes its credential; activity already collected stays until an administrator deletes the machine or it expires. It requires local confirmation. With --purge it also removes the background service and every file the observer keeps in the data directory.",
     "The run command maintains an authenticated, resumable telemetry stream; --profile applies the same portable local collection profile on Windows, macOS, and Linux.",
     "The service commands run the observer in the background for the signed-in user (a Task Scheduler task, a LaunchAgent or a systemd user unit) with this data directory and these settings, starting it at sign-in and again if it stops. Install needs a paired computer with the owner's consent.",
@@ -1958,6 +2092,7 @@ function formatHealth(health: ReturnType<typeof createHealthSnapshot>): string {
       : [
           `Stream cursor: ${health.streamCursor.acknowledgedSequence} for ${health.streamCursor.machineId}`,
         ]),
+    ...(health.consent === undefined ? [] : [`Consent: ${describeConsent(health.consent)}`]),
     `Content collection: ${health.safeCollectionDefaults ? "metadata only" : "explicit categories enabled"}`,
     "",
   ].join("\n");

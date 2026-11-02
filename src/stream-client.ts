@@ -64,6 +64,7 @@ import {
 } from "./generated/phigon/v1/policy_pb.js";
 import {
   ActivityKind,
+  BuildInfoSchema,
   PrivacyClass,
 } from "./generated/phigon/v1/common_pb.js";
 import {
@@ -118,6 +119,8 @@ export type StreamClientOptions = Readonly<{
   /** How often an unchanged checkpoint is saved again; tests shorten it. */
   stateRefreshMs?: number;
   responseTimeoutMs?: number;
+  /** This observer's version, sent with every heartbeat. */
+  observerVersion?: string;
 }>;
 
 export class ObserverStreamClient {
@@ -154,9 +157,11 @@ export class ObserverStreamClient {
   readonly #stateRefreshMs: number;
   readonly #responseTimeoutMs: number;
   readonly #serverClock: ServerClock | undefined;
+  readonly #observerVersion: string | undefined;
 
   constructor(options: StreamClientOptions) {
     this.#serverClock = options.serverClock;
+    this.#observerVersion = reportableVersion(options.observerVersion);
     this.#handshakeTimeoutMs = options.handshakeTimeoutMs ?? 20_000;
     this.#stateRefreshMs = options.stateRefreshMs ?? streamStateRefreshMs;
     this.#responseTimeoutMs = options.responseTimeoutMs ?? Math.max(30_000, options.config.heartbeatIntervalMs * 3);
@@ -464,6 +469,9 @@ export class ObserverStreamClient {
               droppedEvents: BigInt(queueMetrics.dropped),
               coalescedEvents: BigInt(queueMetrics.coalesced),
               acknowledgedSequence: queueMetrics.acknowledged,
+              ...(this.#observerVersion === undefined
+                ? {}
+                : { observerBuild: create(BuildInfoSchema, { version: this.#observerVersion }) }),
             }),
           },
         }),
@@ -1249,4 +1257,13 @@ function channelCredentials(config: ObserverConfig) {
 
 function isServiceError(error: unknown): error is ServiceError {
   return error instanceof Error && "code" in error;
+}
+
+/**
+ * The version a heartbeat reports: printable ASCII of at most 64 bytes, as
+ * the protocol allows. Anything else is left out rather than sent.
+ */
+function reportableVersion(version: string | undefined): string | undefined {
+  const value = version?.trim() ?? "";
+  return /^[!-~]{1,64}$/u.test(value) ? value : undefined;
 }

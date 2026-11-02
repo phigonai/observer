@@ -155,8 +155,9 @@ records. It starts when the user signs in and again if it stops:
   all, only the paths of Node.js, the observer and that file. A proxy address
   that includes a user name and password is saved there as it is, so prefer a
   proxy that does not need one in the address.
-- `service install` refuses until the computer is paired and its owner has
-  consented, and `--profile full` needs full-activity consent. Running it
+- `service install` refuses until the computer is paired and its owner (or,
+  with an enrollment code, its company) has consented, and `--profile full`
+  needs full-activity consent. Running it
   again replaces the earlier definition, so run it again after moving
   Node.js or changing settings.
 - `service status` says whether the service is installed and whether an
@@ -168,6 +169,61 @@ records. It starts when the user signs in and again if it stops:
   session). To keep it running after sign-out, an administrator can run
   `loginctl enable-linger <user>`.
 - What the service prints goes to `logs/observer.log` in the data directory.
+
+### Rolling out to many computers with an enrollment code
+
+A company that installs the observer with device management (Intune, Jamf or
+a Linux configuration tool) uses a reusable **enrollment code** (`phe_…`)
+from its administrator instead of one pairing code per computer. With an
+enrollment code **the company gives consent for its computers, and nobody at
+the computer is asked**. The administrator chose the profile, metadata or
+full activity, when creating the code; the server answers with it, and the
+observer stores it with the key and keeps collection within it exactly as it
+does for a profile an owner chose.
+
+Enroll as the signed-in user, with the code in the environment so it does
+not show in process lists, then install the background service:
+
+```sh
+PHIGON_ENROLLMENT_CODE="$(cat /path/to/code)" phigon-observer pair \
+  --control-plane-url https://phigon.corp.example:8443 \
+  --grpc-url https://phigon.corp.example:9443 --json
+phigon-observer service install
+```
+
+- `--enrollment-code <code>` works too, but anyone on the computer can see a
+  command line. `--server-ca-sha256 <fingerprint>` and `--name <name>` work
+  as with pairing; `--consent-profile` and `--accept-consent` are refused.
+- The code is never printed, logged or saved, and `service install` never
+  copies `PHIGON_ENROLLMENT_CODE` into its settings.
+- A computer already paired with the same server keeps its machine and key,
+  and its consent becomes the company's.
+- A busy server (HTTP 429 or 503) is asked again up to three times, after
+  the wait it asks for, within five minutes in all.
+- `doctor` shows who consented, the owner or the company and the code's
+  label, as a `Consent:` line and as `consent` in `--json` (`doctor --check`
+  too).
+- When it starts collecting, the observer tells the person at the computer
+  once with a system notification: "Phigon is recording AI agent activity",
+  what the profile records, the code's label and "Ask your IT team for
+  details". It tells them again when the profile changes. A computer whose
+  owner paired it gets no such notice, because the owner accepted the
+  profile at the keyboard. `PHIGON_USER_NOTICES=false` turns it off, and it
+  cannot show without the user's desktop session; it is remembered only once
+  shown, so it is tried again at the next start.
+
+A failed enrollment prints the server's sentence and exits with a code a
+script can act on (with `--json`, also an `{"enrolled": false, "error": …}`
+object):
+
+| Exit code | Meaning |
+| --- | --- |
+| `20` | The server was busy, unavailable or unreachable. Try again later. |
+| `21` | The code expired, was revoked, is used up or was made under an earlier policy. Ask for a new code. |
+| `22` | Not an enrollment code, or cut short. |
+| `23` | This computer enrolled with this code before and was removed since. Ask for a new code. |
+| `24` | This computer is already connected to the workspace. Check it with `doctor`. |
+| `1` | Anything else, such as a bad setting. |
 
 ## What is collected
 
@@ -193,6 +249,7 @@ settings. A full description is in
 | Command | What it does |
 | --- | --- |
 | `pair --code <code> --consent-profile <metadata\|full>` | Connects this computer to a workspace after local consent. |
+| `pair` with `PHIGON_ENROLLMENT_CODE` (or `--enrollment-code <code>`) | Enrolls this computer with a company's enrollment code, under the company's consent, without asking; see [above](#rolling-out-to-many-computers-with-an-enrollment-code). |
 | `run [--profile <metadata\|full>]` | Discovers agents and streams permitted activity. |
 | `service install [--profile <metadata\|full>]`, `service uninstall`, `service status` | Runs the observer in the background for the signed-in user, from sign-in on. |
 | `doctor [--profile <...>] [--json]` | Checks the setup without sending any data. |
@@ -256,7 +313,7 @@ Settings are environment variables. The most common ones:
 | `PHIGON_<AGENT>_ACTIVITY_DIRS` | Extra record folders for an agent, e.g. `PHIGON_CLAUDE_ACTIVITY_DIRS`. |
 | `PHIGON_REMOTE_ACTIONS_ENABLED` | Opt in to administrator-approved agent stop and force stop. Off by default. |
 | `PHIGON_REMOTE_COMMANDS_ENABLED` | Opt in to administrator-reviewed system operations. Off by default. |
-| `PHIGON_USER_NOTICES` | Set to `false` to stop telling the person at the computer when Phigon stops an agent, runs a command or restarts it. On by default. |
+| `PHIGON_USER_NOTICES` | Set to `false` to stop telling the person at the computer when Phigon stops an agent, runs a command or restarts it, and, on a computer enrolled with a company's code, that collection started. On by default. |
 | `PHIGON_UPDATE_CHECK` | Set to `false` to turn off the once-a-day update check. |
 | `PHIGON_LOG_LEVEL` | What `run` prints and writes to its log: `debug`, `info` (default), `warn` or `error`. |
 

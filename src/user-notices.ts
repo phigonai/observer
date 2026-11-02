@@ -55,6 +55,32 @@ export class UserNotices {
     });
   }
 
+  /**
+   * Tells the person at a computer whose company consented for it that
+   * Phigon records AI agent activity here, and what. Resolves to whether
+   * the notice was handed to the system, so the caller can try again on
+   * the next start when it was not.
+   */
+  async collectionStarted(input: Readonly<{ profile: "metadata" | "full"; label?: string; changed: boolean }>): Promise<boolean> {
+    if (this.#send === undefined) return false;
+    const label = input.label === undefined ? "" : plainText(input.label, 60);
+    const what = input.profile === "full"
+      ? "It records what AI agents do here, including prompts, replies and commands."
+      : "It records which AI agents run and what kinds of actions they take, not what they say.";
+    try {
+      await this.#send({
+        title: input.changed ? "Phigon changed what it records on this computer" : "Phigon is recording AI agent activity",
+        body: plainText(
+          `Your company turned on Phigon on this computer${label === "" ? "" : ` (${label})`}. ${what} Ask your IT team for details.`,
+          textLimit,
+        ),
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   #show(key: string, notice: UserNotice): void {
     if (this.#send === undefined) return;
     const now = this.#now();

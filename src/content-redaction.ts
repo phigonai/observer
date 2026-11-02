@@ -54,8 +54,9 @@ const broadCredentialNamePattern = /token|secret|passw(?:or)?d|api[_-]?key|passp
 
 // Well-known credential formats with a fixed prefix. Phigon access keys are
 // phg_<12 base32>_<32 base32>; license keys are phl_<payload>.<signature> in
-// base64url; AWS temporary key IDs are ASIA and 16 more characters.
-const tokenFormats = /\b(?:phg_[a-z2-7]{12}_[a-z2-7]{32}|phl_[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{43,}|ASIA[0-9A-Z]{16}\b|GOCSPX-[A-Za-z0-9_-]{20,}|whsec_[A-Za-z0-9+/]{20,}={0,2}|https?:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9_/-]+|glpat-[A-Za-z0-9_-]{20,}|xapp-[A-Za-z0-9-]{10,}|hf_[A-Za-z0-9]{30,}|ya29\.[A-Za-z0-9_-]{20,}|SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}|rk_(?:live|test)_[A-Za-z0-9]{10,}|shp(?:at|ca|pa|ss)_[a-fA-F0-9]{32}|dop_v1_[a-f0-9]{64}|pypi-[A-Za-z0-9_-]{50,})/gu;
+// base64url; enrollment codes are phe_<32 base64url>; AWS temporary key IDs
+// are ASIA and 16 more characters.
+const tokenFormats = /\b(?:phg_[a-z2-7]{12}_[a-z2-7]{32}|phl_[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{43,}|phe_[A-Za-z0-9_-]{32,}|ASIA[0-9A-Z]{16}\b|GOCSPX-[A-Za-z0-9_-]{20,}|whsec_[A-Za-z0-9+/]{20,}={0,2}|https?:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9_/-]+|glpat-[A-Za-z0-9_-]{20,}|xapp-[A-Za-z0-9-]{10,}|hf_[A-Za-z0-9]{30,}|ya29\.[A-Za-z0-9_-]{20,}|SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}|rk_(?:live|test)_[A-Za-z0-9]{10,}|shp(?:at|ca|pa|ss)_[a-fA-F0-9]{32}|dop_v1_[a-f0-9]{64}|pypi-[A-Za-z0-9_-]{50,})/gu;
 const credentialNamePattern = /passw(?:or)?d|passphrase|secret(?!s$)|token$|credentials?$|cookie$|api[_-]?key$|(?:access|account|private|signing|encryption|master|license|subscription|client)[_-]?key$|[_.-](?:key|pass|pwd)$|(?:^|[_.-])auth$|dsn$|connection[_-]?string/u;
 // Keys that name or index something rather than unlock it.
 const keyNamePattern = /(?:primary|foreign|sort|partition|cache|public|idempotency|unique|hash|range|row|object|composite)[_.-]?key$/u;
