@@ -4,14 +4,25 @@ import {
   chmod,
   mkdir,
   open,
+  readdir,
+  stat,
   unlink,
 } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import type { Readable } from "node:stream";
-import { activityBridgeAgent } from "./bridges.js";
+import { activityBridgeAgent, activityBridgeAgents } from "./bridges.js";
 
 const maxLineBytes = 1 << 20;
+// Bridge files wait for the collector, which deletes them once delivered.
+// While no observer runs, agent hooks keep adding files that can hold
+// activity content, so past these limits the oldest are deleted.
+const maxIngestedBytes = 100 << 20;
+const maxIngestedFiles = 2_000;
+// A writing marker this old was left by an ingest run that did not finish.
+const abandonedWritingMs = 3_600_000;
+
+export type IngestLimits = Readonly<{ maxBytes?: number; maxFiles?: number }>;
 
 /** Beside a bridge file that an `ingest` run is still writing. */
 export const bridgeWritingSuffix = ".writing";
@@ -33,6 +44,7 @@ export async function ingestActivityJSONL(options: Readonly<{
   agentName?: string;
   dataDirectory: string;
   input: Readable;
+  limits?: IngestLimits;
 }>): Promise<ActivityIngestResult> {
   const requestedAgent = options.agent.trim().toLowerCase();
   const customAgentName = requestedAgent === "custom"
@@ -128,6 +140,9 @@ export async function ingestActivityJSONL(options: Readonly<{
     await unlink(target);
   } else {
     await chmod(target, 0o600);
+    // Cleanup only frees disk space; the next run tries again.
+    await pruneIngestedFiles(bridgeRoot, target, options.limits ?? {})
+      .catch(() => undefined);
   }
   return Object.freeze({
     agent: agent.id,
@@ -138,6 +153,68 @@ export async function ingestActivityJSONL(options: Readonly<{
     malformed,
     oversized,
   });
+}
+
+/**
+ * Deletes the oldest `ingest` files, across every bridge, until the rest fit
+ * the byte and file limits. The file just written, and files another run is
+ * still writing, stay.
+ */
+async function pruneIngestedFiles(
+  bridgeRoot: string,
+  keep: string,
+  limits: IngestLimits,
+): Promise<void> {
+  const maxBytes = limits.maxBytes ?? maxIngestedBytes;
+  const maxFiles = limits.maxFiles ?? maxIngestedFiles;
+  const now = Date.now();
+  const files: Array<{ path: string; bytes: number; createdAt: number; removable: boolean }> = [];
+  for (const agent of activityBridgeAgents) {
+    const root = join(bridgeRoot, agent.id);
+    let names: string[];
+    try {
+      names = await readdir(root);
+    } catch {
+      continue;
+    }
+    const present = new Set(names);
+    for (const name of names) {
+      if (!ingestedBridgeFile.test(name)) continue;
+      const path = join(root, name);
+      let bytes: number;
+      let modifiedMs: number;
+      try {
+        ({ size: bytes, mtimeMs: modifiedMs } = await stat(path));
+      } catch {
+        continue;
+      }
+      const writing = present.has(`${name}${bridgeWritingSuffix}`) &&
+        now - modifiedMs < abandonedWritingMs;
+      files.push({
+        path,
+        bytes,
+        // The name starts with the time the run started.
+        createdAt: Number(name.slice(0, name.indexOf("-"))),
+        removable: path !== keep && !writing,
+      });
+    }
+  }
+  let bytes = files.reduce((total, file) => total + file.bytes, 0);
+  let count = files.length;
+  files.sort((left, right) => left.createdAt - right.createdAt);
+  for (const file of files) {
+    if (bytes <= maxBytes && count <= maxFiles) return;
+    if (!file.removable) continue;
+    try {
+      await unlink(file.path);
+    } catch {
+      // Gone already, or locked by another program.
+      continue;
+    }
+    await unlink(`${file.path}${bridgeWritingSuffix}`).catch(() => undefined);
+    bytes -= file.bytes;
+    count--;
+  }
 }
 
 function validatedAgentName(value: string | undefined): string {

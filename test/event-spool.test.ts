@@ -20,6 +20,7 @@ import {
   retirePairingState,
 } from "../src/event-spool.js";
 import { PrivacyClass } from "../src/generated/phigon/v1/common_pb.js";
+import { describeSpoolRestore } from "../src/stream-client.js";
 import {
   EventEnvelopeSchema,
   LifecycleEventSchema,
@@ -135,12 +136,13 @@ test("a spool left for another machine is moved aside instead of stopping the ob
 
     // The data directory was paired again as a new machine.
     const repaired = new FileBackedEventQueue(directory, 4);
-    const retired = repaired.restore(
+    const notice = repaired.restore(
       tenantID,
       otherMachineID,
       `phg_m_${"b".repeat(43)}`,
     );
-    assert.ok(retired !== undefined);
+    assert.ok(notice?.reason === "other_machine");
+    const retired = notice.directory;
     assert.equal(dirname(retired), join(directory, "retired-pairings"));
     assert.match(basename(retired), new RegExp(`-${machineID}-`, "u"));
     assert.equal(await readFile(join(retired, "telemetry-spool.jsonl"), "utf8"), previousSpool);
@@ -182,8 +184,8 @@ test("only the newest retired pairings are kept", async () => {
   }
 });
 
-test("event spool restore commits only after every durable record verifies", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "phigon-event-spool-atomic-"));
+test("a spool with a record that does not verify is moved aside and the queue starts empty", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-event-spool-damaged-"));
   const path = join(directory, "telemetry-spool.jsonl");
   try {
     const writer = new FileBackedEventQueue(directory, 4);
@@ -191,24 +193,55 @@ test("event spool restore commits only after every durable record verifies", asy
     writer.enqueue(lifecycleEvent(1n, "verified evidence"), 1n);
     writer.flush();
     const verified = await readFile(path, "utf8");
+    // A damaged record in the middle, with a good one after it.
     await appendFile(path, "{\"corrupt\":true}\n", "utf8");
+    writer.enqueue(lifecycleEvent(2n, "later evidence"), 2n);
+    writer.flush();
+    const damaged = await readFile(path, "utf8");
+    assert.ok(damaged.startsWith(verified));
+    await writeFile(join(directory, "stream-state.json"), "{}\n", "utf8");
 
     const restored = new FileBackedEventQueue(directory, 4);
-    assert.throws(
-      () => restored.restore(tenantID, machineID, credential),
-      /scope or record shape/u,
-    );
+    const notice = restored.restore(tenantID, machineID, credential);
+    assert.ok(notice?.reason === "damaged");
+    assert.equal(dirname(notice.directory), join(directory, "damaged-spools"));
+    assert.equal(await readFile(join(notice.directory, "telemetry-spool.jsonl"), "utf8"), damaged);
+    await assert.rejects(stat(path), { code: "ENOENT" });
+    // The stream cursor still belongs to this machine and stays.
+    assert.equal(await readFile(join(directory, "stream-state.json"), "utf8"), "{}\n");
     assert.equal(restored.metrics().depth, 0);
+    const message = describeSpoolRestore(notice);
+    assert.match(message, /damaged and could not be read/u);
+    assert.match(message, /continues with an empty queue/u);
+    assert.doesNotMatch(message, /evidence/u);
 
-    await writeFile(path, verified, "utf8");
-    restored.restore(tenantID, machineID, credential);
-    assert.deepEqual(restored.pending().map((event) => event.sequence), [1n]);
+    // Collection continues with a fresh spool that survives a restart.
+    restored.enqueue(lifecycleEvent(3n, "after the damage"), 3n);
+    restored.flush();
+    const restarted = new FileBackedEventQueue(directory, 4);
+    assert.equal(restarted.restore(tenantID, machineID, credential), undefined);
+    assert.equal(eventReason(restarted.pending()[0]), "after the damage");
+
+    // A spool written with another key does not verify either.
+    const otherKey = new FileBackedEventQueue(directory, 4);
+    assert.equal(
+      otherKey.restore(tenantID, machineID, `phg_m_${"c".repeat(43)}`)?.reason,
+      "damaged",
+    );
+
+    // Only the newest few damaged spools are kept.
+    for (let attempt = 0; attempt < 4; attempt++) {
+      await writeFile(path, "{\"corrupt\":true}\n", "utf8");
+      const again = new FileBackedEventQueue(directory, 4);
+      assert.equal(again.restore(tenantID, machineID, credential)?.reason, "damaged");
+    }
+    assert.equal((await readdir(join(directory, "damaged-spools"))).length, 3);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });
 
-test("event spool rejects oversized files before reading them", async () => {
+test("an oversized spool is moved aside without being read", async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-event-spool-bound-"));
   const path = join(directory, "telemetry-spool.jsonl");
   try {
@@ -216,11 +249,43 @@ test("event spool rejects oversized files before reading them", async () => {
     await handle.truncate((64 << 20) + 1);
     await handle.close();
     const restored = new FileBackedEventQueue(directory, 4);
-    assert.throws(
-      () => restored.restore(tenantID, machineID, credential),
-      /safe storage bound/u,
+    const notice = restored.restore(tenantID, machineID, credential);
+    assert.ok(notice?.reason === "damaged");
+    assert.equal(
+      (await stat(join(notice.directory, "telemetry-spool.jsonl"))).size,
+      (64 << 20) + 1,
     );
+    await assert.rejects(stat(path), { code: "ENOENT" });
     assert.equal(restored.metrics().depth, 0);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a spool with more events than the queue holds keeps the newest", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-event-spool-capacity-"));
+  try {
+    const writer = new FileBackedEventQueue(directory, 8);
+    writer.restore(tenantID, machineID, credential);
+    for (let sequence = 1n; sequence <= 6n; sequence++) {
+      writer.enqueue(lifecycleEvent(sequence, `event ${sequence}`), sequence);
+    }
+    writer.acknowledge(1n);
+    writer.flush();
+
+    // The queue capacity was lowered below the backlog of five events.
+    const smaller = new FileBackedEventQueue(directory, 3);
+    const notice = smaller.restore(tenantID, machineID, credential);
+    assert.deepEqual(notice, { reason: "over_capacity", dropped: 2 });
+    assert.deepEqual(smaller.pending().map((event) => event.sequence), [4n, 5n, 6n]);
+    assert.match(describeSpoolRestore(notice), /^2 queued events did not fit/u);
+    assert.doesNotMatch(describeSpoolRestore(notice), /event \d/u);
+
+    // The spool was rewritten to what was kept.
+    const restarted = new FileBackedEventQueue(directory, 3);
+    assert.equal(restarted.restore(tenantID, machineID, credential), undefined);
+    assert.deepEqual(restarted.pending().map((event) => event.sequence), [4n, 5n, 6n]);
+    assert.equal(restarted.metrics().acknowledged, 1n);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

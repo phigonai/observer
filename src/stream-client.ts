@@ -34,7 +34,7 @@ import {
   type CredentialStore,
 } from "./credential-store.js";
 import type { BoundedEventQueue, QueueMetrics } from "./event-queue.js";
-import { FileBackedEventQueue } from "./event-spool.js";
+import { FileBackedEventQueue, type SpoolRestoreNotice } from "./event-spool.js";
 import {
   HeartbeatSchema,
   type AgentInventory,
@@ -284,20 +284,16 @@ export class ObserverStreamClient {
     if (signal.aborted) return;
     if (this.#queue instanceof FileBackedEventQueue) {
       try {
-        const retired = this.#queue.restore(
+        const notice = this.#queue.restore(
           credential.tenantId,
           credential.machineId,
           credential.credential,
         );
-        if (retired !== undefined) {
-          this.#onStatus(
-            "Queued activity from an earlier pairing of this computer cannot be " +
-              `delivered as this machine; it was moved to ${retired}.`,
-          );
-        }
+        if (notice !== undefined) this.#onStatus(describeSpoolRestore(notice));
       } catch (error) {
-        // Retrying cannot repair a corrupt, oversized or foreign spool; stop
-        // and say so instead of reconnecting forever with nothing delivered.
+        // A damaged, oversized or foreign spool is moved aside by restore.
+        // What is left, such as a spool the disk will not let the observer
+        // read or rewrite, needs someone to look at the computer.
         throw new PermanentTelemetryError(
           `The local telemetry spool cannot be used (${error instanceof Error ? error.message : "unknown error"}). ` +
             "Keep the data directory and contact your administrator before removing it.",
@@ -942,6 +938,23 @@ function createTraceParent(): string {
 }
 
 class PermanentTelemetryError extends Error {}
+
+/** A plain sentence for the log; it names no activity content. */
+export function describeSpoolRestore(notice: SpoolRestoreNotice): string {
+  switch (notice.reason) {
+    case "other_machine":
+      return "Queued activity from an earlier pairing of this computer cannot be " +
+        `delivered as this machine; it was moved to ${notice.directory}.`;
+    case "damaged":
+      return "The queued activity on this computer was damaged and could not be " +
+        `read. It was moved to ${notice.directory}, and collection continues ` +
+        "with an empty queue.";
+    case "over_capacity":
+      return `${notice.dropped} queued ${notice.dropped === 1 ? "event" : "events"} ` +
+        "did not fit in the activity queue (PHIGON_ACTIVITY_QUEUE_CAPACITY). The " +
+        "newest were kept and the oldest were left out.";
+  }
+}
 
 function telemetryErrorSummary(error: unknown): string {
   if (isServiceError(error)) {

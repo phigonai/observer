@@ -13,7 +13,7 @@ import {
   toBinary,
 } from "@bufbuild/protobuf";
 import { timestampFromDate } from "@bufbuild/protobuf/wkt";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -1565,7 +1565,7 @@ test("legacy private pairings cannot fall back to hosted telemetry", async () =>
   assert.equal(checkpointReads, 0);
 });
 
-test("an unusable local spool stops the observer instead of retrying forever", async () => {
+test("a damaged local spool is moved aside and the observer keeps connecting", async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-stream-spool-"));
   const controller = new AbortController();
   const statuses: string[] = [];
@@ -1573,12 +1573,13 @@ test("an unusable local spool stops the observer instead of retrying forever", a
     config: streamConfig(directory, 1),
     credentialStore: testCredentialStore("machine"),
     queue: new FileBackedEventQueue(directory, 8),
-    // A transient-retry regression would report a disconnect; stop it there.
-    onStatus: (message) => { statuses.push(message); if (/disconnected/u.test(message)) controller.abort(); },
+    onStatus: (message) => { statuses.push(message); if (/^Connecting telemetry/u.test(message)) controller.abort(); },
   });
   try {
     await writeFile(join(directory, "telemetry-spool.jsonl"), "this is not a spool record\n", "utf8");
-    await assert.rejects(client.run(controller.signal), /spool/iu);
-    assert.deepEqual(statuses.filter((message) => /disconnected/u.test(message)), []);
+    await client.run(controller.signal);
+    assert.equal(statuses.filter((message) => /damaged and could not be read/u.test(message)).length, 1);
+    assert.ok(statuses.some((message) => /^Connecting telemetry/u.test(message)));
+    assert.equal((await readdir(join(directory, "damaged-spools"))).length, 1);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });

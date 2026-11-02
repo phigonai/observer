@@ -69,7 +69,7 @@ import {
 import { removeMachine } from "./remove-machine.js";
 import { forgetServerAuthority, parseAuthorityFingerprint, pinServerAuthority } from "./server-authority.js";
 import { hasByteHeadroom } from "./event-queue.js";
-import { InstanceLock } from "./instance-lock.js";
+import { InstanceLock, ObserverAlreadyRunningError } from "./instance-lock.js";
 import { clearEventSpool } from "./event-spool.js";
 import { GuardianDecisionJournal } from "./guardian-decision-journal.js";
 import {
@@ -473,24 +473,42 @@ export async function run(
           "JSON machine removal requires --yes after reviewing the removal scope.",
         );
       }
-      if (!flags.includes("--yes")) {
-        output.stdout(removeMachinePrompt(credential.machineId));
-        const confirmed = await readConfirmation(input);
-        if (confirmed !== "remove") {
-          throw new Error(
-            "Machine removal was not confirmed. No request was sent.",
-          );
-        }
+      // A running observer would keep writing the queue this removes, then
+      // stop as unpaired and be restarted by its service over and over.
+      let removalLock: InstanceLock;
+      try {
+        removalLock = await InstanceLock.acquire(config.dataDirectory);
+      } catch (error) {
+        if (!(error instanceof ObserverAlreadyRunningError)) throw error;
+        throw new Error(
+          "A Phigon observer is running with this data directory. Stop it, " +
+            "or stop its service, and then run remove-machine again. No " +
+            "request was sent.",
+        );
       }
-      const result = await removeMachine({
-        config,
-        credential,
-        clearCredential: async () => {
-          clearEventSpool(config.dataDirectory);
-          await forgetServerAuthority(config.dataDirectory);
-          return await credentialStore.clear();
-        },
-      });
+      let result: Awaited<ReturnType<typeof removeMachine>>;
+      try {
+        if (!flags.includes("--yes")) {
+          output.stdout(removeMachinePrompt(credential.machineId));
+          const confirmed = await readConfirmation(input);
+          if (confirmed !== "remove") {
+            throw new Error(
+              "Machine removal was not confirmed. No request was sent.",
+            );
+          }
+        }
+        result = await removeMachine({
+          config,
+          credential,
+          clearCredential: async () => {
+            clearEventSpool(config.dataDirectory);
+            await forgetServerAuthority(config.dataDirectory);
+            return await credentialStore.clear();
+          },
+        });
+      } finally {
+        await removalLock.release();
+      }
       output.stdout(
         json
           ? `${JSON.stringify(result, null, 2)}\n`

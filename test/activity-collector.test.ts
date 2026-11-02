@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -421,11 +421,14 @@ test("activity collector leaves source cursors untouched while delivery is backp
   }
 });
 
-test("multiple source identity saves preserve the first persistence failure", async () => {
+test("a source identity that cannot be saved is reported and saved again, without stopping collection", async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-source-save-fail-"));
   const sourceRoot = join(directory, "sessions");
   await mkdir(sourceRoot, { recursive: true });
   let callbacks = 0;
+  const saved: string[] = [];
+  const emitted: EventEnvelope[] = [];
+  const reported: SourceFailure[] = [];
   const collector = new ActivityCollector({
     config: loadContentConfig({
       PHIGON_DATA_DIR: join(directory, "data"),
@@ -440,14 +443,15 @@ test("multiple source identity saves preserve the first persistence failure", as
       createdAt: "2026-07-24T00:00:00.000Z",
     },
     initialSequence: 0n,
-    emit: () => undefined,
+    emit: (event) => emitted.push(event),
     sources: [{ adapterId: "generic", roots: [sourceRoot] }],
-    onSourceIdentity: () => {
+    onSourceIdentity: (identity) => {
       callbacks++;
-      return callbacks === 1
-        ? Promise.reject(new Error("catalog persistence failed"))
-        : Promise.resolve();
+      if (callbacks === 1) return Promise.reject(new Error("catalog persistence failed"));
+      saved.push(identity.agentId);
+      return Promise.resolve();
     },
+    onSourceFailure: (failure) => reported.push(failure),
   });
 
   try {
@@ -463,11 +467,107 @@ test("multiple source identity saves preserve the first persistence failure", as
       "utf8",
     );
 
-    await assert.rejects(
-      collector.scanOnce(),
-      /catalog persistence failed/u,
-    );
+    await collector.scanOnce();
     assert.equal(callbacks, 2);
+    assert.ok(emitted.length >= 2);
+    assert.deepEqual(
+      reported.map((failure) => [failure.adapterId, failure.message]),
+      [["agent identities", "catalog persistence failed"]],
+    );
+
+    // The identity that failed is saved with its source's next record.
+    const unsaved = emitted
+      .map((event) => event.agentId)
+      .find((agentID) => !saved.includes(agentID));
+    assert.ok(unsaved !== undefined);
+    for (const name of ["source-a.jsonl", "source-b.jsonl"]) {
+      await appendFile(
+        join(sourceRoot, name),
+        `${JSON.stringify({ type: "message", content: "again" })}\n`,
+        "utf8",
+      );
+    }
+    await collector.scanOnce();
+    assert.equal(callbacks, 3);
+    assert.ok(saved.includes(unsaved));
+    assert.equal(reported.length, 1);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a record that cannot be converted is skipped and reported without its content", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-record-throws-"));
+  const dataDirectory = join(directory, "data");
+  const sourceRoot = join(directory, "sessions");
+  await mkdir(sourceRoot, { recursive: true });
+  const emitted: EventEnvelope[] = [];
+  const reported: SourceFailure[] = [];
+  // A record whose every field read throws, as an unexpected bug in
+  // conversion would, placed before a good record in the same scan.
+  class PoisonedReader extends JSONLSourceReader {
+    poison = 0;
+    override async scan(
+      ...args: Parameters<JSONLSourceReader["scan"]>
+    ): ReturnType<JSONLSourceReader["scan"]> {
+      const result = await super.scan(...args);
+      const first = result.records[0];
+      if (first === undefined || this.poison === 0) return result;
+      const poisoned = Array.from({ length: this.poison }, (_, index) => ({
+        ...first,
+        sourceRecordId: `poisoned-${index}`,
+        value: new Proxy({}, {
+          get: () => {
+            throw new TypeError("conversion failed near private-record-text");
+          },
+        }),
+      }));
+      return { ...result, records: [...poisoned, ...result.records] };
+    }
+  }
+  const reader = new PoisonedReader(dataDirectory, true, 256 << 10, 1, "live");
+  const collector = new ActivityCollector({
+    config: loadContentConfig({
+      PHIGON_DATA_DIR: dataDirectory,
+      PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE: "1000",
+    }),
+    credential: {
+      machineId: "5f1b4cb4-a77d-4f53-af66-197e184683f4",
+      tenantId: "7d1b4cb4-a77d-4f53-af66-197e184683f4",
+      credential: `phg_m_${"0".repeat(43)}`,
+      controlPlaneOrigin: "http://127.0.0.1:8080",
+      createdAt: "2026-07-24T00:00:00.000Z",
+    },
+    initialSequence: 0n,
+    emit: (event) => emitted.push(event),
+    sources: [{ adapterId: "generic", roots: [sourceRoot] }],
+    reader,
+    onSourceFailure: (failure) => reported.push(failure),
+  });
+
+  try {
+    await collector.scanOnce();
+    const source = join(sourceRoot, "source.jsonl");
+    await writeFile(source, `${JSON.stringify({ type: "message", content: "kept" })}\n`, "utf8");
+    reader.poison = 1;
+    const before = collector.metrics().malformedRecords;
+    await collector.scanOnce();
+    assert.ok(emitted.length > 0);
+    assert.deepEqual(
+      emitted.map((event) => event.sequence),
+      emitted.map((_, index) => BigInt(index + 1)),
+    );
+    assert.equal(collector.metrics().malformedRecords, before + 1);
+    assert.deepEqual(reported.map((failure) => [failure.adapterId, failure.failures]), [["generic", 1]]);
+    assert.match(reported[0]?.message ?? "", /could not be converted and was skipped \(TypeError\)/u);
+    assert.doesNotMatch(JSON.stringify(reported), /private-record-text/u);
+
+    // A good record ends a run of failures; the next run is reported at
+    // its 1st, 2nd and 4th failure, and the scan goes on.
+    reader.poison = 7;
+    await appendFile(source, `${JSON.stringify({ type: "message", content: "more" })}\n`, "utf8");
+    await collector.scanOnce();
+    assert.deepEqual(reported.map((failure) => failure.failures), [1, 1, 2, 4]);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
