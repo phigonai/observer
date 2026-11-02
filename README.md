@@ -92,7 +92,7 @@ telemetry. The wire protocol is in [`proto/`](proto).
 
 ## Quick start
 
-You need **Node.js 24 or newer** and a Phigon workspace. Installed releases
+You need **Node.js 24.5 or newer** and a Phigon workspace. Installed releases
 include the Guardian runner for Windows, macOS and Linux on x64 and Arm64; Go is
 only needed to build from source.
 
@@ -119,12 +119,55 @@ phigon-observer pair --code YOUR-CODE --consent-profile full
 phigon-observer run --profile full
 ```
 
-Keep `phigon-observer run` running for live collection; closing the Phigon app
-does not stop it. Check the installation and connection at any time:
+To keep collecting after the terminal closes and after every restart, install
+the observer as a background service for the signed-in user:
 
 ```sh
-phigon-observer doctor --json
+phigon-observer service install --profile metadata   # or --profile full
 ```
+
+Closing the Phigon app does not stop it. Check the installation and connection
+at any time:
+
+```sh
+phigon-observer service status
+phigon-observer doctor --check
+```
+
+### Background service
+
+`service install` runs `phigon-observer run` in the background as the
+signed-in user, not as SYSTEM or root, because it reads that user's agent
+records. It starts when the user signs in and again if it stops:
+
+| System | What is installed | Restart |
+| --- | --- | --- |
+| Windows | A Task Scheduler task, "Phigon Observer", that runs at sign-in without a window | Started again within a minute |
+| macOS | A LaunchAgent, `~/Library/LaunchAgents/com.phigon.observer.plist` | launchd keeps it running (`KeepAlive`) |
+| Linux | A systemd user unit, `~/.config/systemd/user/phigon-observer.service` | `Restart=on-failure` |
+
+- The service runs the same Node.js and observer that ran `service install`,
+  with the same data directory. The settings it needs (`PHIGON_*`, `PATH`,
+  the proxy variables, `NODE_EXTRA_CA_CERTS` and the agents' folder settings)
+  are saved to `service-settings.json` in the data directory, which only this
+  user can read. Settings whose names suggest a secret (token, password and
+  similar) are never saved, and the service definition holds no settings at
+  all, only the paths of Node.js, the observer and that file. A proxy address
+  that includes a user name and password is saved there as it is, so prefer a
+  proxy that does not need one in the address.
+- `service install` refuses until the computer is paired and its owner has
+  consented, and `--profile full` needs full-activity consent. Running it
+  again replaces the earlier definition, so run it again after moving
+  Node.js or changing settings.
+- `service status` says whether the service is installed and whether an
+  observer is running with its data directory. `service uninstall` stops it
+  and removes it.
+- A data directory other than the default gets its own service, named with a
+  short code made from its path.
+- On Linux the service runs while the user is signed in (a desktop or SSH
+  session). To keep it running after sign-out, an administrator can run
+  `loginctl enable-linger <user>`.
+- What the service prints goes to `logs/observer.log` in the data directory.
 
 ## What is collected
 
@@ -151,16 +194,38 @@ settings. A full description is in
 | --- | --- |
 | `pair --code <code> --consent-profile <metadata\|full>` | Connects this computer to a workspace after local consent. |
 | `run [--profile <metadata\|full>]` | Discovers agents and streams permitted activity. |
+| `service install [--profile <metadata\|full>]`, `service uninstall`, `service status` | Runs the observer in the background for the signed-in user, from sign-in on. |
 | `doctor [--profile <...>] [--json]` | Checks the setup without sending any data. |
+| `doctor --check [--max-delivery-age <minutes>] [--json]` | Checks that collection is working, with an exit code for scripts. |
 | `discover [--json]` | Prints a one-time, sanitized inventory of local agents. |
 | `agent add \| list \| remove` | Manages custom agent definitions. |
 | `ingest --agent <id\|custom> [--name <name>]` | Reads NDJSON activity from stdin (bridges). |
 | `guardian status \| exec \| launch` | Guardian checks and managed execution. |
 | `authorize-action --action <a> --resource <r>` | Asks Guardian whether one action may run. |
 | `update [--check] [--yes]` | Checks for or installs a new release. |
-| `remove-machine` | Stops collection and revokes this computer's key. Activity already collected stays with the company until an administrator deletes the computer or it expires. |
+| `remove-machine [--purge]` | Stops collection and revokes this computer's key. Activity already collected stays with the company until an administrator deletes the computer or it expires. `--purge` also removes the background service and the observer's local files; see [Uninstall](#uninstall). |
 
 Run `phigon-observer help` for every flag.
+
+### Checking a computer from scripts
+
+`doctor --check` is meant for device management scripts. It sends no
+activity: it reads the local state and asks the control plane's `/healthz`
+(through the configured proxy and pinned authority, with a five-second
+limit). It exits with the code of the first problem it finds:
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Everything checked out. |
+| `1` | The check itself could not run, for example because of a bad setting. |
+| `3` | This computer is not paired, or its pairing data cannot be read. |
+| `4` | The owner's consent is missing or out of date. Pair again. |
+| `5` | No observer is running with this data directory. |
+| `6` | The workspace has not confirmed delivery for longer than `--max-delivery-age` minutes (default 15). A connected observer confirms at least once a minute, even when no agent is active. |
+| `7` | The control plane did not answer. |
+
+`--json` prints every check with its result. Plain `doctor` keeps exiting
+`0`.
 
 ### A company's own Phigon server
 
@@ -193,11 +258,41 @@ Settings are environment variables. The most common ones:
 | `PHIGON_REMOTE_COMMANDS_ENABLED` | Opt in to administrator-reviewed system operations. Off by default. |
 | `PHIGON_USER_NOTICES` | Set to `false` to stop telling the person at the computer when Phigon stops an agent, runs a command or restarts it. On by default. |
 | `PHIGON_UPDATE_CHECK` | Set to `false` to turn off the once-a-day update check. |
-| `PHIGON_LOG_LEVEL` | Logging detail. |
+| `PHIGON_LOG_LEVEL` | What `run` prints and writes to its log: `debug`, `info` (default), `warn` or `error`. |
+
+`run` also writes what it prints to `logs/observer.log` in the data directory,
+so a background service leaves a record. The log is rotated at about 5 MB and
+keeps three files. Like the terminal output, it never contains activity
+content, credentials or secrets.
 
 Never disable certificate verification. Interactive `pair` and `run` sessions
 check npm for a new release at most once a day and ask before updating;
 background services and `--json` commands never prompt or update on their own.
+
+### Corporate proxies
+
+The observer sends every HTTPS call (pairing, `remove-machine`, update checks,
+Guardian, `doctor --check`) and the telemetry stream through the proxy that
+`HTTPS_PROXY` names, or `HTTP_PROXY` when only that is set. `NO_PROXY` lists
+hosts it reaches directly. Either case works; when both are set, the lowercase
+name wins. A user name and password in the proxy address are supported and
+never printed.
+
+- `NO_PROXY` is a comma-separated list of host names. `example.com`,
+  `.example.com` and `*.example.com` each cover `example.com` and every host
+  under it, `*` turns the proxy off, and `host:port` applies to that port only.
+- HTTPS passes through the proxy as a CONNECT tunnel, and TLS is negotiated
+  with the Phigon server inside it, so certificate checks, including the
+  authority pinned for a company's own server, still apply. A proxy that
+  inspects TLS must leave the Phigon endpoints alone; the observer never turns
+  certificate checks off.
+- The telemetry stream uses the same settings, but it can use only an
+  `http://` proxy address, and it cannot check ports or address ranges in
+  `NO_PROXY`. Set `grpc_proxy` (and `no_grpc_proxy`) to give the stream
+  different ones.
+- Node.js 24.14 or newer applies these settings by itself. On Node.js 24.5 to
+  24.13, also set `NODE_USE_ENV_PROXY=1` in the environment that starts the
+  observer.
 
 ## Custom agents
 
@@ -310,6 +405,32 @@ ones started outside `guardian launch`. Discovery happens after launch, so it
 cannot undo earlier activity. A company that must prevent bypass also needs
 operating-system application control and a controlled model provider proxy.
 
+## Uninstall
+
+To remove this computer from the workspace and delete everything the observer
+keeps on it, then the program itself:
+
+```sh
+phigon-observer remove-machine --purge
+npm uninstall --global @phigon/observer
+```
+
+`remove-machine --purge` does what `remove-machine` does (collection stops and
+this computer's key is revoked), then stops and removes the background
+service and deletes every file the observer keeps in its data directory,
+including activity that was not delivered yet. It removes only files the
+observer created, and the data directory itself once it is empty. It also
+works on a computer that is no longer paired. If the workspace cannot be
+reached, nothing is deleted and the service is started again.
+
+Without `--purge`, `remove-machine` keeps the observer's local progress files
+so the computer can be paired again where it left off. Use a separate
+`service uninstall` to remove only the background service.
+
+Either way, the activity the company already collected stays in the workspace
+until an administrator deletes the computer or it expires under the retention
+policy; removing the observer from a computer never erases it.
+
 ## Troubleshooting
 
 - **Command not found:** put npm's global bin directory on `PATH` and reopen
@@ -317,7 +438,10 @@ operating-system application control and a controlled model provider proxy.
 - **Expired pairing code:** generate a new one in **Connect machine**.
 - **No conversations:** the metadata profile excludes content. Check with
   `phigon-observer doctor --profile full --json`.
-- **Disconnected:** keep `run` running and allow its HTTPS and gRPC endpoints.
+- **Collection stops after a restart:** install the background service with
+  `phigon-observer service install`, and read `logs/observer.log` in the data
+  directory.
+- **Disconnected:** keep the observer running and allow its HTTPS and gRPC endpoints.
   Queued activity is delivered when the connection returns.
 - **Older self-hosted pairing without a saved stream endpoint:** pass
   `run --grpc-url https://stream.your-company.example` or set `PHIGON_GRPC_URL`.
@@ -331,7 +455,7 @@ More help: [setup guide](https://phigon.online/docs/get-started/),
 
 ## Building from source
 
-You need Node.js 24+ and Go 1.26+.
+You need Node.js 24.5+ and Go 1.26+.
 
 ```sh
 npm ci

@@ -223,9 +223,7 @@ export function loadConfig(
     controlPlaneUrl,
     grpcUrl,
     grpcEndpointConfigured: Boolean(environment["PHIGON_GRPC_URL"]?.trim()),
-    dataDirectory:
-      environment["PHIGON_DATA_DIR"]?.trim() ||
-      join(homedir(), ".phigon", "observer"),
+    dataDirectory: dataDirectoryFrom(environment),
     heartbeatIntervalMs,
     discoveryIntervalMs,
     activityScanIntervalMs,
@@ -373,6 +371,12 @@ export function loadConfig(
     policy: collection.policy,
     contentSettingsOutsideProfile: collection.refused,
   });
+}
+
+/** `PHIGON_DATA_DIR`, or ~/.phigon/observer when it is not set. */
+export function dataDirectoryFrom(environment: NodeJS.ProcessEnv): string {
+  return environment["PHIGON_DATA_DIR"]?.trim() ||
+    join(homedir(), ".phigon", "observer");
 }
 
 function parseControlPlaneUrl(value: string): URL {

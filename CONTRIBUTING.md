@@ -40,7 +40,7 @@ A check on every pull request fails if a commit is not signed off.
 
 ## Development
 
-You need Node.js 24+ and Go 1.26+.
+You need Node.js 24.5+ and Go 1.26+.
 
 ```sh
 npm ci

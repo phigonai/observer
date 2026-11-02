@@ -1583,3 +1583,66 @@ test("a damaged local spool is moved aside and the observer keeps connecting", a
     assert.equal((await readdir(join(directory, "damaged-spools"))).length, 1);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
+
+test("a connected observer saves its unchanged checkpoint now and then, not on every heartbeat", async () => {
+  const dataDirectory = await mkdtemp(join(tmpdir(), "phigon-stream-refresh-"));
+  const machineId = "3a1b4cb4-a77d-4f53-af66-197e184683f4";
+  const server = new Server();
+  let heartbeats = 0;
+  server.addService(observerServiceDefinition, {
+    streamTelemetry(
+      call: ServerDuplexStream<StreamTelemetryRequest, StreamTelemetryResponse>,
+    ) {
+      call.on("data", (request: StreamTelemetryRequest) => {
+        if (request.payload.case === "resume") {
+          call.write(policySnapshot(machineId));
+          call.write(acknowledgement(machineId, 7n));
+          return;
+        }
+        // The control plane answers every heartbeat with its checkpoint.
+        if (request.payload.case === "heartbeat") {
+          heartbeats++;
+          call.write(acknowledgement(machineId, 7n));
+        }
+      });
+      call.on("end", () => call.end());
+    },
+  });
+  const port = await bindServer(server);
+  const runWith = async (stateRefreshMs: number, heartbeatsWanted: number) => {
+    const saved: string[] = [];
+    heartbeats = 0;
+    const controller = new AbortController();
+    const client = new ObserverStreamClient({
+      config: streamConfig(dataDirectory, port),
+      credentialStore: testCredentialStore(machineId),
+      queue: new BoundedEventQueue<EventEnvelope>(128),
+      stateRefreshMs,
+      stateStore: {
+        load: async () => ({ machineId, acknowledgedSequence: 7n, updatedAt: new Date(0).toISOString() }),
+        save: async (_machine, sequence) => { saved.push(sequence.toString()); },
+      },
+    });
+    const watcher = setInterval(() => {
+      if (heartbeats >= heartbeatsWanted) controller.abort();
+    }, 20);
+    const deadline = setTimeout(() => controller.abort(), 15_000);
+    try {
+      await client.run(controller.signal);
+    } finally {
+      clearInterval(watcher);
+      clearTimeout(deadline);
+    }
+    assert.ok(heartbeats >= heartbeatsWanted, `saw ${heartbeats} heartbeats`);
+    return saved;
+  };
+  try {
+    // Saved once when the stream connects; heartbeats within a minute add nothing.
+    assert.deepEqual(await runWith(60_000, 3), ["7"]);
+    // Once the interval passes, the next heartbeat saves it again.
+    assert.ok((await runWith(0, 3)).length >= 3);
+  } finally {
+    await shutdownServer(server);
+    await rm(dataDirectory, { recursive: true, force: true });
+  }
+});

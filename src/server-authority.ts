@@ -1,9 +1,10 @@
 import { createHash, X509Certificate } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { rm, writeFile } from "node:fs/promises";
-import { isIP } from "node:net";
+import { isIP, type Socket } from "node:net";
 import { join } from "node:path";
 import * as tls from "node:tls";
+import { connectThroughProxy } from "./proxy.js";
 
 /**
  * A company's own Phigon server (run by the Phigon app) signs its HTTPS
@@ -57,18 +58,23 @@ type Connect = (options: tls.ConnectionOptions, listener: () => void) => tls.TLS
  * Finds the certificate in the server's chain whose SHA-256 matches the
  * pinned fingerprint, saves it and trusts it. Nothing is sent to the server
  * on this connection; the requests that follow are verified normally,
- * including the server's name, against the pinned authority.
+ * including the server's name, against the pinned authority. Behind a
+ * proxy (`options.proxy`), the chain is read through a CONNECT tunnel.
  */
 export async function pinServerAuthority(
   url: URL,
   fingerprint: string,
   dataDirectory: string,
   connect: Connect = tls.connect,
+  options: Readonly<{ proxy?: URL | undefined }> = {},
 ): Promise<string> {
   if (url.protocol !== "https:") {
     throw new Error("--server-ca-sha256 needs an https:// control plane URL.");
   }
-  const chain = await peerChain(url, connect);
+  const tunnel = options.proxy === undefined
+    ? undefined
+    : await connectThroughProxy(options.proxy, url.hostname.replace(/^\[|\]$/gu, ""), Number(url.port || 443));
+  const chain = await peerChain(url, connect, tunnel);
   const match = chain.find((raw) => createHash("sha256").update(raw).digest("hex") === fingerprint);
   if (match === undefined) {
     throw new Error("The server's certificate does not match the fingerprint in the pairing command. Check that this computer is on the right network and that you copied the whole command.");
@@ -80,13 +86,12 @@ export async function pinServerAuthority(
   return file;
 }
 
-function peerChain(url: URL, connect: Connect): Promise<Buffer[]> {
+function peerChain(url: URL, connect: Connect, tunnel: Socket | undefined): Promise<Buffer[]> {
   const host = url.hostname.replace(/^\[|\]$/gu, "");
   const port = Number(url.port || 443);
   return new Promise((resolve, reject) => {
     const socket = connect({
-      host,
-      port,
+      ...(tunnel === undefined ? { host, port } : { socket: tunnel }),
       ...(isIP(host) ? {} : { servername: host }),
       // Only to read the chain; the fingerprint decides what is trusted.
       rejectUnauthorized: false,

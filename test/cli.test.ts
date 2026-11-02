@@ -131,7 +131,7 @@ test("portable profile flags fail closed outside doctor and run", async () => {
   );
 
   assert.equal(exitCode, 1);
-  assert.match(stderr, /supported only by doctor and run/u);
+  assert.match(stderr, /supported only by doctor, run and service install/u);
 });
 
 test("run collects no content on a computer whose owner consented to metadata only", { timeout: 10_000 }, async () => {
@@ -1215,6 +1215,47 @@ test("guardian launch rejects an agent ID the control plane would refuse, before
       assert.match(stderr, /--agent must be 1-128 letters, numbers/u, agent);
     }
 
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("run stops cleanly when asked to stop before the stream connects", { timeout: 60_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-cli-early-stop-"));
+  try {
+    await new FileCredentialStore(directory).save({
+      machineId: "machine-early-stop",
+      tenantId: "tenant-early-stop",
+      credential: `phg_m_${"e".repeat(43)}`,
+      controlPlaneOrigin: "http://127.0.0.1:9",
+      grpcOrigin: "http://127.0.0.1:9",
+      createdAt: "2026-11-02T00:00:00.000Z",
+      consentProfile: "metadata",
+      consentPolicyVersion: "observer-policy-v1",
+      consentedAt: "2026-11-02T00:00:00.000Z",
+    });
+    let stdout = "";
+    let stderr = "";
+    let stopped = false;
+    const exitCode = await run(["run"], {
+      PHIGON_DATA_DIR: directory,
+      PHIGON_UPDATE_CHECK: "false",
+      PHIGON_DISCOVERY_INTERVAL_MS: "60000",
+    }, {
+      stdout: (value) => {
+        stdout += value;
+        // The stream cannot connect; stop while it is still trying.
+        if (!stopped && value.includes("Connecting telemetry")) {
+          stopped = true;
+          setImmediate(() => process.emit("SIGTERM", "SIGTERM"));
+        }
+      },
+      stderr: (value) => { stderr += value; },
+    });
+    assert.equal(exitCode, 0, stderr);
+    assert.match(stdout, /Observer stopped\./u);
+    assert.doesNotMatch(stderr, /readiness wait was aborted|Observer command failed/u);
+    assert.equal(process.listenerCount("SIGTERM"), 0);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
