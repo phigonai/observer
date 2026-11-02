@@ -198,7 +198,11 @@ test("service settings keep what the observer needs and never a secret", async (
   }
 });
 
-test("Windows install registers the task from UTF-16 XML, replaces an earlier one and starts it", async () => {
+// Installing writes real files under the data directory, so a Windows install
+// runs only where that directory is a Windows path.
+const onlyOnWindows = process.platform === "win32" ? false : "writes the task's files under a Windows data directory";
+
+test("Windows install registers the task from UTF-16 XML, replaces an earlier one and starts it", { skip: onlyOnWindows }, async () => {
   const home = await temporary("phigon-service-windows-");
   const xmlFiles: string[] = [];
   const { calls, runner } = recorder();
@@ -242,7 +246,8 @@ test("macOS install writes the LaunchAgent and loads it in the user's session", 
     return {};
   });
   try {
-    const service = context("macos", home, { run: runner });
+    // The settings file is written for real, so it goes in this test's folder.
+    const service = context("macos", home, { run: runner, dataDirectory: join(home, "data") });
     const result = await installService(service, {});
     const plist = join(home, "Library", "LaunchAgents", "com.phigon.observer.plist");
     assert.equal(result.definition, plist);
@@ -318,7 +323,14 @@ test("a service manager failure is one plain sentence", async () => {
       run: async () => ({ code: 1, stdout: "", stderr: "Failed to connect to bus: No medium found" }),
     });
     await assert.rejects(installService(noBus, {}), /could not be installed \(Failed to connect to bus: No medium found\)\. Sign in to this computer/u);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
 
+test("a Task Scheduler failure is one plain sentence and leaves no task file", { skip: onlyOnWindows }, async () => {
+  const home = await temporary("phigon-service-denied-");
+  try {
     const denied = context("windows", home, {
       dataDirectory: home,
       run: async () => ({ code: 1, stdout: "", stderr: "ERROR: Access is denied.\r\n" }),
