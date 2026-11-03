@@ -1,4 +1,7 @@
-import { GuardianDecisionUnavailableError } from "./agentic-guardian.js";
+import { connectionFailure, GuardianDecisionUnavailableError } from "./agentic-guardian.js";
+
+/** A response the server sent with an error status. */
+class HostedStatusError extends Error {}
 
 export class GuardianHostedClient {
   constructor(private readonly options: Readonly<{ controlPlaneURL: URL; credential: string; fetcher?: typeof fetch }>) {}
@@ -16,12 +19,16 @@ export class GuardianHostedClient {
       try { while (true) { const chunk = await reader.read(); if (chunk.done) break; size += chunk.value.byteLength;
         if (size > 64 << 10) throw new Error("Oversized response."); chunks.push(chunk.value);
       } } finally { await reader.cancel(); }
-      if (!response.ok) throw new Error(`Service returned ${response.status}.`);
+      if (!response.ok) throw new HostedStatusError(`the server returned ${response.status}`);
       const value: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
       if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid response.");
       return value as Record<string, unknown>;
-    } catch {
-      throw new GuardianDecisionUnavailableError("Phigon Guardian could not verify hosted enforcement; the action remains blocked.");
+    } catch (error) {
+      // Only the status or the connection error's code: never the response.
+      const reason = error instanceof HostedStatusError ? error.message : connectionFailure(error, false);
+      throw new GuardianDecisionUnavailableError(
+        `Phigon Guardian could not verify hosted enforcement${reason === undefined ? "" : ` (${reason})`}; the action remains blocked.`,
+      );
     }
   }
 }

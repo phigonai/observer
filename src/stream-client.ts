@@ -7,6 +7,7 @@ import {
 } from "@grpc/grpc-js";
 import { createHash, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { isIP } from "node:net";
 import {
   clone,
   create,
@@ -73,6 +74,7 @@ import {
   type EventEnvelope,
   type ResourceReference,
 } from "./generated/phigon/v1/telemetry_pb.js";
+import { MachineRemovedError } from "./machine-removed.js";
 import type { ServerClock } from "./server-clock.js";
 import { StreamStateStore } from "./stream-state.js";
 import { noProxyForAll } from "./proxy.js";
@@ -85,6 +87,12 @@ const maxMessageBytes = 1 << 20;
 const policyReceiptRefreshMs = 5 * 60 * 1_000;
 /** How often an unchanged checkpoint is saved again while connected. */
 export const streamStateRefreshMs = 60 * 1_000;
+// The longest wait between reconnect attempts. A server that is off, such
+// as the Phigon app's computer overnight, is tried about once a minute, so
+// computers are back within a minute of it starting.
+const maxReconnectDelayMs = 60_000;
+// The same reason for being disconnected is logged again after this long.
+const failureRepeatMs = 30 * 60_000;
 
 export type ObserverStreamMetrics = Readonly<{
   reconnects: number;
@@ -152,6 +160,10 @@ export class ObserverStreamClient {
   #sendInventory: ((inventory: AgentInventory) => void) | undefined;
   #readySequence: bigint | undefined;
   #establishedSinceConnect = false;
+  // While the stream stays down, its attempts are not logged one by one:
+  // only a new reason, or the same one again after a long while.
+  #reconnectingQuietly = false;
+  #lastLoggedFailure: Readonly<{ summary: string; at: number }> | undefined;
   readonly #readyWaiters = new Set<(sequence: bigint) => void>();
   readonly #handshakeTimeoutMs: number;
   readonly #stateRefreshMs: number;
@@ -254,7 +266,8 @@ export class ObserverStreamClient {
       } catch (error) {
         if (signal.aborted) return;
         if (isServiceError(error) && error.code === status.UNAUTHENTICATED) {
-          throw new Error("The workspace no longer accepts this computer's key: an administrator removed the computer or revoked the key. Get a new pairing code from your workspace and run pair again with the same data directory. The computer is paired as a new machine, and activity that was not delivered is moved aside.");
+          // An administrator removed the computer or revoked its key.
+          throw new MachineRemovedError();
         }
         if (error instanceof PermanentTelemetryError) throw error;
         // A connection that completed its handshake ends the outage; the
@@ -262,12 +275,18 @@ export class ObserverStreamClient {
         // instead of inheriting the longest delay of an earlier outage.
         if (this.#establishedSinceConnect) backoffMs = initialBackoffMs;
         this.#reconnects++;
-        this.#onStatus(
-          `Telemetry disconnected (${telemetryErrorSummary(error)}); ` +
-            `retrying in ${backoffMs}ms.`,
-        );
-        await abortableDelay(backoffMs + Math.floor(Math.random() * backoffMs / 4), signal);
-        backoffMs = Math.min(backoffMs * 2, 10_000);
+        const summary = telemetryErrorSummary(error);
+        const now = Date.now();
+        const last = this.#lastLoggedFailure;
+        if (this.#establishedSinceConnect || last?.summary !== summary || now - last.at >= failureRepeatMs) {
+          this.#lastLoggedFailure = { summary, at: now };
+          this.#onStatus(`Telemetry disconnected (${summary}); retrying in ${backoffMs}ms.`);
+        }
+        // The first attempt after a connection that worked starts a new
+        // outage, so it says it is connecting; the ones after it do not.
+        this.#reconnectingQuietly = !this.#establishedSinceConnect;
+        await abortableDelay(reconnectDelay(backoffMs), signal);
+        backoffMs = Math.min(backoffMs * 2, maxReconnectDelayMs);
       }
     }
   }
@@ -358,7 +377,7 @@ export class ObserverStreamClient {
       metadata,
     );
 
-    this.#onStatus(`Connecting telemetry to ${this.#config.grpcUrl.origin}…`);
+    if (!this.#reconnectingQuietly) this.#onStatus(`Connecting telemetry to ${this.#config.grpcUrl.origin}…`);
     const abort = () => stream.cancel();
     signal.addEventListener("abort", abort, { once: true });
     let heartbeat: NodeJS.Timeout | undefined;
@@ -896,6 +915,7 @@ export class ObserverStreamClient {
 
   #markReady(sequence: bigint): void {
     this.#establishedSinceConnect = true;
+    this.#reconnectingQuietly = false;
     this.#readySequence = sequence;
     for (const ready of this.#readyWaiters) ready(sequence);
     this.#readyWaiters.clear();
@@ -1235,8 +1255,42 @@ function sanitizeResource(
   if (!identifierAllowed) delete resource.identifier;
 }
 
+/**
+ * The wait before a reconnect attempt: up to a quarter less than the
+ * backoff, at random, so computers that lost the same server do not all
+ * try at once, and never longer than the backoff, so a computer is back
+ * within a minute of the server.
+ */
+export function reconnectDelay(backoffMs: number, random: () => number = Math.random): number {
+  return backoffMs - Math.floor(random() * backoffMs / 4);
+}
+
+let ipServerNameWarningMuted = false;
+
+/**
+ * grpc-js always sends the server's host as the TLS server name, even an IP
+ * address such as a company's own Phigon server on its network, and Node.js
+ * warns once that this is deprecated (DEP0123). The certificate is checked
+ * against the address either way, so that one warning is left out of the
+ * log; every other warning is shown as usual.
+ */
+export function muteIpServerNameWarning(): void {
+  if (ipServerNameWarningMuted) return;
+  ipServerNameWarningMuted = true;
+  const emitWarning = process.emitWarning.bind(process) as (...args: unknown[]) => void;
+  process.emitWarning = ((...args: unknown[]) => {
+    const [, typeOrOptions, code] = args;
+    const warningCode = typeof typeOrOptions === "object" && typeOrOptions !== null && "code" in typeOrOptions
+      ? typeOrOptions.code
+      : code;
+    if (warningCode === "DEP0123") return;
+    emitWarning(...args);
+  }) as typeof process.emitWarning;
+}
+
 function channelCredentials(config: ObserverConfig) {
   if (config.grpcUrl.protocol === "https:") {
+    if (isIP(config.grpcUrl.hostname.replace(/^\[|\]$/gu, "")) !== 0) muteIpServerNameWarning();
     const rootCertificates = config.tlsCaFile === undefined
       ? undefined
       : readFileSync(config.tlsCaFile);

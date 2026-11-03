@@ -9,6 +9,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { createServer } from "node:http";
+import { createServer as createHttp2Server } from "node:http2";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
@@ -23,6 +24,7 @@ import {
 import { FileActionPolicyStore } from "../src/action-policy.js";
 import { FileCredentialStore } from "../src/credential-store.js";
 import { InstanceLock } from "../src/instance-lock.js";
+import { machineRemovedFileName, rememberMachineRemoved, removedAtStart } from "../src/machine-removed.js";
 import { CustomAgentRegistry } from "../src/custom-agent-registry.js";
 import { StreamStateStore } from "../src/stream-state.js";
 import { create } from "@bufbuild/protobuf";
@@ -1297,6 +1299,219 @@ test("run stops cleanly when asked to stop before the stream connects", { timeou
     assert.doesNotMatch(stderr, /readiness wait was aborted|Observer command failed/u);
     assert.equal(process.listenerCount("SIGTERM"), 0);
   } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+const removedMessage = "This computer was removed from Phigon. Pair it again with a new code from Connect machine, or run phigon-observer service uninstall.";
+
+async function saveRemovableMachine(directory: string, controlPlaneOrigin: string, grpcOrigin: string) {
+  const machine = {
+    machineId: "machine-removed",
+    tenantId: "tenant-removed",
+    credential: `phg_m_${"r".repeat(43)}`,
+    controlPlaneOrigin,
+    grpcOrigin,
+    createdAt: "2026-11-03T00:00:00.000Z",
+    consentProfile: "metadata" as const,
+    consentPolicyVersion: "observer-policy-v1",
+    consentedAt: "2026-11-03T00:00:00.000Z",
+  };
+  await new FileCredentialStore(directory).save(machine);
+  return machine;
+}
+
+/**
+ * A workspace that refuses the computer's telemetry stream with
+ * UNAUTHENTICATED, as it does for a computer an administrator removed, and
+ * answers its HTTPS check with `heartbeat`.
+ */
+async function refusingWorkspace(heartbeat: 401 | 503, onStream: () => Promise<void> = async () => undefined) {
+  const stream = createHttp2Server();
+  stream.on("stream", (call) => {
+    void onStream().then(() => {
+      call.respond({ ":status": 200, "content-type": "application/grpc", "grpc-status": "16", "grpc-message": "machine credential is revoked" }, { endStream: true });
+    });
+  });
+  let heartbeats = 0;
+  const api = createServer((request, response) => {
+    if (request.method === "POST" && request.url === "/v1/machine/heartbeat") heartbeats++;
+    response.writeHead(heartbeat, { "Content-Type": "application/json" });
+    response.end(JSON.stringify(heartbeat === 401
+      ? { error: { code: "invalid_credential", message: "machine credential is revoked" } }
+      : { error: { code: "unavailable", message: "try again" } }));
+  });
+  await new Promise<void>((resolve) => stream.listen(0, "127.0.0.1", resolve));
+  await new Promise<void>((resolve) => api.listen(0, "127.0.0.1", resolve));
+  const port = (server: { address: () => unknown }) => (server.address() as { port: number }).port;
+  return {
+    controlPlaneOrigin: `http://127.0.0.1:${port(api)}`,
+    grpcOrigin: `http://127.0.0.1:${port(stream)}`,
+    heartbeats: () => heartbeats,
+    close: async () => {
+      await new Promise<void>((resolve) => stream.close(() => resolve()));
+      await new Promise<void>((resolve) => api.close(() => resolve()));
+    },
+  };
+}
+
+async function runObserver(directory: string, service: boolean) {
+  let stdout = "";
+  let stderr = "";
+  const output = { stdout: (value: string) => { stdout += value; }, stderr: (value: string) => { stderr += value; } };
+  const settings = { PHIGON_UPDATE_CHECK: "false", PHIGON_DISCOVERY_INTERVAL_MS: "60000" };
+  let exitCode: number;
+  if (service) {
+    const file = join(directory, "service-settings.json");
+    await writeFile(file, JSON.stringify({ version: 1, environment: settings }), "utf8");
+    exitCode = await run(["run", "--service-settings", file], {}, output);
+  } else {
+    exitCode = await run(["run"], { PHIGON_DATA_DIR: directory, ...settings }, output);
+  }
+  return { exitCode, stdout, stderr };
+}
+
+for (const service of [false, true]) {
+  test(`a computer the workspace removed stops, says what to do, and remembers it (${service ? "service" : "terminal"})`, { timeout: 60_000 }, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "phigon-cli-removed-"));
+    const workspace = await refusingWorkspace(401);
+    try {
+      await saveRemovableMachine(directory, workspace.controlPlaneOrigin, workspace.grpcOrigin);
+      const { exitCode, stdout, stderr } = await runObserver(directory, service);
+      // systemd leaves a service that exits cleanly stopped; a person in a
+      // terminal sees a failure. Never the pairing-changed restart code.
+      assert.equal(exitCode, service ? 0 : 1);
+      assert.equal(stderr, `${removedMessage}\n`);
+      assert.doesNotMatch(stdout, /Observer stopped/u);
+      assert.equal(workspace.heartbeats(), 1, "the stream's refusal is confirmed with the server");
+      const remembered = JSON.parse(await readFile(join(directory, machineRemovedFileName), "utf8")) as { machineId: string; confirmedAt?: string };
+      assert.equal(remembered.machineId, "machine-removed");
+      assert.ok(remembered.confirmedAt !== undefined);
+    } finally {
+      await workspace.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+}
+
+test("a refused stream the server does not confirm exits so the service starts the observer again", { timeout: 60_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-cli-removed-unconfirmed-run-"));
+  const workspace = await refusingWorkspace(503);
+  try {
+    await saveRemovableMachine(directory, workspace.controlPlaneOrigin, workspace.grpcOrigin);
+    const { exitCode, stderr } = await runObserver(directory, true);
+    // A failure, which systemd restarts too.
+    assert.equal(exitCode, 1);
+    assert.match(stderr, /did not confirm that the computer was removed/u);
+    await assert.rejects(readFile(join(directory, machineRemovedFileName), "utf8"), { code: "ENOENT" });
+  } finally {
+    await workspace.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("pairing again while the old key is refused restarts the observer instead of stopping it", { timeout: 60_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-cli-removed-repaired-"));
+  let saved: Awaited<ReturnType<typeof saveRemovableMachine>> | undefined;
+  // The person pairs again just as the workspace refuses the old key.
+  const workspace = await refusingWorkspace(401, async () => {
+    if (saved === undefined) return;
+    await new FileCredentialStore(directory).save({ ...saved, machineId: "machine-paired-again", credential: `phg_m_${"n".repeat(43)}`, createdAt: "2026-11-03T12:00:00.000Z" });
+  });
+  try {
+    saved = await saveRemovableMachine(directory, workspace.controlPlaneOrigin, workspace.grpcOrigin);
+    const { exitCode, stderr } = await runObserver(directory, true);
+    assert.equal(exitCode, 75, "the pairing-changed code, so the service starts it with the new pairing");
+    assert.doesNotMatch(stderr, /removed from Phigon/u);
+    await assert.rejects(readFile(join(directory, machineRemovedFileName), "utf8"), { code: "ENOENT" });
+  } finally {
+    await workspace.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a removed computer's background service stops at once, without scanning or asking again", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-cli-removed-service-"));
+  try {
+    const machine = await saveRemovableMachine(directory, "http://127.0.0.1:9", "http://127.0.0.1:9");
+    await rememberMachineRemoved(directory, machine);
+    // The server confirmed the removal a moment ago.
+    const confirm = (async () => new Response(JSON.stringify({ error: { code: "invalid_credential" } }), { status: 401 })) as typeof fetch;
+    assert.equal(await removedAtStart({
+      dataDirectory: directory, machine, controlPlaneUrl: new URL("http://127.0.0.1:9"), recheckAfterMs: 0, fetcher: confirm,
+    }), "removed");
+    const settings = join(directory, "service-settings.json");
+    await writeFile(settings, JSON.stringify({ version: 1, environment: { PHIGON_UPDATE_CHECK: "false" } }), "utf8");
+    let stdout = "";
+    let stderr = "";
+    const exitCode = await run(["run", "--service-settings", settings], {}, {
+      stdout: (value) => { stdout += value; },
+      stderr: (value) => { stderr += value; },
+    });
+    // systemd leaves a service that exits cleanly stopped.
+    assert.equal(exitCode, 0);
+    assert.equal(stderr, "", "asked within the hour, so nothing new to say");
+    assert.doesNotMatch(stdout, /Connecting telemetry|Starting Phigon observer/u);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a background service starts as usual when the server cannot confirm a removal", { timeout: 60_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-cli-removed-unconfirmed-"));
+  try {
+    // Only the stream refused the key; the server cannot be asked now.
+    const machine = await saveRemovableMachine(directory, "http://127.0.0.1:9", "http://127.0.0.1:9");
+    await rememberMachineRemoved(directory, machine);
+    const settings = join(directory, "service-settings.json");
+    await writeFile(settings, JSON.stringify({ version: 1, environment: { PHIGON_UPDATE_CHECK: "false", PHIGON_DISCOVERY_INTERVAL_MS: "60000" } }), "utf8");
+    let stdout = "";
+    let stopped = false;
+    const exitCode = await run(["run", "--service-settings", settings], {}, {
+      stdout: (value) => {
+        stdout += value;
+        if (!stopped && value.includes("Connecting telemetry")) {
+          stopped = true;
+          setImmediate(() => process.emit("SIGTERM", "SIGTERM"));
+        }
+      },
+      stderr: () => undefined,
+    });
+    assert.equal(exitCode, 0);
+    assert.match(stdout, /Observer stopped\./u);
+    await assert.rejects(readFile(join(directory, machineRemovedFileName), "utf8"), { code: "ENOENT" });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a removed computer run in a terminal asks the server again and stops while it still refuses", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-cli-removed-terminal-"));
+  let heartbeats = 0;
+  const server = createServer((request, response) => {
+    if (request.method === "POST" && request.url === "/v1/machine/heartbeat") heartbeats++;
+    response.writeHead(401, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ error: { code: "invalid_credential", message: "machine credential is revoked" } }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    assert.ok(address !== null && typeof address === "object");
+    const origin = `http://127.0.0.1:${address.port}`;
+    const machine = await saveRemovableMachine(directory, origin, origin);
+    await rememberMachineRemoved(directory, machine);
+    let stdout = "";
+    let stderr = "";
+    const exitCode = await run(["run"], { PHIGON_DATA_DIR: directory, PHIGON_UPDATE_CHECK: "false" }, {
+      stdout: (value) => { stdout += value; },
+      stderr: (value) => { stderr += value; },
+    });
+    assert.equal(exitCode, 1);
+    assert.equal(heartbeats, 1);
+    assert.equal(stderr, `${removedMessage}\n`);
+    assert.doesNotMatch(stdout, /Connecting telemetry/u);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
     await rm(directory, { recursive: true, force: true });
   }
 });

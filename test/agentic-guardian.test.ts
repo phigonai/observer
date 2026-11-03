@@ -9,6 +9,7 @@ import {
   HTTPGuardianDecisionClient,
   readGuardianActionContext,
 } from "../src/agentic-guardian.js";
+import { GuardianHostedClient } from "../src/guardian-hosted-client.js";
 
 const ruleID = "72b1f93f-6317-46c7-bbba-6174d19c4119";
 const policy: StoredActionPolicy = Object.freeze({
@@ -127,4 +128,32 @@ test("Guardian action context is structured and bounded", async () => {
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("a Guardian request that gets no answer says why, without anything it sent", async () => {
+  const refused = (async () => {
+    throw new TypeError("fetch failed", { cause: Object.assign(new Error("connect ECONNREFUSED 192.0.2.1:443"), { code: "ECONNREFUSED" }) });
+  }) as typeof fetch;
+  const proposal = { policyDigest: policy.policyDigest, agentId: "", action: "command.execute", resource: "Remove-Item project.txt", context: {} };
+  const client = (fetcher: typeof fetch, timeoutMs = 1_000) => new HTTPGuardianDecisionClient({
+    controlPlaneURL: new URL("https://control.example.test"), credential: "machine-secret", timeoutMs, fetcher,
+  });
+  await assert.rejects(client(refused).decide(proposal), { message: "Guardian semantic decision service was unavailable (ECONNREFUSED)." });
+  const silent = ((_url: URL, init: RequestInit) => new Promise((_resolve, reject) => {
+    init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+  })) as typeof fetch;
+  await assert.rejects(client(silent, 5).decide(proposal), { message: "Guardian semantic decision service was unavailable (no answer in time)." });
+  const odd = (async () => { throw new TypeError("fetch failed", { cause: { code: "not a code; secret=1" } }); }) as typeof fetch;
+  await assert.rejects(client(odd).decide(proposal), { message: "Guardian semantic decision service was unavailable." });
+
+  const hosted = (fetcher: typeof fetch) => new GuardianHostedClient({ controlPlaneURL: new URL("https://control.example.test"), credential: "machine-secret", fetcher });
+  const conflict = (async () => new Response(JSON.stringify({ error: { message: "do not repeat me" } }), { status: 409 })) as typeof fetch;
+  await assert.rejects(
+    hosted(conflict).post("/v1/machine/guardian/coverage", {}),
+    { message: "Phigon Guardian could not verify hosted enforcement (the server returned 409); the action remains blocked." },
+  );
+  await assert.rejects(
+    hosted(refused).post("/v1/machine/guardian/coverage", {}),
+    { message: "Phigon Guardian could not verify hosted enforcement (ECONNREFUSED); the action remains blocked." },
+  );
 });
