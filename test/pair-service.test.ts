@@ -7,6 +7,8 @@ import { join } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
 import { run } from "../src/cli.js";
+import { loadConfig } from "../src/config.js";
+import { restartServiceAfterUpdate } from "../src/service-command.js";
 import type { CommandResult } from "../src/service.js";
 
 // Built at runtime so secret scanners never see a key-shaped string.
@@ -51,7 +53,7 @@ async function setUp(answer: (call: Call) => Partial<CommandResult> = () => ({})
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await rm(root, { recursive: true, force: true });
   };
-  return { root, calls, pair, close };
+  return { root, calls, runner, pair, close };
 }
 
 test("pairing keeps the observer running in the background, for the profile the owner agreed to", async () => {
@@ -123,6 +125,26 @@ test("pairing again keeps the settings the service was installed with, and chang
     const kept = JSON.parse(await readFile(file, "utf8")) as { environment: Record<string, string> };
     assert.equal(kept.environment["PHIGON_REMOTE_ACTIONS_ENABLED"], "true");
     assert.equal(kept.environment["PHIGON_OBSERVABILITY_PROFILE"], "metadata");
+  } finally {
+    await setup.close();
+  }
+});
+
+test("an update starts the background service again so it runs the new version", async () => {
+  const setup = await setUp();
+  try {
+    const dependencies = { serviceRunner: setup.runner, platform: "linux" as const, homeDirectory: setup.root, stopTimeoutMs: 50 };
+    const config = loadConfig({ PHIGON_DATA_DIR: join(setup.root, "data") });
+    // No service yet: nothing to restart.
+    assert.equal(await restartServiceAfterUpdate(config, {}, dependencies), "not_installed");
+    assert.equal(setup.calls.length, 0);
+
+    const paired = await setup.pair(["--consent-profile", "metadata", "--accept-consent"]);
+    assert.equal(paired.code, 0, paired.stderr);
+    setup.calls.length = 0;
+    assert.equal(await restartServiceAfterUpdate(config, {}, dependencies), "restarted");
+    const systemctl = setup.calls.filter((call) => call.command === "systemctl").map((call) => call.args.find((arg) => arg === "stop" || arg === "start"));
+    assert.deepEqual(systemctl.filter(Boolean), ["stop", "start"]);
   } finally {
     await setup.close();
   }

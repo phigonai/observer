@@ -273,7 +273,7 @@ settings. A full description is in
 | `ingest --agent <id\|custom> [--name <name>]` | Reads NDJSON activity from stdin (bridges). |
 | `guardian status \| exec \| launch` | Guardian checks and managed execution. |
 | `authorize-action --action <a> --resource <r>` | Asks Guardian whether one action may run. |
-| `update [--check] [--yes]` | Checks for or installs a new release. |
+| `update [--check] [--yes]` | Checks for or installs a new release, then starts the background service again so it runs the new version. |
 | `remove-machine [--purge]` | Stops collection and revokes this computer's key. Activity already collected stays with the company until an administrator deletes the computer or it expires. `--purge` also removes the background service and the observer's local files; see [Uninstall](#uninstall). |
 
 Run `phigon-observer help` for every flag.

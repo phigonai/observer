@@ -78,6 +78,6 @@ export async function offerObserverUpdate(options: {
   options.write(`A new Phigon observer version is available: ${options.current} → ${options.latest}.\nType "yes" to update, or press Enter to continue: `);
   if ((await options.confirm()).trim().toLowerCase() !== "yes") return false;
   await (options.install ?? installObserverUpdate)(options.latest);
-  options.write("Observer updated. Run your command again. Restart the observer service if it is running; your pairing and queued activity are preserved.\n");
+  options.write("Observer updated. Your pairing and queued activity are preserved. Run your command again.\n");
   return true;
 }
