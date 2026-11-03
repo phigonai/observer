@@ -139,6 +139,16 @@ test("custom agent definitions reject unsafe or signal-free monitoring", () => {
     }),
     /cannot claim Phigon-managed identity or evidence properties/u,
   );
+  // Only Guardian's own decision journal is Phigon's; an agent cannot hide as it.
+  assert.throws(
+    () => customAgentRegistration({
+      id: "release-bot",
+      displayName: "Release Bot",
+      processNames: ["release-bot"],
+      capabilities: ["activity", "phigon-guardian"],
+    }),
+    /cannot claim Phigon-managed identity or evidence properties/u,
+  );
 });
 
 test("custom agent definitions reject ambiguous evidence claims", async () => {

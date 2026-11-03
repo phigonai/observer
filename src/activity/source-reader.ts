@@ -56,6 +56,11 @@ export type ActivitySource = Readonly<{
    * its root, with `/` separators. Only matching files belong to the source.
    */
   pathPattern?: string;
+  /**
+   * Capabilities the identity of each of this source's files carries, for a
+   * file only the observer writes. Records cannot add any.
+   */
+  sourceCapabilities?: readonly string[];
 }>;
 
 export type SourceRecord = Readonly<{
@@ -63,6 +68,7 @@ export type SourceRecord = Readonly<{
   sourceId: string;
   sourceRecordId: string;
   sourceDisplayName?: string;
+  sourceCapabilities?: readonly string[];
   observedAt: Date;
   initialReplay?: boolean;
   value: unknown;
@@ -126,6 +132,7 @@ type FileIdentity = Readonly<{
 type SourceFile = Readonly<{
   adapterId: string;
   sourceDisplayName?: string;
+  sourceCapabilities?: readonly string[];
   root: string;
   path: string;
   modifiedMs: number;
@@ -475,6 +482,7 @@ export class JSONLSourceReader {
           replayFiles.has(file.path),
           file.sourceDisplayName,
           remainingRecords - reservedDatabaseRecords,
+          file.sourceCapabilities,
         );
       } catch (error) {
         if (!isTransientSourceError(error)) {
@@ -819,6 +827,7 @@ export class JSONLSourceReader {
     initialReplay: boolean,
     sourceDisplayName?: string,
     maxRecords = Number.MAX_SAFE_INTEGER,
+    sourceCapabilities?: readonly string[],
   ): Promise<
     Readonly<{
       records: readonly SourceRecord[];
@@ -949,6 +958,7 @@ export class JSONLSourceReader {
           ...(sourceDisplayName === undefined
             ? {}
             : { sourceDisplayName }),
+          ...(sourceCapabilities === undefined ? {} : { sourceCapabilities }),
           observedAt: metadata.mtime,
           initialReplay: initialReplay || this.#mode === "history",
           value: JSON.parse(line),
@@ -1007,6 +1017,9 @@ export class JSONLSourceReader {
           ...(source.sourceDisplayName === undefined
             ? {}
             : { sourceDisplayName: source.sourceDisplayName }),
+          ...(source.sourceCapabilities === undefined
+            ? {}
+            : { sourceCapabilities: source.sourceCapabilities }),
           root,
           path: canonicalPath,
           modifiedMs: file.modifiedMs,
@@ -1255,9 +1268,14 @@ function reconciledSourceFile(claims: readonly SourceFile[]): SourceFile {
   if (representative === undefined) {
     throw new Error("Activity source reconciliation requires one file claim.");
   }
+  // A file another source also claims keeps capabilities only when every
+  // claim gives the same ones.
+  const capabilityClaims = new Set(ordered.map((claim) => JSON.stringify(claim.sourceCapabilities ?? [])));
+  const sourceCapabilities = capabilityClaims.size === 1 ? representative.sourceCapabilities : undefined;
   return {
     adapterId,
     ...(sourceDisplayName === undefined ? {} : { sourceDisplayName }),
+    ...(sourceCapabilities === undefined ? {} : { sourceCapabilities }),
     root: representative.root,
     path: representative.path,
     modifiedMs: Math.max(...ordered.map((claim) => claim.modifiedMs)),

@@ -7,6 +7,16 @@ export const guardianDecisionJournal = "guardian-decisions";
 export const managedCommandJournal = "guardian-managed-commands";
 type JournalName = typeof guardianDecisionJournal | typeof managedCommandJournal;
 
+/** Each segment of Guardian's decision journal, as a path within its bridge. */
+export const guardianDecisionFilePattern = `${guardianDecisionJournal}(?:-\\d{1,16})?\\.jsonl`;
+
+/**
+ * Marks the identity of Guardian's decision journal, which is Phigon's own and
+ * not an agent. Only the observer sets it, from where the records were read;
+ * nothing a record says, and no custom agent, can claim it.
+ */
+export const phigonGuardianCapability = "phigon-guardian";
+
 // A journal starts a new file past this size, and keeps about this much in
 // all when nothing reads it.
 const segmentBytes = 4 << 20;
