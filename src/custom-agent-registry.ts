@@ -1,4 +1,5 @@
 import { makeDirectoryPrivate } from "./private-directory.js";
+import { phigonGuardianCapability } from "./bridge-journal.js";
 import { randomUUID } from "node:crypto";
 import {
   chmod,
@@ -26,6 +27,7 @@ const namePattern = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/u;
 const capabilityPattern = /^[a-z0-9][a-z0-9:._+-]{0,63}$/u;
 const reservedCapabilities = new Set([
   "native-activity",
+  phigonGuardianCapability,
   "process-instance",
   "source-isolated",
   "unattributed",

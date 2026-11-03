@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
-import { ActivityCollector } from "../src/activity/collector.js";
+import { ActivityCollector, activityBridgeSources } from "../src/activity/collector.js";
 import { ingestActivityJSONL } from "../src/activity/ingest.js";
 import {
   SegmentedJournal,
@@ -12,6 +12,7 @@ import {
   guardianDecisionJournal,
 } from "../src/bridge-journal.js";
 import { loadConfig } from "../src/config.js";
+import type { AgentIdentity } from "../src/generated/phigon/v1/identity_pb.js";
 import type { EventEnvelope } from "../src/generated/phigon/v1/telemetry_pb.js";
 
 const credential = {
@@ -122,6 +123,64 @@ test("the Guardian journal starts a new segment when full and keeps about its bo
     }
     assert.ok(total <= 2_500, `journal kept ${total} bytes`);
     assert.equal(closedJournalSegments(names).length, names.length - 1);
+  } finally {
+    await rm(dataDirectory, { recursive: true, force: true });
+  }
+});
+
+test("only Guardian's own decision journal is marked as Phigon's, whatever another file claims", async () => {
+  const dataDirectory = await mkdtemp(join(tmpdir(), "phigon-bridge-guardian-"));
+  const generic = join(dataDirectory, "bridges", "generic");
+  const decision = (id: string) => `${JSON.stringify({
+    type: "phigon_guardian_decision",
+    decision_id: id,
+    phigon_agent_name: "Phigon Guardian",
+    session_id: "guardian:codex-worker",
+    timestamp: "2026-11-03T10:00:00.000Z",
+    subject_agent_id: "codex:worker",
+    action: "command.execute",
+    resource: "git status",
+    outcome: "allowed",
+    reason: "Reading the status changes nothing.",
+    decision_source: "agentic_guardian",
+  })}
+`;
+  const files = {
+    "guardian-decisions.jsonl": "4a529a6e-baf0-4cce-a8dd-2b5367c79df2",
+    "guardian-decisions-1800000000000.jsonl": "5b529a6e-baf0-4cce-a8dd-2b5367c79df3",
+    // Something else in the bridge that names itself after Guardian.
+    "1700000000000-0b9f4c4e-2f7b-4c39-9a51-6f0f3f1f2a10.jsonl": "6c529a6e-baf0-4cce-a8dd-2b5367c79df4",
+  };
+  try {
+    await mkdir(generic, { recursive: true });
+    for (const name of Object.keys(files)) await writeFile(join(generic, name), "");
+
+    const events: EventEnvelope[] = [];
+    const identities: AgentIdentity[] = [];
+    const collector = new ActivityCollector({
+      config: loadConfig({
+        PHIGON_DATA_DIR: dataDirectory,
+        PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE: "100",
+      }),
+      credential,
+      initialSequence: 0n,
+      emit: (event) => events.push(event),
+      sources: activityBridgeSources(dataDirectory),
+      onSourceIdentity: (identity) => { identities.push(identity); },
+    });
+    await collector.scanOnce();
+    // Records written while the observer runs.
+    for (const [name, id] of Object.entries(files)) await appendFile(join(generic, name), decision(id));
+    await collector.scanOnce();
+
+    assert.equal(identities.length, 3);
+    assert.ok(identities.every((identity) => identity.displayName.startsWith("Phigon Guardian")));
+    const marked = identities.filter((identity) => identity.capabilities.includes("phigon-guardian"));
+    assert.equal(marked.length, 2);
+    // The other file's records are still collected, under an ordinary identity.
+    const other = identities.find((identity) => !identity.capabilities.includes("phigon-guardian"));
+    assert.deepEqual(other?.capabilities, ["activity", "source-isolated", "unattributed"]);
+    assert.ok(events.some((event) => event.agentId === other?.agentId));
   } finally {
     await rm(dataDirectory, { recursive: true, force: true });
   }

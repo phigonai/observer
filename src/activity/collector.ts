@@ -61,7 +61,7 @@ import {
   type SourceRecord,
 } from "./source-reader.js";
 import { bridgeWritingSuffix, ingestedBridgeFile } from "./ingest.js";
-import { closedJournalSegments } from "../bridge-journal.js";
+import { closedJournalSegments, guardianDecisionFilePattern, phigonGuardianCapability } from "../bridge-journal.js";
 import type { VendorActivityAdapter } from "./types.js";
 import { processKeyCapability } from "../discovery/process-identity.js";
 
@@ -579,6 +579,7 @@ export class ActivityCollector {
           record.value,
           record.observedAt,
           genericAgent?.displayName,
+          record.sourceCapabilities,
         ),
         sessionId: draft.sessionId,
         sequence: this.#lastSequence + 1n + BigInt(events.length),
@@ -855,6 +856,7 @@ export class ActivityCollector {
     record: unknown,
     observedAt: Date,
     sourceDisplayName?: string,
+    sourceCapabilities: readonly string[] = [],
   ): string {
     const agents = this.#agentsByKind.get(kind) ?? [];
     const fallback = fallbackAgentID(kind, adapterId, sourceId);
@@ -867,6 +869,7 @@ export class ActivityCollector {
       sourceId,
       observedAt,
       sourceDisplayName,
+      sourceCapabilities,
     );
     return fallback;
   }
@@ -877,7 +880,8 @@ export class ActivityCollector {
     adapterID: string,
     sourceID: string,
     observedAt: Date,
-    sourceDisplayName?: string,
+    sourceDisplayName: string | undefined,
+    sourceCapabilities: readonly string[],
   ): void {
     if (this.#sourceIdentities.has(agentID)) return;
     if (this.#sourceIdentities.size >= 256) {
@@ -895,7 +899,7 @@ export class ActivityCollector {
       state: AgentState.UNKNOWN,
       processId: 0n,
       lastObservedAt: timestampFromDate(observedAt),
-      capabilities: ["activity", "source-isolated", "unattributed"],
+      capabilities: ["activity", "source-isolated", "unattributed", ...sourceCapabilities],
     });
     this.#sourceIdentities.set(agentID, identity);
     // An identity that could not be saved is forgotten, so the source's
@@ -1257,11 +1261,29 @@ function configuredSources(config: ObserverConfig): readonly ActivitySource[] {
       adapterId: "generic",
       roots: config.activitySourceDirectories.generic,
     },
-    ...activityBridgeAgents.map((agent) => ({
-      adapterId: agent.id,
-      roots: [join(config.dataDirectory, "bridges", agent.id)],
-    })),
+    ...activityBridgeSources(config.dataDirectory),
   ];
+}
+
+/**
+ * The bridge folders in the observer's data directory. Guardian's decision
+ * journal in the generic bridge is a source of its own, whose identity says it
+ * is Phigon's, so it is never listed as an agent.
+ */
+export function activityBridgeSources(dataDirectory: string): readonly ActivitySource[] {
+  return activityBridgeAgents.flatMap((agent): ActivitySource[] => {
+    const roots = [join(dataDirectory, "bridges", agent.id)];
+    if (agent.id !== "generic") return [{ adapterId: agent.id, roots }];
+    return [
+      { adapterId: agent.id, roots, pathPattern: `^(?!${guardianDecisionFilePattern}$)` },
+      {
+        adapterId: agent.id,
+        roots,
+        pathPattern: `^${guardianDecisionFilePattern}$`,
+        sourceCapabilities: [phigonGuardianCapability],
+      },
+    ];
+  });
 }
 
 class MinuteRateLimiter {
