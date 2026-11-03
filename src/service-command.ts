@@ -18,6 +18,8 @@ import {
   servicePlatform,
   serviceSettings,
   serviceSettingsPath,
+  startService,
+  stopService,
   uninstallService,
   type CommandRunner,
   type ServiceContext,
@@ -137,6 +139,32 @@ export async function installServiceAfterPairing(
     return { status: "installed", name: serviceName(context), note: restartNote(context), alreadyRunning };
   } catch (error) {
     return { status: "not_installed", reason: error instanceof Error ? error.message : "The background service could not be installed." };
+  }
+}
+
+/**
+ * After an update, starts the background service again, so it runs the new
+ * version instead of the old one until the next sign-in. Says what happened.
+ */
+export async function restartServiceAfterUpdate(
+  config: ObserverConfig,
+  environment: NodeJS.ProcessEnv,
+  dependencies: ServiceDependencies = {},
+): Promise<"restarted" | "not_installed" | "failed"> {
+  let context: ServiceContext;
+  try {
+    context = serviceContext(config, environment, dependencies);
+    if (!(await stopService(context))) return "not_installed";
+  } catch {
+    return "failed";
+  }
+  // Started again even if the old observer is slow to stop: it takes over then.
+  await waitUntilStopped(context.dataDirectory, dependencies.stopTimeoutMs ?? 15_000).catch(() => false);
+  try {
+    await startService(context);
+    return "restarted";
+  } catch {
+    return "failed";
   }
 }
 

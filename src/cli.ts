@@ -85,6 +85,7 @@ import { pairingChanged, pairingChangedExitCode, watchPairing, type PairingChang
 import { moveServiceEndpoints, readServiceSettings, startService, stopService, uninstallService } from "./service.js";
 import {
   installServiceAfterPairing,
+  restartServiceAfterUpdate,
   runServiceCommand,
   serviceContext,
   type PairingService,
@@ -239,7 +240,12 @@ export async function run(
       }
       if (command === "update" && !interactive && !flags.includes("--yes")) throw new Error("Use update --check for a read-only check, or update --yes to explicitly authorize an unattended update.");
       const updated = await offerObserverUpdate({ current: version, latest, write: output.stdout, confirm: () => command === "update" && flags.includes("--yes") ? Promise.resolve("yes") : readConfirmation(input) });
-      if (updated) return 0;
+      if (updated) {
+        const restart = await restartServiceAfterUpdate(config, callerEnvironment, dependencies);
+        if (restart === "restarted") output.stdout("The background service now runs the new version.\n");
+        if (restart === "failed") output.stdout("Start the background service again to use the new version: phigon-observer service install.\n");
+        return 0;
+      }
       if (command === "update") {
         output.stdout(latest === null ? "Could not check for updates. Check your connection and try again.\n" : newerVersion(version, latest) ? "Update skipped.\n" : `Observer ${version} is up to date.\n`);
         return latest === null ? 1 : 0;
