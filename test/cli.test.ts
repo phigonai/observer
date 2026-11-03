@@ -150,7 +150,6 @@ test("run collects no content on a computer whose owner consented to metadata on
     const attempts: readonly (readonly string[])[] = [
       ["run"],
       ["run", "--profile", "metadata"],
-      ["run", "--profile", "full"],
     ];
     for (const args of attempts) {
       let stdout = "";
@@ -173,12 +172,53 @@ test("run collects no content on a computer whose owner consented to metadata on
       assert.equal(stdout, "", args.join(" "));
       assert.match(
         stderr,
-        args.includes("full")
-          ? /outside the consented metadata profile/u
-          : /PHIGON_COLLECT_PROMPT_CONTENT turns on content collection, which needs the full activity profile/u,
+        /PHIGON_COLLECT_PROMPT_CONTENT turns on content collection, which needs the full activity profile/u,
         args.join(" "),
       );
     }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("run started with the full profile on a metadata-only computer collects metadata instead of failing", { timeout: 60_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-cli-consent-cap-"));
+  try {
+    await new FileCredentialStore(directory).save({
+      machineId: "machine-consent-cap",
+      tenantId: "tenant-consent-cap",
+      credential: `phg_m_${"c".repeat(43)}`,
+      controlPlaneOrigin: "http://127.0.0.1:9",
+      grpcOrigin: "http://127.0.0.1:9",
+      createdAt: "2026-11-02T00:00:00.000Z",
+      consentProfile: "metadata",
+      consentPolicyVersion: "observer-policy-v1",
+      consentedAt: "2026-11-02T00:00:00.000Z",
+    });
+    let stdout = "";
+    let stderr = "";
+    let stopped = false;
+    // A background service keeps the profile it was installed with, here
+    // with a content setting the full profile allowed.
+    const exitCode = await run(["run", "--profile", "full"], {
+      PHIGON_DATA_DIR: directory,
+      PHIGON_UPDATE_CHECK: "false",
+      PHIGON_DISCOVERY_INTERVAL_MS: "60000",
+      PHIGON_COLLECT_PROMPT_CONTENT: "true",
+    }, {
+      stdout: (value) => {
+        stdout += value;
+        if (!stopped && value.includes("Connecting telemetry")) {
+          stopped = true;
+          setImmediate(() => process.emit("SIGTERM", "SIGTERM"));
+        }
+      },
+      stderr: (value) => { stderr += value; },
+    });
+    assert.equal(exitCode, 0, stderr);
+    assert.match(stdout, /consent covers agent metadata only, so the observer collects metadata instead of the full profile/u);
+    assert.match(stdout, /service install --profile metadata/u);
+    assert.match(stdout, /Observer stopped\./u);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

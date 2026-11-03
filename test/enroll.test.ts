@@ -195,7 +195,7 @@ test("a computer paired with another server is not enrolled from the same data d
     const requests: Recorded[] = [];
     await assert.rejects(
       enrollMachine({ config: config(directory), code: newCode(), fetcher: controlPlane(requests, () => json(500, {})) }),
-      /different control plane.*separate data directory/u,
+      /connected to the Phigon server at https:\/\/other\.example\.test.*separate data directory/u,
     );
     assert.equal(requests.length, 0);
   });

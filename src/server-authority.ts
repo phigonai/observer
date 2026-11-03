@@ -52,7 +52,18 @@ export async function forgetServerAuthority(dataDirectory: string): Promise<void
   await rm(serverAuthorityPath(dataDirectory), { force: true });
 }
 
+/** The SHA-256 of the authority saved when this computer paired, if any. */
+export function savedAuthorityFingerprint(dataDirectory: string): string | undefined {
+  try {
+    const pem = readFileSync(serverAuthorityPath(dataDirectory), "utf8");
+    return createHash("sha256").update(new X509Certificate(pem).raw).digest("hex");
+  } catch {
+    return undefined;
+  }
+}
+
 type Connect = (options: tls.ConnectionOptions, listener: () => void) => tls.TLSSocket;
+type AuthorityOptions = Readonly<{ proxy?: URL | undefined }>;
 
 /**
  * Finds the certificate in the server's chain whose SHA-256 matches the
@@ -66,14 +77,27 @@ export async function pinServerAuthority(
   fingerprint: string,
   dataDirectory: string,
   connect: Connect = tls.connect,
-  options: Readonly<{ proxy?: URL | undefined }> = {},
+  options: AuthorityOptions = {},
+): Promise<string> {
+  return await saveServerAuthority(dataDirectory, await readServerAuthority(url, fingerprint, connect, options));
+}
+
+/**
+ * Like `pinServerAuthority`, but only trusts the authority for this
+ * process and returns it: pairing saves it with `saveServerAuthority` once
+ * it has succeeded, so a refused pairing keeps the authority of the server
+ * this computer already uses.
+ */
+export async function readServerAuthority(
+  url: URL,
+  fingerprint: string,
+  connect: Connect = tls.connect,
+  options: AuthorityOptions = {},
 ): Promise<string> {
   if (url.protocol !== "https:") {
     throw new Error("--server-ca-sha256 needs an https:// control plane URL.");
   }
-  const tunnel = options.proxy === undefined
-    ? undefined
-    : await connectThroughProxy(options.proxy, url.hostname.replace(/^\[|\]$/gu, ""), Number(url.port || 443));
+  const tunnel = await tunnelFor(url, options);
   const chain = await peerChain(url, connect, tunnel);
   const match = chain.find((raw) => createHash("sha256").update(raw).digest("hex") === fingerprint);
   if (match === undefined) {
@@ -81,9 +105,56 @@ export async function pinServerAuthority(
   }
   const pem = new X509Certificate(match).toString();
   trustAuthority(pem);
+  return pem;
+}
+
+/** Saves an authority read by `readServerAuthority`, and returns its file. */
+export async function saveServerAuthority(dataDirectory: string, pem: string): Promise<string> {
   const file = serverAuthorityPath(dataDirectory);
   await writeFile(file, pem, { mode: 0o600 });
   return file;
+}
+
+/**
+ * Checks that the server at `url` holds a certificate the authority `pem`
+ * issued for that address, trusting nothing else. A chain only lists its
+ * authority, which anyone can copy; this connection proves the server has
+ * a certificate that authority signed. Nothing is sent on it.
+ */
+export async function verifyServerAuthority(
+  url: URL,
+  pem: string,
+  connect: Connect = tls.connect,
+  options: AuthorityOptions = {},
+): Promise<void> {
+  const host = url.hostname.replace(/^\[|\]$/gu, "");
+  const port = Number(url.port || 443);
+  const tunnel = await tunnelFor(url, options);
+  await new Promise<void>((resolve, reject) => {
+    const socket = connect({
+      ...(tunnel === undefined ? { port } : { socket: tunnel }),
+      // Also the name the certificate is checked against.
+      host,
+      ...(isIP(host) ? {} : { servername: host }),
+      ca: [pem],
+      rejectUnauthorized: true,
+      timeout: 15_000,
+    }, () => {
+      socket.end();
+      resolve();
+    });
+    socket.once("error", () => reject(new Error(`The server at ${url.host} could not prove it is the Phigon server this computer is connected to. Check the address, and copy the whole command from Connect machine again.`)));
+    socket.once("timeout", () => {
+      socket.destroy();
+      reject(new Error(`Connecting to ${url.host} timed out. Check that this computer can reach it on the network.`));
+    });
+  });
+}
+
+async function tunnelFor(url: URL, options: AuthorityOptions): Promise<Socket | undefined> {
+  return options.proxy === undefined
+    ? undefined
+    : await connectThroughProxy(options.proxy, url.hostname.replace(/^\[|\]$/gu, ""), Number(url.port || 443));
 }
 
 function peerChain(url: URL, connect: Connect, tunnel: Socket | undefined): Promise<Buffer[]> {

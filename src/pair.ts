@@ -37,6 +37,8 @@ export type PairResult = Readonly<{
    * longer accepted its key and the computer was paired as a new machine.
    */
   replacedMachineId?: string;
+  /** Where this computer reached its server before, when it moved. */
+  previousControlPlaneOrigin?: string;
 }>;
 
 /**
@@ -66,6 +68,8 @@ export type PairOptions = Readonly<{
   consentProfile: ConsentProfile;
   credentialStore?: CredentialStore;
   fetcher?: typeof fetch;
+  /** See `ConnectOptions.serverMoved`. */
+  serverMoved?: boolean;
 }>;
 
 export async function pairMachine(options: PairOptions): Promise<PairResult> {
@@ -91,6 +95,7 @@ export async function pairMachine(options: PairOptions): Promise<PairResult> {
     endpoint,
     fetcher,
     ...(options.credentialStore === undefined ? {} : { credentialStore: options.credentialStore }),
+    ...(options.serverMoved === true ? { serverMoved: true } : {}),
     exchange: (installationID, existingCredential) => exchangePairing(fetcher, endpoint, {
       code,
       installation_id: installationID,
@@ -120,6 +125,14 @@ export type ConnectOptions<T extends ConnectedMachine> = Readonly<{
   endpoint: URL;
   fetcher: typeof fetch;
   credentialStore?: CredentialStore;
+  /**
+   * The server this computer is paired with now answers at the configured
+   * address, so the stored key may go there: it holds a certificate from
+   * the authority pinned at pairing, or both addresses are this computer's
+   * own. Without it, a stored machine from another address is refused
+   * before anything is sent.
+   */
+  serverMoved?: boolean;
   /** Exchanges a code for this installation, with the stored key if any. */
   exchange: (installationID: string, existingCredential?: string) => Promise<ExchangeOutcome<T>>;
   /** The consent evidence to store with the credential `paired` returned. */
@@ -141,8 +154,9 @@ export async function connectMachine<T extends ConnectedMachine>(
   const credentialStore = options.credentialStore ??
     new FileCredentialStore(dataDirectory);
   const previous = await credentialStore.load();
-  if (previous !== null && previous.controlPlaneOrigin !== options.endpoint.origin) {
-    throw new Error("The stored machine belongs to a different control plane. Use a separate data directory to pair another workspace.");
+  const moved = previous !== null && previous.controlPlaneOrigin !== options.endpoint.origin;
+  if (previous !== null && moved && options.serverMoved !== true) {
+    throw new Error(otherServerMessage(previous.controlPlaneOrigin, options.endpoint.origin));
   }
   let paired: T | undefined;
   if (previous !== null) {
@@ -215,8 +229,16 @@ export async function connectMachine<T extends ConnectedMachine>(
       controlPlaneOrigin: options.config.controlPlaneUrl.origin,
       credentialStored: true,
       ...(replaced ? { replacedMachineId: previous.machineId } : {}),
+      ...(previous !== null && moved ? { previousControlPlaneOrigin: previous.controlPlaneOrigin } : {}),
     }),
   });
+}
+
+/** Why a computer paired with the server at `stored` does not pair at `requested`. */
+export function otherServerMessage(stored: string, requested: string): string {
+  return `This computer is connected to the Phigon server at ${stored}. ` +
+    `If that server moved to ${requested}, copy the whole command from Connect machine again, including --server-ca-sha256. ` +
+    "To connect this computer to another workspace instead, run phigon-observer remove-machine first, or use a separate data directory (PHIGON_DATA_DIR).";
 }
 
 function sameMachine(
