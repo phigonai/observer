@@ -10,12 +10,14 @@ import { OBSERVER_CONSENT_POLICY_VERSION } from "./pair.js";
 import { currentUserSID } from "./private-directory.js";
 import {
   installService,
+  readServiceSettings,
   runCommand,
   serviceDefinitionPath,
   serviceInstalled,
   serviceName,
   servicePlatform,
   serviceSettings,
+  serviceSettingsPath,
   uninstallService,
   type CommandRunner,
   type ServiceContext,
@@ -99,6 +101,43 @@ function restartNote(context: ServiceContext): string {
     : context.platform === "macos"
       ? "It starts when you sign in, and launchd starts it again if it stops."
       : "It starts when you sign in, and systemd restarts it if it fails.";
+}
+
+/** What pairing did about the background service. */
+export type PairingService =
+  | Readonly<{ status: "installed"; name: string; note: string; alreadyRunning: boolean }>
+  | Readonly<{ status: "not_installed"; reason: string }>;
+
+/**
+ * Installs the background service right after the computer's owner paired
+ * it, for the profile they consented to (`config` is loaded with it), so
+ * collection keeps running after the terminal closes and starts again after
+ * every restart. A computer that cannot have one is still paired: the
+ * result says why, and the observer can be run by hand.
+ */
+export async function installServiceAfterPairing(
+  config: ObserverConfig,
+  environment: NodeJS.ProcessEnv,
+  dependencies: ServiceDependencies = {},
+): Promise<PairingService> {
+  try {
+    const refusal = await installRefusal(config);
+    if (refusal !== undefined) return { status: "not_installed", reason: refusal };
+    const context = serviceContext(config, environment, dependencies);
+    // A service installed before (pairing again, or following a server to a
+    // new address) keeps the settings it was installed with, which this
+    // terminal may not have; only the consented profile changes.
+    const installed = await serviceInstalled(context);
+    const kept = installed
+      ? await readServiceSettings(serviceSettingsPath(context.dataDirectory)).catch(() => undefined)
+      : undefined;
+    // An observer started by hand; one the service runs restarts for the new pairing.
+    const alreadyRunning = !installed && (await InstanceLock.inspect(context.dataDirectory)).running;
+    await installService(context, { ...(kept ?? serviceSettings(environment)), PHIGON_OBSERVABILITY_PROFILE: config.observabilityProfile });
+    return { status: "installed", name: serviceName(context), note: restartNote(context), alreadyRunning };
+  } catch (error) {
+    return { status: "not_installed", reason: error instanceof Error ? error.message : "The background service could not be installed." };
+  }
 }
 
 /** `service install | uninstall | status`. */

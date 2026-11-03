@@ -217,35 +217,35 @@ function parseLock(raw: string): LockRecord | undefined {
   return { pid: value.pid, started_at: value.started_at };
 }
 
-/** A holder that started since the computer last started and still runs. */
+/**
+ * Whether the holder still runs. After a hard kill the operating system can
+ * give its process ID to an unrelated program, so a live process counts only
+ * when the start time the system recorded for it matches the lock. That
+ * holds even when the clock changed since: a computer whose clock is wrong
+ * when it starts, and is corrected a few minutes later, would otherwise make
+ * its own background service look like one from before the restart. Only
+ * when the start time cannot be read does the holder have to have started
+ * since the computer did.
+ */
 async function holderIsLive(
   holder: LockRecord,
   isAlive: (pid: number) => boolean,
   processStartedAt: (pid: number) => Promise<number | null>,
   bootedAt: () => number,
 ): Promise<boolean> {
-  return Date.parse(holder.started_at) >= bootedAt() - bootToleranceMs &&
-    isAlive(holder.pid) &&
-    !(await processIDReused(holder, processStartedAt));
+  if (!isAlive(holder.pid)) return false;
+  const started = await readStart(holder.pid, processStartedAt);
+  if (started !== null) return Math.abs(started - Date.parse(holder.started_at)) <= processStartToleranceMs;
+  return Date.parse(holder.started_at) >= bootedAt() - bootToleranceMs;
 }
 
-/**
- * After a hard kill the operating system can give the holder's process ID to
- * an unrelated program. When its start time cannot be read, the holder is
- * taken to be still running.
- */
-async function processIDReused(
-  holder: LockRecord,
-  processStartedAt: (pid: number) => Promise<number | null>,
-): Promise<boolean> {
-  let startedAt: number | null;
+async function readStart(pid: number, processStartedAt: (pid: number) => Promise<number | null>): Promise<number | null> {
   try {
-    startedAt = await processStartedAt(holder.pid);
+    const started = await processStartedAt(pid);
+    return started !== null && Number.isFinite(started) ? started : null;
   } catch {
-    return false;
+    return null;
   }
-  return startedAt !== null && Number.isFinite(startedAt) &&
-    Math.abs(startedAt - Date.parse(holder.started_at)) > processStartToleranceMs;
 }
 
 async function readProcessStartedAt(pid: number): Promise<number | null> {

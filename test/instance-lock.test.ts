@@ -50,11 +50,13 @@ test("a lock left by a stopped process or before a restart is taken over", async
     assert.equal(JSON.parse(await readFile(path, "utf8")).pid, process.pid);
     await afterCrash.release();
 
-    // The process ID is in use again, but the lock predates the last boot.
+    // The process ID is in use again, its start time cannot be read, and the
+    // lock predates the last boot.
     await writeFile(path, JSON.stringify({ pid: 424_242, started_at: new Date(now - 7_200_000).toISOString() }));
     const afterReboot = await InstanceLock.acquire(directory, {
       isAlive: () => true,
       bootedAt: () => now - 3_600_000,
+      processStartedAt: () => Promise.resolve(null),
     });
     await afterReboot.release();
 
@@ -181,7 +183,7 @@ test("inspect tells whether an observer holds the directory without touching the
     assert.deepEqual(await InstanceLock.inspect(directory, { isAlive: () => false }), { running: false });
     assert.equal(await readFile(path, "utf8"), content);
     assert.deepEqual(
-      await InstanceLock.inspect(directory, { bootedAt: () => Date.now() + 3_600_000 }),
+      await InstanceLock.inspect(directory, { bootedAt: () => Date.now() + 3_600_000, processStartedAt: async () => null }),
       { running: false },
     );
     assert.deepEqual(
@@ -193,6 +195,35 @@ test("inspect tells whether an observer holds the directory without touching the
     await writeFile(path, "");
     assert.deepEqual(await InstanceLock.inspect(directory), { running: true });
     assert.deepEqual(await InstanceLock.inspect(directory, { now: () => Date.now() + 60_000 }), { running: false });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a running observer is recognised after the clock changed, as it can just after the computer starts", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-instance-lock-clock-"));
+  const path = join(directory, "observer.lock");
+  const now = Date.parse("2026-11-03T15:00:00.000Z");
+  // The background service started at sign-in while the clock was hours
+  // behind; the clock was corrected a few minutes later.
+  const startedAt = now - 12 * 3_600_000;
+  const options = {
+    isAlive: () => true,
+    bootedAt: () => now - 3_600_000,
+    now: () => now,
+  };
+  try {
+    await writeFile(path, JSON.stringify({ pid: 424_242, started_at: new Date(startedAt).toISOString() }));
+    // The system recorded the same start time for that process: it is the holder.
+    const sameProcess = { ...options, processStartedAt: () => Promise.resolve(startedAt + 1_500) };
+    assert.equal((await InstanceLock.inspect(directory, sameProcess)).running, true);
+    await assert.rejects(InstanceLock.acquire(directory, sameProcess), ObserverAlreadyRunningError);
+
+    // A different start time is another program that got the process ID.
+    const otherProcess = { ...options, processStartedAt: () => Promise.resolve(now - 600_000) };
+    assert.equal((await InstanceLock.inspect(directory, otherProcess)).running, false);
+    const lock = await InstanceLock.acquire(directory, otherProcess);
+    await lock.release();
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
