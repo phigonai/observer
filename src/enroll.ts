@@ -134,6 +134,8 @@ export type EnrollOptions = Readonly<{
   observerVersion?: string;
   credentialStore?: CredentialStore;
   fetcher?: typeof fetch;
+  /** See `ConnectOptions.serverMoved`. */
+  serverMoved?: boolean;
   /** Called before each retry of a busy server, with the wait. */
   onRetry?: (waitMs: number, attempt: number) => void;
   sleep?: (ms: number) => Promise<void>;
@@ -156,6 +158,7 @@ export async function enrollMachine(options: EnrollOptions): Promise<EnrollResul
     endpoint,
     fetcher,
     ...(options.credentialStore === undefined ? {} : { credentialStore: options.credentialStore }),
+    ...(options.serverMoved === true ? { serverMoved: true } : {}),
     exchange: (installationID, existingCredential) => exchangeWithRetries(options, fetcher, endpoint, {
       enrollment_code: code,
       installation_id: installationID,

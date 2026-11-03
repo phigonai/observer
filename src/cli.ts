@@ -36,7 +36,7 @@ import {
   type CollectionPolicy,
   type ObserverConfig,
 } from "./config.js";
-import { FileCredentialStore } from "./credential-store.js";
+import { FileCredentialStore, type StoredMachineCredential } from "./credential-store.js";
 import {
   CustomAgentRegistry,
   customAgentRegistration,
@@ -79,8 +79,10 @@ import {
   type EnrollResult,
 } from "./enroll.js";
 import { removeMachine } from "./remove-machine.js";
-import { forgetServerAuthority, parseAuthorityFingerprint, pinServerAuthority, trustAuthority } from "./server-authority.js";
-import { readServiceSettings, startService, stopService, uninstallService } from "./service.js";
+import { forgetServerAuthority, parseAuthorityFingerprint, trustAuthority } from "./server-authority.js";
+import { preparePairingAuthority } from "./server-move.js";
+import { pairingChanged, pairingChangedExitCode, watchPairing, type PairingChange, type PairingWatch } from "./pairing-watch.js";
+import { moveServiceEndpoints, readServiceSettings, startService, stopService, uninstallService } from "./service.js";
 import { runServiceCommand, serviceContext, type ServiceDependencies } from "./service-command.js";
 import { purgeDataDirectory, removeEmptyDataDirectory } from "./purge.js";
 import { hasByteHeadroom } from "./event-queue.js";
@@ -205,7 +207,8 @@ export async function run(
       trustExtraCertificates(settings["NODE_EXTRA_CA_CERTS"], output);
     }
     environment = command === "update" ? { PHIGON_DATA_DIR:environment["PHIGON_DATA_DIR"] } : await connectionEnvironment(environment, command === "pair" || command === "run" || command === "doctor" ? flags : []);
-    const config = loadConfig(
+    // `run` narrows it to the consent stored with the credential.
+    let config = loadConfig(
       observabilityEnvironment(command, flags, environment),
     );
     // Every HTTPS call and the telemetry stream go through the proxy that
@@ -639,6 +642,7 @@ export async function run(
         })
         : undefined;
       let instanceLock: InstanceLock | undefined;
+      let pairingWatch: PairingWatch | undefined;
       try {
         const credential = await new FileCredentialStore(
           config.dataDirectory,
@@ -667,11 +671,18 @@ export async function run(
           config.observabilityProfile === "full" &&
           credential.consentProfile !== "full"
         ) {
-          throw new Error(
-            "Full-content collection is outside the consented metadata profile.",
+          // Consent caps the profile; refusing would only have a background
+          // service start again every minute, collecting nothing. Content
+          // settings are switched off with the full profile.
+          config = loadConfig({
+            ...observabilityEnvironment(command, flags, environment),
+            PHIGON_OBSERVABILITY_PROFILE: "metadata",
+          });
+          output.stdout(
+            "This computer's consent covers agent metadata only, so the observer collects metadata instead of the full profile it was started with. " +
+              "To keep it that way, run phigon-observer service install --profile metadata; to share everything, pair again with --consent-profile full.\n",
           );
-        }
-        if (config.contentSettingsOutsideProfile.length > 0) {
+        } else if (config.contentSettingsOutsideProfile.length > 0) {
           throw new Error(
             contentOutsideProfileMessage(config.contentSettingsOutsideProfile),
           );
@@ -693,6 +704,20 @@ export async function run(
           resolveCollector = resolve;
         });
         let fatalPersistenceError: Error | undefined;
+        // Pairing again while this runs, for example with narrower consent,
+        // stops it at once; its service starts it again with the new pairing.
+        let pairingChange: PairingChange | undefined;
+        pairingWatch = watchPairing({
+          dataDirectory: config.dataDirectory,
+          current: credential,
+          onChange: (change) => {
+            pairingChange = change;
+            // Nothing more is collected under the earlier pairing, not even
+            // by a pass already under way.
+            collector?.updatePolicy(intersectCollectionPolicy(config.policy, "metadata"));
+            controller.abort();
+          },
+        });
         const discoveryEngine = new DiscoveryEngine({
           customAgentRegistry,
         });
@@ -769,6 +794,7 @@ export async function run(
           },
           onStatus: (message) => output.stdout(`${message}\n`),
           onPolicy: (policy) => {
+            if (pairingChange !== undefined) return;
             effectivePolicy = intersectCollectionPolicy(
               config.policy,
               credential.consentProfile,
@@ -1005,14 +1031,24 @@ export async function run(
             controller,
             () => fatalPersistenceError,
           );
+        } catch (error) {
+          // The stream can see the new pairing first, as endpoints that no
+          // longer match; the change is the reason to stop.
+          pairingChange ??= await pairingWatch.check().catch(() => undefined);
+          if (pairingChange === undefined) throw error;
         } finally {
           // Write what the spool still buffers. Nothing depends on it:
           // checkpoints only moved past written events, and a lost
           // acknowledgement only sends an event again.
           try { client.flush(); } catch { /* Read again on the next start. */ }
         }
+        if (pairingChange !== undefined) {
+          output.stdout(`${pairingChange.message}\n`);
+          return pairingChangedExitCode;
+        }
         output.stdout("Observer stopped.\n");
       } finally {
+        pairingWatch?.stop();
         process.removeListener("SIGINT", stop);
         process.removeListener("SIGTERM", stop);
         stopWatchingParent?.();
@@ -1056,30 +1092,29 @@ export async function run(
           throw new Error("Consent was not granted. No pairing request was sent.");
         }
       }
-      if (authority !== undefined) {
-        await pinServerAuthority(config.controlPlaneUrl, authority, config.dataDirectory, undefined, {
-          proxy: proxyForUrl(config.controlPlaneUrl, proxySettings(callerEnvironment)),
-        });
-      }
-      let result: Awaited<ReturnType<typeof pairMachine>>;
-      try {
-        result = await pairMachine({
-          config,
-          code,
-          consentProfile,
-          ...(displayName === undefined ? {} : { displayName }),
-        });
-      } catch (error) {
-        // An authority pinned for a pairing that failed is not kept.
-        if (authority !== undefined && await new FileCredentialStore(config.dataDirectory).load() === null) {
-          await forgetServerAuthority(config.dataDirectory);
-        }
-        throw error;
-      }
+      const pairingAuthority = await preparePairingAuthority({
+        config,
+        fingerprint: authority,
+        proxy: proxyForUrl(config.controlPlaneUrl, proxySettings(callerEnvironment)),
+      });
+      const credentialStore = new FileCredentialStore(config.dataDirectory);
+      const before = await credentialStore.load();
+      const observerRunning = (await InstanceLock.inspect(config.dataDirectory)).running;
+      const result = await pairMachine({
+        config,
+        code,
+        consentProfile,
+        serverMoved: pairingAuthority.serverMoved,
+        ...(displayName === undefined ? {} : { displayName }),
+      });
+      await pairingAuthority.commit();
+      await followServiceEndpoints(config, before);
+      // A running observer stops for the new pairing within a second.
+      const restarts = observerRunning && before !== null && pairingChanged(before, await credentialStore.load());
       output.stdout(
         json
-          ? `${JSON.stringify(result, null, 2)}\n`
-          : formatPairResult(result),
+          ? `${JSON.stringify({ ...result, ...(restarts ? { runningObserverRestarts: true } : {}) }, null, 2)}\n`
+          : formatPairResult(result, restarts),
       );
       return 0;
     }
@@ -1187,35 +1222,49 @@ async function enrollWithCode(
   const displayName = flagValue(flags, "--name");
   const authorityFlag = flagValue(flags, "--server-ca-sha256");
   const authority = authorityFlag === undefined ? undefined : parseAuthorityFingerprint(authorityFlag);
-  if (authority !== undefined) {
-    await pinServerAuthority(config.controlPlaneUrl, authority, config.dataDirectory, undefined, {
-      proxy: proxyForUrl(config.controlPlaneUrl, proxySettings(environment)),
-    });
-  }
-  let result: Awaited<ReturnType<typeof enrollMachine>>;
-  try {
-    result = await enrollMachine({
-      config,
-      code: enrollmentCode,
-      observerVersion: version,
-      ...(displayName === undefined ? {} : { displayName }),
-      onRetry: (waitMs) => output.stderr(
-        `The Phigon server is busy. Trying again in ${Math.ceil(waitMs / 1_000)} seconds.\n`,
-      ),
-    });
-  } catch (error) {
-    // An authority pinned for an enrollment that failed is not kept.
-    if (authority !== undefined && await new FileCredentialStore(config.dataDirectory).load() === null) {
-      await forgetServerAuthority(config.dataDirectory);
-    }
-    throw error;
-  }
+  const pairingAuthority = await preparePairingAuthority({
+    config,
+    fingerprint: authority,
+    proxy: proxyForUrl(config.controlPlaneUrl, proxySettings(environment)),
+  });
+  const before = await new FileCredentialStore(config.dataDirectory).load();
+  const result = await enrollMachine({
+    config,
+    code: enrollmentCode,
+    observerVersion: version,
+    serverMoved: pairingAuthority.serverMoved,
+    ...(displayName === undefined ? {} : { displayName }),
+    onRetry: (waitMs) => output.stderr(
+      `The Phigon server is busy. Trying again in ${Math.ceil(waitMs / 1_000)} seconds.\n`,
+    ),
+  });
+  await pairingAuthority.commit();
+  await followServiceEndpoints(config, before);
   const warning = config.observabilityProfile === "full" && result.consent.profile !== "full"
-    ? "Your company's code covers the metadata profile only, so the observer does not start with PHIGON_OBSERVABILITY_PROFILE=full. Set it to metadata, or ask for a full-activity code."
+    ? "Your company's code covers the metadata profile only, so the observer collects metadata even with PHIGON_OBSERVABILITY_PROFILE=full. Ask your company for a full-activity code to change it."
     : undefined;
   if (warning !== undefined) output.stderr(`${warning}\n`);
   output.stdout(json ? `${JSON.stringify({ enrolled: true, ...result }, null, 2)}\n` : formatEnrollResult(result));
   return 0;
+}
+
+/**
+ * After a pairing at a new address, points the background service's saved
+ * endpoints there too, when they named the address this computer used.
+ */
+async function followServiceEndpoints(
+  config: ObserverConfig,
+  before: StoredMachineCredential | null,
+): Promise<void> {
+  if (before === null || before.controlPlaneOrigin === config.controlPlaneUrl.origin) return;
+  try {
+    await moveServiceEndpoints(config.dataDirectory, {
+      PHIGON_CONTROL_PLANE_URL: { from: before.controlPlaneOrigin, to: config.controlPlaneUrl.origin },
+      PHIGON_GRPC_URL: { from: before.grpcOrigin, to: config.grpcUrl.origin },
+    });
+  } catch {
+    throw new Error("This computer is paired at the new address, but its background service settings could not be updated. Run phigon-observer service install again.");
+  }
 }
 
 function formatEnrollResult(result: EnrollResult): string {
@@ -1225,6 +1274,9 @@ function formatEnrollResult(result: EnrollResult): string {
     `Control plane: ${result.controlPlaneOrigin}`,
     `Consent: given by your company${result.consent.enrollmentCodeLabel === undefined ? "" : ` with the enrollment code "${result.consent.enrollmentCodeLabel}"`}, ${result.consent.profile} profile`,
     "Machine credential: stored securely",
+    ...(result.previousControlPlaneOrigin === undefined || result.replacedMachineId !== undefined
+      ? []
+      : [`Earlier address: ${result.previousControlPlaneOrigin}. Activity this computer had not delivered yet is sent to the new address.`]),
     ...(result.replacedMachineId === undefined
       ? []
       : [
@@ -1704,18 +1756,25 @@ function formatDiscovery(snapshot: DiscoverySnapshot): string {
 
 function formatPairResult(
   result: Awaited<ReturnType<typeof pairMachine>>,
+  observerRestarts: boolean,
 ): string {
   return [
     "Machine paired successfully.",
     `Machine: ${result.displayName} (${result.machineId})`,
     `Control plane: ${result.controlPlaneOrigin}`,
     "Machine credential: stored securely",
+    ...(result.previousControlPlaneOrigin === undefined || result.replacedMachineId !== undefined
+      ? []
+      : [`Earlier address: ${result.previousControlPlaneOrigin}. Activity this computer had not delivered yet is sent to the new address.`]),
     ...(result.replacedMachineId === undefined
       ? []
       : [
           `Earlier machine: ${result.replacedMachineId} (the workspace no longer accepted its key)`,
           "This computer was paired as a new machine. Activity the earlier machine had not delivered was moved to the retired-pairings folder in the data directory.",
         ]),
+    ...(observerRestarts
+      ? ["The observer running with this data directory stops within a few seconds to use the new pairing. Its background service starts it again; if you started it yourself, run it again."]
+      : []),
     "",
   ].join("\n");
 }

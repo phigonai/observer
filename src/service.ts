@@ -362,6 +362,52 @@ export async function readServiceSettings(path: string): Promise<Record<string, 
   return settings;
 }
 
+/**
+ * A saved endpoint setting to point at a server's new address. `from` is
+ * the address the earlier pairing stored; a pairing saved before it stored
+ * one (older gRPC pairings) used the setting itself, so with no `from` the
+ * setting moves whatever it names.
+ */
+export type EndpointMove = Readonly<{ from: string | undefined; to: string }>;
+
+/**
+ * After this computer followed its server to a new address, points the
+ * background service's saved endpoints there too: a service installed while
+ * PHIGON_CONTROL_PLANE_URL or PHIGON_GRPC_URL was set keeps them, and would
+ * otherwise start again with the earlier address and refuse to run. Only a
+ * setting that named the earlier address changes. Returns whether the file
+ * changed; without a service there is nothing to change.
+ */
+export async function moveServiceEndpoints(
+  dataDirectory: string,
+  moves: Readonly<Record<string, EndpointMove>>,
+): Promise<boolean> {
+  const path = serviceSettingsPath(dataDirectory);
+  try {
+    await stat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+  const settings = await readServiceSettings(path);
+  let changed = false;
+  for (const [name, move] of Object.entries(moves)) {
+    const value = settings[name];
+    if (value === undefined) continue;
+    let origin: string;
+    try {
+      origin = new URL(value).origin;
+    } catch {
+      continue;
+    }
+    if ((move.from !== undefined && origin !== move.from) || origin === move.to) continue;
+    settings[name] = move.to;
+    changed = true;
+  }
+  if (changed) await writeServiceSettings(dataDirectory, settings);
+  return changed;
+}
+
 // ---------------------------------------------------------------------------
 // Installing, removing and inspecting the service.
 

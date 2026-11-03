@@ -119,6 +119,13 @@ phigon-observer pair --code YOUR-CODE --consent-profile full
 phigon-observer run --profile full
 ```
 
+Consent always wins. Pairing again while the observer runs takes effect at
+once: within a second the running observer stops collecting and exits (with
+code 75), and its background service starts it again with the new pairing.
+If the owner paired again with `--consent-profile metadata`, an observer
+started with `--profile full` (for example a background service) then
+collects metadata only and says so, rather than failing to start.
+
 To keep collecting after the terminal closes and after every restart, install
 the observer as a background service for the signed-in user:
 
@@ -298,6 +305,19 @@ connection trusts it. A server that presents another certificate is refused
 before anything is sent. `remove-machine` deletes the file. This needs
 Node.js 24.5 or newer.
 
+When that server's address changes (a new IP address from the network, or
+the company moves the Phigon app to another network), run the new **Connect
+machine** command on each computer with the same data directory. The
+computer keeps its machine and the activity it has not delivered yet, and
+sends them to the new address; a running observer and its background service
+restart with it, and service settings that named the old address are
+updated. Its stored key goes there only after the new
+address proves it holds a certificate from the authority pinned at pairing.
+A server on the computer itself may also move between its own addresses,
+for example when the Phigon app turns sharing with the network on or off.
+Pairing with a server that is neither is refused, and the authority already
+saved is kept.
+
 ## Configuration
 
 Settings are environment variables. The most common ones:
@@ -308,7 +328,7 @@ Settings are environment variables. The most common ones:
 | `PHIGON_CONTROL_PLANE_URL`, `PHIGON_GRPC_URL` | Endpoints for a self-hosted workspace. Pairing saves them; the stream refuses to send credentials anywhere else. |
 | `PHIGON_TLS_CA_FILE` | A private certificate authority for gRPC. Use `NODE_EXTRA_CA_CERTS` for HTTPS. Pairing with `--server-ca-sha256` sets up both for you. |
 | `PHIGON_TLS_CLIENT_CERT_FILE`, `PHIGON_TLS_CLIENT_KEY_FILE` | Client certificate, when the workspace requires mutual TLS. |
-| `PHIGON_COLLECT_*` | Turns individual content categories off. Content can be turned on only under `--profile full` on a computer whose owner consented to full activity; otherwise `run` refuses to start. |
+| `PHIGON_COLLECT_*` | Turns individual content categories off. Content can be turned on only under `--profile full` on a computer whose owner consented to full activity. Under `--profile metadata`, `run` refuses to start with one turned on; when the consent alone covers metadata only, they stay off. |
 | `PHIGON_REDACT_PATH_PATTERNS` | Extra file path patterns to redact. |
 | `PHIGON_<AGENT>_ACTIVITY_DIRS` | Extra record folders for an agent, e.g. `PHIGON_CLAUDE_ACTIVITY_DIRS`. |
 | `PHIGON_REMOTE_ACTIONS_ENABLED` | Opt in to administrator-approved agent stop and force stop. Off by default. |
