@@ -15,6 +15,7 @@ const observerFiles = new Set([
   "historical-agent-identities.json",
   "installation-id",
   "machine-credential.json",
+  "machine-removed.json",
   "observer.lock",
   "server-ca.pem",
   "service-settings.json",

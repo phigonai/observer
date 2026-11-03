@@ -87,6 +87,7 @@ import { runServiceCommand, serviceContext, type ServiceDependencies } from "./s
 import { purgeDataDirectory, removeEmptyDataDirectory } from "./purge.js";
 import { hasByteHeadroom } from "./event-queue.js";
 import { InstanceLock, ObserverAlreadyRunningError, processIsAlive } from "./instance-lock.js";
+import { MachineRemovedError, machineRemovedMessage, rememberMachineRemoved, removedAtStart } from "./machine-removed.js";
 import { clearEventSpool } from "./event-spool.js";
 import { GuardianDecisionJournal } from "./guardian-decision-journal.js";
 import {
@@ -694,6 +695,19 @@ export async function run(
           `Observer ${version} started for machine ${credential.machineId} ` +
             `with the ${config.observabilityProfile} profile, using ${config.dataDirectory}.\n`,
         );
+        // A computer the workspace removed stops here, before any agent scan,
+        // so a background service that keeps starting it costs next to
+        // nothing. The service asks the server again once an hour.
+        const removed = await removedAtStart({
+          dataDirectory: config.dataDirectory,
+          machine: credential,
+          controlPlaneUrl: config.controlPlaneUrl,
+          recheckAfterMs: serviceSettingsFile === undefined ? 0 : removedRecheckMs,
+        });
+        if (removed !== "start") {
+          if (removed === "removed") output.stderr(`${machineRemovedMessage}\n`);
+          return removedExitCode(serviceSettingsFile !== undefined);
+        }
         let effectivePolicy = intersectCollectionPolicy(
           config.policy,
           credential.consentProfile,
@@ -918,11 +932,15 @@ export async function run(
         };
         const monitoring = (async () => {
           if (await streamReady() === undefined) return;
+          // Said once when it starts failing, not on every pass.
+          let policyUnreadable = false;
           while (!controller.signal.aborted) {
             try {
               await processMonitor.review(latestDiscoveryInventory, controller.signal);
+              policyUnreadable = false;
             } catch {
-              output.stderr("Guardian process monitoring could not read verified policy state.\n");
+              if (!policyUnreadable) output.stderr("Guardian process monitoring could not read verified policy state.\n");
+              policyUnreadable = true;
             }
             try { await delay(config.discoveryIntervalMs, undefined, { signal: controller.signal }); }
             catch { break; }
@@ -1025,6 +1043,7 @@ export async function run(
             catch { break; }
           }
         })();
+        let removedWhileRunning = false;
         try {
           await settleObserverTasks(
             [streaming, discovering, collecting, monitoring, maintaining],
@@ -1033,14 +1052,41 @@ export async function run(
           );
         } catch (error) {
           // The stream can see the new pairing first, as endpoints that no
-          // longer match; the change is the reason to stop.
+          // longer match or a key the workspace no longer accepts; the
+          // change is the reason to stop.
           pairingChange ??= await pairingWatch.check().catch(() => undefined);
-          if (pairingChange === undefined) throw error;
+          if (pairingChange === undefined) {
+            if (!(error instanceof MachineRemovedError)) throw error;
+            removedWhileRunning = true;
+          }
         } finally {
           // Write what the spool still buffers. Nothing depends on it:
           // checkpoints only moved past written events, and a lost
           // acknowledgement only sends an event again.
           try { client.flush(); } catch { /* Read again on the next start. */ }
+        }
+        if (removedWhileRunning) {
+          // The stream's refusal is confirmed with the server before the
+          // observer stops for good; until then a service starts it again.
+          // Without the file the next start scans and fails again; it is
+          // only slower, so a failed write does not change the outcome.
+          await rememberMachineRemoved(config.dataDirectory, credential).catch(() => undefined);
+          const confirmed = await removedAtStart({
+            dataDirectory: config.dataDirectory,
+            machine: credential,
+            controlPlaneUrl: config.controlPlaneUrl,
+            recheckAfterMs: 0,
+          }).catch(() => "start" as const) === "removed";
+          // Pairing again just as the old key was refused restarts instead.
+          pairingChange ??= await pairingWatch.check().catch(() => undefined);
+          if (pairingChange === undefined) {
+            if (!confirmed) {
+              output.stderr("Phigon's server refused this computer's key but did not confirm that the computer was removed. The observer stops and starts again to check.\n");
+              return 1;
+            }
+            output.stderr(`${machineRemovedMessage}\n`);
+            return removedExitCode(serviceSettingsFile !== undefined);
+          }
         }
         if (pairingChange !== undefined) {
           output.stdout(`${pairingChange.message}\n`);
@@ -1574,6 +1620,19 @@ function trustExtraCertificates(file: string | undefined, output: Output): void 
   } catch {
     output.stderr(`The certificates in NODE_EXTRA_CA_CERTS (${file}) could not be read; HTTPS uses the system's authorities only.\n`);
   }
+}
+
+/** How often a background service asks again whether a removed computer is back. */
+const removedRecheckMs = 60 * 60_000;
+
+/**
+ * How `run` exits on a computer the workspace removed. A background service
+ * exits cleanly: systemd then leaves it stopped, and on Windows and macOS,
+ * which start it again anyway, the next start stops at once. A person
+ * running it in a terminal sees a failure.
+ */
+function removedExitCode(service: boolean): number {
+  return service ? 0 : 1;
 }
 
 export async function settleObserverTasks(

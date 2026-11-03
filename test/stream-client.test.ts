@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   Server,
   ServerCredentials,
+  status,
   type ServerDuplexStream,
   type ServiceDefinition,
   type UntypedServiceImplementation,
@@ -66,9 +67,12 @@ import {
   type EventEnvelope,
 } from "../src/generated/phigon/v1/telemetry_pb.js";
 import {
+  muteIpServerNameWarning,
   ObserverStreamClient,
+  reconnectDelay,
   sanitizeEventForPolicy,
 } from "../src/stream-client.js";
+import { MachineRemovedError } from "../src/machine-removed.js";
 import { ServerClock } from "../src/server-clock.js";
 import { StreamStateStore } from "../src/stream-state.js";
 import {
@@ -1556,6 +1560,71 @@ test("a clean server disconnect uses reconnect backoff instead of a busy loop", 
   } finally { clearTimeout(deadline); controller.abort(); server.forceShutdown(); await rm(directory, { recursive:true, force:true }); }
 });
 
+test("a stream that keeps failing the same way is logged once, not on every attempt", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-quiet-retry-"));
+  const server = new Server(); const controller = new AbortController();
+  let connections = 0; const messages: string[] = [];
+  server.addService(observerServiceDefinition, { streamTelemetry(call: ServerDuplexStream<StreamTelemetryRequest, StreamTelemetryResponse>) { connections++; call.resume(); call.end(); } });
+  const port = await bindServer(server);
+  const client = new ObserverStreamClient({ config:streamConfig(directory, port), credentialStore:testCredentialStore("machine"), onStatus: message => { messages.push(message); } });
+  const deadline = setTimeout(() => controller.abort(), 1_500);
+  try {
+    await client.run(controller.signal);
+    assert.ok(connections >= 3, `expected several attempts, got ${connections}`);
+    assert.equal(messages.filter((message) => message.startsWith("Connecting telemetry")).length, 1, messages.join("\n"));
+    assert.equal(messages.filter((message) => message.startsWith("Telemetry disconnected")).length, 1, messages.join("\n"));
+  } finally { clearTimeout(deadline); controller.abort(); server.forceShutdown(); await rm(directory, { recursive:true, force:true }); }
+});
+
+test("a reconnect waits at most its backoff, a minute at the longest, with some randomness", () => {
+  assert.equal(reconnectDelay(60_000, () => 0), 60_000);
+  assert.equal(reconnectDelay(60_000, () => 0.999_999), 45_001);
+  assert.equal(reconnectDelay(250, () => 0.5), 219);
+  for (let index = 0; index < 1_000; index++) {
+    const delay = reconnectDelay(60_000);
+    assert.ok(delay > 45_000 && delay <= 60_000, String(delay));
+  }
+});
+
+test("only Node's warning about an IP address as the TLS server name is left out", async () => {
+  const seen: string[] = [];
+  const listener = (warning: Error & { code?: string }) => { seen.push(warning.code ?? warning.message); };
+  process.on("warning", listener);
+  try {
+    muteIpServerNameWarning();
+    muteIpServerNameWarning();
+    process.emitWarning("Setting the TLS ServerName to an IP address is not permitted by RFC 6066.", "DeprecationWarning", "DEP0123");
+    process.emitWarning("Setting the TLS ServerName to an IP address is not permitted by RFC 6066.", { type: "DeprecationWarning", code: "DEP0123" });
+    process.emitWarning("Something else is deprecated.", "DeprecationWarning", "DEP9999");
+    process.emitWarning("A plain warning.");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(seen, ["DEP9999", "A plain warning."]);
+  } finally {
+    process.off("warning", listener);
+  }
+});
+
+test("a stream the workspace refuses ends with a removed-computer error instead of retrying", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-removed-stream-"));
+  const server = new Server();
+  let connections = 0;
+  server.addService(observerServiceDefinition, { streamTelemetry(call: ServerDuplexStream<StreamTelemetryRequest, StreamTelemetryResponse>) {
+    connections++;
+    call.resume();
+    call.emit("error", { code: status.UNAUTHENTICATED, details: "machine credential is revoked" });
+  } });
+  const port = await bindServer(server);
+  const client = new ObserverStreamClient({ config:streamConfig(directory, port), credentialStore:testCredentialStore("machine") });
+  try {
+    await assert.rejects(client.run(new AbortController().signal), (error: Error) => {
+      assert.ok(error instanceof MachineRemovedError);
+      assert.equal(error.message, "This computer was removed from Phigon. Pair it again with a new code from Connect machine, or run phigon-observer service uninstall.");
+      return true;
+    });
+    assert.equal(connections, 1);
+  } finally { server.forceShutdown(); await rm(directory, { recursive:true, force:true }); }
+});
+
 test("reconnect backoff starts over after a connection completed its handshake", async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-backoff-reset-"));
   const machineId = "5f1b4cb4-a77d-4f53-af66-197e184683f4";
@@ -1564,8 +1633,10 @@ test("reconnect backoff starts over after a connection completed its handshake",
   server.addService(observerServiceDefinition, { streamTelemetry(call: ServerDuplexStream<StreamTelemetryRequest, StreamTelemetryResponse>) {
     connections++;
     // Two failed attempts grow the backoff; the third connection is healthy
-    // and then closes, as a restarting control plane would.
-    if (connections <= 2) { call.resume(); call.end(); return; }
+    // and then closes, as a restarting control plane would. The two
+    // failures differ, so both are logged.
+    if (connections === 1) { call.resume(); call.end(); return; }
+    if (connections === 2) { call.resume(); call.emit("error", { code: status.UNAVAILABLE, details: "server is starting" }); return; }
     call.on("data", (request: StreamTelemetryRequest) => {
       if (request.payload.case !== "resume") return;
       call.write(policySnapshot(machineId)); call.write(acknowledgement(machineId, 0n));
@@ -1573,17 +1644,20 @@ test("reconnect backoff starts over after a connection completed its handshake",
     });
   } });
   const port = await bindServer(server);
+  let connecting = 0;
   const client = new ObserverStreamClient({ config:streamConfig(directory, port), credentialStore:testCredentialStore(machineId), queue:new BoundedEventQueue<EventEnvelope>(8),
     onStatus: message => {
+      // Said at the start, and again after the healthy connection ends.
+      if (message.startsWith("Connecting telemetry") && ++connecting === 2) controller.abort();
       const delay = /retrying in (\d+)ms/u.exec(message)?.[1];
-      if (delay === undefined) return;
-      retries.push(Number(delay));
-      if (retries.length === 3) controller.abort();
+      if (delay !== undefined) retries.push(Number(delay));
     } });
   const deadline = setTimeout(() => controller.abort(), 8_000);
   try {
     await client.run(controller.signal);
     assert.deepEqual(retries, [250, 500, 250]);
+    assert.equal(connecting, 2, "once per outage, not once per attempt");
+    assert.ok(connections >= 3, `expected at least three connections, got ${connections}`);
   } finally { clearTimeout(deadline); controller.abort(); server.forceShutdown(); await rm(directory, { recursive:true, force:true }); }
 });
 

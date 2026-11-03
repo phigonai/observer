@@ -519,7 +519,16 @@ policy; removing the observer from a computer never erases it.
   `phigon-observer service install`, and read `logs/observer.log` in the data
   directory.
 - **Disconnected:** keep the observer running and allow its HTTPS and gRPC endpoints.
-  Queued activity is delivered when the connection returns.
+  Queued activity is delivered when the connection returns. While the server
+  cannot be reached, the observer tries again up to once a minute and logs
+  each new reason once.
+- **"This computer was removed from Phigon":** an administrator removed the
+  computer or revoked its key, and the server confirmed it, so the observer
+  stopped. Pair it again with a new code from **Connect machine**, or run
+  `phigon-observer service uninstall`. Until then the background service
+  stops as soon as it starts and asks the server again once an hour. On
+  Linux it stays stopped; after pairing again, start it with
+  `systemctl --user restart phigon-observer` or sign in again.
 - **Older self-hosted pairing without a saved stream endpoint:** pass
   `run --grpc-url https://stream.your-company.example` or set `PHIGON_GRPC_URL`.
 - **Unreadable pairing data:** keep the data directory and encrypted queue, and

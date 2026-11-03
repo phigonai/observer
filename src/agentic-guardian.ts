@@ -120,13 +120,25 @@ export class HTTPGuardianDecisionClient {
       );
     } catch (error) {
       if (error instanceof GuardianDecisionUnavailableError) throw error;
+      const reason = connectionFailure(error, controller.signal.aborted);
       throw new GuardianDecisionUnavailableError(
-        "Guardian semantic decision service was unavailable.",
+        `Guardian semantic decision service was unavailable${reason === undefined ? "" : ` (${reason})`}.`,
       );
     } finally {
       clearTimeout(timeout);
     }
   }
+}
+
+/**
+ * Why a request never got an answer, for a log line: that it timed out, or
+ * the connection error's code (such as ECONNREFUSED). Never anything sent.
+ */
+export function connectionFailure(error: unknown, timedOut: boolean): string | undefined {
+  if (timedOut || (error instanceof Error && error.name === "TimeoutError")) return "no answer in time";
+  const cause = error instanceof Error ? error.cause : undefined;
+  const code = typeof cause === "object" && cause !== null && "code" in cause ? cause.code : undefined;
+  return typeof code === "string" && /^[A-Z][A-Z0-9_]{1,63}$/u.test(code) ? code : undefined;
 }
 
 export async function readGuardianActionContext(

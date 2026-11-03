@@ -30,6 +30,8 @@ async function fillDataDirectory(directory: string): Promise<void> {
     ["custom-agents.json", "{}"],
     ["action-policy.json.123.7f6b3c2a-1111-4222-8333-944445555666.tmp", "x"],
     ["service-settings.json", "{}"],
+    // Left by a computer the workspace removed.
+    ["machine-removed.json", "{}"],
     [join("logs", "observer.log"), "line\n"],
     [join("bridges", "generic", "segment.jsonl"), "{}\n"],
   ] as const) {
@@ -45,7 +47,7 @@ test("a purge removes only what the observer created", async () => {
     await writeFile(join(directory, "observer.lock"), "{}");
     const result = await purgeDataDirectory(directory, ["observer.lock"]);
     assert.deepEqual(result.leftBehind, ["notes.txt"]);
-    assert.equal(result.removed, 14);
+    assert.equal(result.removed, 15);
     assert.deepEqual((await readdir(directory)).sort(), ["notes.txt", "observer.lock"]);
     assert.equal(await removeEmptyDataDirectory(directory), false);
 
