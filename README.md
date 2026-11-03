@@ -102,22 +102,29 @@ npm install --global @phigon/observer
 
 1. In the Phigon app, choose **Connect machine**.
 2. Choose **Metadata** or **Full activity**, then generate a one-time code.
-3. On the computer, run the two commands the dialog shows. The computer's owner
+3. On the computer, run the command the dialog shows. The computer's owner
    reviews and accepts the scope.
 
 Metadata only:
 
 ```sh
 phigon-observer pair --code YOUR-CODE --consent-profile metadata
-phigon-observer run --profile metadata
 ```
 
 Full activity (supported conversations, commands, outputs and past history):
 
 ```sh
 phigon-observer pair --code YOUR-CODE --consent-profile full
-phigon-observer run --profile full
 ```
+
+That is all: pairing also installs the observer as a background service for
+the signed-in user, with the profile the owner agreed to (see
+[Background service](#background-service)). It keeps collecting after the
+terminal closes and starts again after every restart. The consent prompt says
+so before the owner agrees. If the computer cannot have a background service
+(for example Linux without systemd user services), pairing still succeeds and
+says to run `phigon-observer run --profile metadata` (or `full`) instead. Add
+`--no-service` to pair without installing one.
 
 Consent always wins. Pairing again while the observer runs takes effect at
 once: within a second the running observer stops collecting and exits (with
@@ -126,8 +133,8 @@ If the owner paired again with `--consent-profile metadata`, an observer
 started with `--profile full` (for example a background service) then
 collects metadata only and says so, rather than failing to start.
 
-To keep collecting after the terminal closes and after every restart, install
-the observer as a background service for the signed-in user:
+To install the background service yourself, for a computer paired with
+`--no-service` or an older observer, or to change its profile:
 
 ```sh
 phigon-observer service install --profile metadata   # or --profile full
@@ -255,7 +262,7 @@ settings. A full description is in
 
 | Command | What it does |
 | --- | --- |
-| `pair --code <code> --consent-profile <metadata\|full>` | Connects this computer to a workspace after local consent. |
+| `pair --code <code> --consent-profile <metadata\|full>` | Connects this computer to a workspace after local consent, and keeps the observer running in the background from then on. `--no-service` pairs only. |
 | `pair` with `PHIGON_ENROLLMENT_CODE` (or `--enrollment-code <code>`) | Enrolls this computer with a company's enrollment code, under the company's consent, without asking; see [above](#rolling-out-to-many-computers-with-an-enrollment-code). |
 | `run [--profile <metadata\|full>]` | Discovers agents and streams permitted activity. |
 | `service install [--profile <metadata\|full>]`, `service uninstall`, `service status` | Runs the observer in the background for the signed-in user, from sign-in on. |

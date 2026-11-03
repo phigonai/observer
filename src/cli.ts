@@ -83,7 +83,13 @@ import { forgetServerAuthority, parseAuthorityFingerprint, trustAuthority } from
 import { preparePairingAuthority } from "./server-move.js";
 import { pairingChanged, pairingChangedExitCode, watchPairing, type PairingChange, type PairingWatch } from "./pairing-watch.js";
 import { moveServiceEndpoints, readServiceSettings, startService, stopService, uninstallService } from "./service.js";
-import { runServiceCommand, serviceContext, type ServiceDependencies } from "./service-command.js";
+import {
+  installServiceAfterPairing,
+  runServiceCommand,
+  serviceContext,
+  type PairingService,
+  type ServiceDependencies,
+} from "./service-command.js";
 import { purgeDataDirectory, removeEmptyDataDirectory } from "./purge.js";
 import { hasByteHeadroom } from "./event-queue.js";
 import { InstanceLock, ObserverAlreadyRunningError, processIsAlive } from "./instance-lock.js";
@@ -1126,13 +1132,16 @@ export async function run(
       );
       const authorityFlag = flagValue(flags, "--server-ca-sha256");
       const authority = authorityFlag === undefined ? undefined : parseAuthorityFingerprint(authorityFlag);
+      // Pairing also keeps the observer running in the background, unless
+      // whoever runs it keeps it running another way.
+      const background = !flags.includes("--no-service");
       if (json && !flags.includes("--accept-consent")) {
         throw new Error(
           "JSON pairing requires --accept-consent after reviewing the selected profile.",
         );
       }
       if (!flags.includes("--accept-consent")) {
-        output.stdout(consentPrompt(consentProfile));
+        output.stdout(consentPrompt(consentProfile, background));
         const confirmed = await readConfirmation(input);
         if (confirmed !== "yes") {
           throw new Error("Consent was not granted. No pairing request was sent.");
@@ -1157,10 +1166,21 @@ export async function run(
       await followServiceEndpoints(config, before);
       // A running observer stops for the new pairing within a second.
       const restarts = observerRunning && before !== null && pairingChanged(before, await credentialStore.load());
+      const service = background
+        ? await installServiceAfterPairing(
+          loadConfig({ ...environment, PHIGON_OBSERVABILITY_PROFILE: consentProfile }),
+          callerEnvironment,
+          dependencies,
+        )
+        : undefined;
       output.stdout(
         json
-          ? `${JSON.stringify({ ...result, ...(restarts ? { runningObserverRestarts: true } : {}) }, null, 2)}\n`
-          : formatPairResult(result, restarts),
+          ? `${JSON.stringify({
+            ...result,
+            ...(restarts ? { runningObserverRestarts: true } : {}),
+            ...(service === undefined ? {} : { backgroundService: service }),
+          }, null, 2)}\n`
+          : formatPairResult(result, restarts, service, consentProfile),
       );
       return 0;
     }
@@ -1729,7 +1749,7 @@ function helpText(): string {
     "  phigon-observer --version",
     "  phigon-observer discover [--json]",
     "  phigon-observer ingest --agent <agent-id|custom> [--name <agent-name>] [--quiet] [--json]",
-    "  phigon-observer pair --code <one-time-code> --consent-profile <metadata|full> [--control-plane-url <url> --grpc-url <url> [--server-ca-sha256 <fingerprint>]] [--name <machine-name>] [--accept-consent] [--json]",
+    "  phigon-observer pair --code <one-time-code> --consent-profile <metadata|full> [--control-plane-url <url> --grpc-url <url> [--server-ca-sha256 <fingerprint>]] [--name <machine-name>] [--accept-consent] [--no-service] [--json]",
     "  PHIGON_ENROLLMENT_CODE=<code> phigon-observer pair [--control-plane-url <url> --grpc-url <url> [--server-ca-sha256 <fingerprint>]] [--name <machine-name>] [--json]",
     "  phigon-observer pair --enrollment-code <code> [same options]",
     "  phigon-observer remove-machine [--purge] [--yes] [--json]",
@@ -1816,6 +1836,8 @@ function formatDiscovery(snapshot: DiscoverySnapshot): string {
 function formatPairResult(
   result: Awaited<ReturnType<typeof pairMachine>>,
   observerRestarts: boolean,
+  service: PairingService | undefined,
+  profile: ConsentProfile,
 ): string {
   return [
     "Machine paired successfully.",
@@ -1834,8 +1856,27 @@ function formatPairResult(
     ...(observerRestarts
       ? ["The observer running with this data directory stops within a few seconds to use the new pairing. Its background service starts it again; if you started it yourself, run it again."]
       : []),
+    ...pairingServiceLines(service, profile),
     "",
   ].join("\n");
+}
+
+function pairingServiceLines(service: PairingService | undefined, profile: ConsentProfile): string[] {
+  if (service === undefined) return [`Start collecting with: phigon-observer run --profile ${profile}`];
+  if (service.status === "installed") {
+    return [
+      "",
+      `Phigon now runs in the background on this computer (${service.name}). You can close this window.`,
+      service.note,
+      ...(service.alreadyRunning ? ["An observer you started is still running; the service takes over when it stops."] : []),
+      "To stop it: phigon-observer service uninstall",
+    ];
+  }
+  return [
+    "",
+    `Phigon could not keep running in the background: ${service.reason}`,
+    `Start collecting with: phigon-observer run --profile ${profile}, and keep that window open.`,
+  ];
 }
 
 /**
@@ -2173,14 +2214,17 @@ function parseConsentProfile(value: string | undefined): ConsentProfile {
   );
 }
 
-function consentPrompt(profile: ConsentProfile): string {
+function consentPrompt(profile: ConsentProfile, background: boolean): string {
   const scope = profile === "metadata"
     ? "process, file, network, and browser metadata; no prompts, responses, file contents, terminal output, or browser contents"
     : "metadata plus prompts, responses, reasoning, command arguments and output, file/browser/network content, tool output, and model content; environment values remain excluded";
   return [
     `Consent profile: ${profile}`,
     `Collection scope: ${scope}.`,
-    "The machine owner can stop the observer at any time.",
+    ...(background
+      ? ["Phigon then keeps running in the background on this computer and starts when you sign in."]
+      : []),
+    `The machine owner can stop the observer at any time${background ? " (phigon-observer service uninstall)" : ""}.`,
     'Type "yes" to grant this scope and pair the machine: ',
   ].join("\n");
 }

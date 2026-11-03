@@ -86,6 +86,8 @@ async function pair(directory: string, origin: string, fingerprint: string) {
     "--grpc-url", origin,
     "--server-ca-sha256", fingerprint,
     "--accept-consent",
+    // These tests are about the address; no service is installed on the test computer.
+    "--no-service",
     "--json",
   ], { PHIGON_DATA_DIR: directory, PHIGON_UPDATE_CHECK: "false" }, {
     stdout: (value) => { stdout += value; },
