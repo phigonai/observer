@@ -5,6 +5,7 @@ import { redactSecrets } from "./content-redaction.js";
 import {
   maxEnrollmentCodeLabelLength,
   type CredentialStore,
+  type RemoteActionConsent,
 } from "./credential-store.js";
 import {
   OBSERVER_CONSENT_POLICY_VERSION,
@@ -132,6 +133,8 @@ export type EnrollOptions = Readonly<{
   code: string;
   displayName?: string;
   observerVersion?: string;
+  /** What the company lets its administrators do on this computer. */
+  remoteActions?: RemoteActionConsent;
   credentialStore?: CredentialStore;
   fetcher?: typeof fetch;
   /** See `ConnectOptions.serverMoved`. */
@@ -174,6 +177,7 @@ export async function enrollMachine(options: EnrollOptions): Promise<EnrollResul
       consentPolicyVersion: enrolled.consent.policyVersion,
       consentedAt: enrolled.consent.grantedAt ?? at,
       consentSource: "company",
+      ...(options.remoteActions === undefined ? {} : { remoteActions: options.remoteActions }),
       ...(enrolled.consent.enrollmentCodeId === undefined
         ? {}
         : { enrollmentCodeId: enrolled.consent.enrollmentCodeId }),

@@ -71,6 +71,28 @@ test("pairing keeps the observer running in the background, for the profile the 
     const settings = JSON.parse(await readFile(join(setup.root, "data", "service-settings.json"), "utf8")) as { environment: Record<string, string> };
     assert.equal(settings.environment["PHIGON_OBSERVABILITY_PROFILE"], "full");
     assert.equal(result.stdout.includes(key), false);
+    // The owner also agrees that administrators may stop agents and run approved commands.
+    assert.match(result.stdout, /Your company's Phigon administrators can stop AI agents on this computer and run the commands they approve\./u);
+    const stored = JSON.parse(await readFile(join(setup.root, "data", "machine-credential.json"), "utf8")) as Record<string, unknown>;
+    assert.equal(stored["remoteActions"], "all");
+  } finally {
+    await setup.close();
+  }
+});
+
+test("the owner can pair while allowing only stopping agents, or neither", async () => {
+  const setup = await setUp();
+  try {
+    const stopOnly = await setup.pair(["--consent-profile", "metadata", "--no-remote-commands"], ["yes\n"]);
+    assert.equal(stopOnly.code, 0, stopOnly.stderr);
+    assert.match(stopOnly.stdout, /Your company's Phigon administrators can stop AI agents on this computer\. You see/u);
+    const file = join(setup.root, "data", "machine-credential.json");
+    assert.equal((JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>)["remoteActions"], "stop_agents");
+
+    const neither = await setup.pair(["--consent-profile", "metadata", "--no-remote-actions", "--accept-consent", "--json"]);
+    assert.equal(neither.code, 0, neither.stderr);
+    assert.equal((JSON.parse(neither.stdout) as Record<string, unknown>)["remoteActions"], "none");
+    assert.equal((JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>)["remoteActions"], "none");
   } finally {
     await setup.close();
   }

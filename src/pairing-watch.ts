@@ -37,6 +37,7 @@ const watchedFields = [
   "consentPolicyVersion",
   "consentSource",
   "enrollmentCodeId",
+  "remoteActions",
 ] as const satisfies readonly (keyof StoredMachineCredential)[];
 
 // Where the server answers; the same machine and consent at a new address.
