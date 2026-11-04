@@ -4,6 +4,7 @@ import {
   FileCredentialStore,
   credentialFileName,
   type CredentialStore,
+  type RemoteActionConsent,
   type StoredMachineCredential,
 } from "./credential-store.js";
 import { retirePairingState } from "./event-spool.js";
@@ -59,6 +60,7 @@ export type ConsentEvidence = Pick<
   | "consentSource"
   | "enrollmentCodeId"
   | "enrollmentCodeLabel"
+  | "remoteActions"
 >;
 
 export type PairOptions = Readonly<{
@@ -66,6 +68,8 @@ export type PairOptions = Readonly<{
   code: string;
   displayName?: string;
   consentProfile: ConsentProfile;
+  /** What the owner lets the company's administrators do on this computer. */
+  remoteActions?: RemoteActionConsent;
   credentialStore?: CredentialStore;
   fetcher?: typeof fetch;
   /** See `ConnectOptions.serverMoved`. */
@@ -115,6 +119,7 @@ export async function pairMachine(options: PairOptions): Promise<PairResult> {
       consentPolicyVersion: OBSERVER_CONSENT_POLICY_VERSION,
       consentedAt: at,
       consentSource: "owner",
+      ...(options.remoteActions === undefined ? {} : { remoteActions: options.remoteActions }),
     }),
   });
   return connected.result;

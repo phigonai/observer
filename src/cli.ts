@@ -36,7 +36,8 @@ import {
   type CollectionPolicy,
   type ObserverConfig,
 } from "./config.js";
-import { FileCredentialStore, type StoredMachineCredential } from "./credential-store.js";
+import { FileCredentialStore, type RemoteActionConsent, type StoredMachineCredential } from "./credential-store.js";
+import { remoteActionConsent, remoteActionSentence, remoteActionsAllowed } from "./remote-actions.js";
 import {
   CustomAgentRegistry,
   customAgentRegistration,
@@ -752,10 +753,13 @@ export async function run(
         const serverClock = new ServerClock({
           onLargeSkew: (offsetMs) => output.stdout(`${describeClockSkew(offsetMs)}\n`),
         });
+        // What administrators may do here: what was consented to at pairing,
+        // unless the observer's settings say otherwise.
+        const allowed = remoteActionsAllowed(credential, environment, config);
         const actionExecutor = new AgentActionExecutor({
           notices: userNotices,
-          enabled: config.remoteActionsEnabled,
-          commandsEnabled: config.remoteCommandsEnabled,
+          enabled: allowed.stopAgents,
+          commandsEnabled: allowed.commands,
           machineID: credential.machineId,
           dataDirectory: config.dataDirectory,
           inventory: async () =>
@@ -1158,13 +1162,15 @@ export async function run(
       // Pairing also keeps the observer running in the background, unless
       // whoever runs it keeps it running another way.
       const background = !flags.includes("--no-service");
+      // The owner also agrees to what the company's administrators may do here.
+      const remoteActions = remoteActionConsent(flags);
       if (json && !flags.includes("--accept-consent")) {
         throw new Error(
           "JSON pairing requires --accept-consent after reviewing the selected profile.",
         );
       }
       if (!flags.includes("--accept-consent")) {
-        output.stdout(consentPrompt(consentProfile, background));
+        output.stdout(consentPrompt(consentProfile, background, remoteActions));
         const confirmed = await readConfirmation(input);
         if (confirmed !== "yes") {
           throw new Error("Consent was not granted. No pairing request was sent.");
@@ -1182,6 +1188,7 @@ export async function run(
         config,
         code,
         consentProfile,
+        remoteActions,
         serverMoved: pairingAuthority.serverMoved,
         ...(displayName === undefined ? {} : { displayName }),
       });
@@ -1200,10 +1207,11 @@ export async function run(
         json
           ? `${JSON.stringify({
             ...result,
+            remoteActions,
             ...(restarts ? { runningObserverRestarts: true } : {}),
             ...(service === undefined ? {} : { backgroundService: service }),
           }, null, 2)}\n`
-          : formatPairResult(result, restarts, service, consentProfile),
+          : formatPairResult(result, restarts, service, consentProfile, remoteActions),
       );
       return 0;
     }
@@ -1321,6 +1329,7 @@ async function enrollWithCode(
     config,
     code: enrollmentCode,
     observerVersion: version,
+    remoteActions: remoteActionConsent(flags),
     serverMoved: pairingAuthority.serverMoved,
     ...(displayName === undefined ? {} : { displayName }),
     onRetry: (waitMs) => output.stderr(
@@ -1333,7 +1342,8 @@ async function enrollWithCode(
     ? "Your company's code covers the metadata profile only, so the observer collects metadata even with PHIGON_OBSERVABILITY_PROFILE=full. Ask your company for a full-activity code to change it."
     : undefined;
   if (warning !== undefined) output.stderr(`${warning}\n`);
-  output.stdout(json ? `${JSON.stringify({ enrolled: true, ...result }, null, 2)}\n` : formatEnrollResult(result));
+  const remoteActions = remoteActionConsent(flags);
+  output.stdout(json ? `${JSON.stringify({ enrolled: true, ...result, remoteActions }, null, 2)}\n` : formatEnrollResult(result, remoteActions));
   return 0;
 }
 
@@ -1356,12 +1366,13 @@ async function followServiceEndpoints(
   }
 }
 
-function formatEnrollResult(result: EnrollResult): string {
+function formatEnrollResult(result: EnrollResult, remoteActions: RemoteActionConsent): string {
   return [
     "Computer enrolled.",
     `Machine: ${result.displayName} (${result.machineId})`,
     `Control plane: ${result.controlPlaneOrigin}`,
     `Consent: given by your company${result.consent.enrollmentCodeLabel === undefined ? "" : ` with the enrollment code "${result.consent.enrollmentCodeLabel}"`}, ${result.consent.profile} profile`,
+    remoteActionSentence(remoteActions),
     "Machine credential: stored securely",
     ...(result.previousControlPlaneOrigin === undefined || result.replacedMachineId !== undefined
       ? []
@@ -1772,7 +1783,7 @@ function helpText(): string {
     "  phigon-observer --version",
     "  phigon-observer discover [--json]",
     "  phigon-observer ingest --agent <agent-id|custom> [--name <agent-name>] [--quiet] [--json]",
-    "  phigon-observer pair --code <one-time-code> --consent-profile <metadata|full> [--control-plane-url <url> --grpc-url <url> [--server-ca-sha256 <fingerprint>]] [--name <machine-name>] [--accept-consent] [--no-service] [--json]",
+    "  phigon-observer pair --code <one-time-code> --consent-profile <metadata|full> [--control-plane-url <url> --grpc-url <url> [--server-ca-sha256 <fingerprint>]] [--name <machine-name>] [--accept-consent] [--no-service] [--no-remote-commands | --no-remote-actions] [--json]",
     "  PHIGON_ENROLLMENT_CODE=<code> phigon-observer pair [--control-plane-url <url> --grpc-url <url> [--server-ca-sha256 <fingerprint>]] [--name <machine-name>] [--json]",
     "  phigon-observer pair --enrollment-code <code> [same options]",
     "  phigon-observer remove-machine [--purge] [--yes] [--json]",
@@ -1861,11 +1872,13 @@ function formatPairResult(
   observerRestarts: boolean,
   service: PairingService | undefined,
   profile: ConsentProfile,
+  remoteActions: RemoteActionConsent,
 ): string {
   return [
     "Machine paired successfully.",
     `Machine: ${result.displayName} (${result.machineId})`,
     `Control plane: ${result.controlPlaneOrigin}`,
+    remoteActionSentence(remoteActions),
     "Machine credential: stored securely",
     ...(result.previousControlPlaneOrigin === undefined || result.replacedMachineId !== undefined
       ? []
@@ -2237,7 +2250,7 @@ function parseConsentProfile(value: string | undefined): ConsentProfile {
   );
 }
 
-function consentPrompt(profile: ConsentProfile, background: boolean): string {
+function consentPrompt(profile: ConsentProfile, background: boolean, remoteActions: RemoteActionConsent): string {
   const scope = profile === "metadata"
     ? "process, file, network, and browser metadata; no prompts, responses, file contents, terminal output, or browser contents"
     : "metadata plus prompts, responses, reasoning, command arguments and output, file/browser/network content, tool output, and model content; environment values remain excluded";
@@ -2246,6 +2259,10 @@ function consentPrompt(profile: ConsentProfile, background: boolean): string {
     `Collection scope: ${scope}.`,
     ...(background
       ? ["Phigon then keeps running in the background on this computer and starts when you sign in."]
+      : []),
+    remoteActionSentence(remoteActions),
+    ...(remoteActions === "all"
+      ? ["To allow only stopping agents, add --no-remote-commands; to allow neither, add --no-remote-actions."]
       : []),
     `The machine owner can stop the observer at any time${background ? " (phigon-observer service uninstall)" : ""}.`,
     'Type "yes" to grant this scope and pair the machine: ',

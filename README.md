@@ -348,8 +348,8 @@ Settings are environment variables. The most common ones:
 | `PHIGON_COLLECT_*` | Turns individual content categories off. Content can be turned on only under `--profile full` on a computer whose owner consented to full activity. Under `--profile metadata`, `run` refuses to start with one turned on; when the consent alone covers metadata only, they stay off. |
 | `PHIGON_REDACT_PATH_PATTERNS` | Extra file path patterns to redact. |
 | `PHIGON_<AGENT>_ACTIVITY_DIRS` | Extra record folders for an agent, e.g. `PHIGON_CLAUDE_ACTIVITY_DIRS`. |
-| `PHIGON_REMOTE_ACTIONS_ENABLED` | Opt in to administrator-approved agent stop and force stop. Off by default. |
-| `PHIGON_REMOTE_COMMANDS_ENABLED` | Opt in to administrator-reviewed system operations. Off by default. |
+| `PHIGON_REMOTE_ACTIONS_ENABLED` | `true` or `false` overrides whether administrators may stop and force-stop agents. Unset, the consent given when the computer paired decides. |
+| `PHIGON_REMOTE_COMMANDS_ENABLED` | `true` or `false` overrides whether administrators may run reviewed commands, inspect the system and restart it. Unset, the consent given when the computer paired decides. |
 | `PHIGON_USER_NOTICES` | Set to `false` to stop telling the person at the computer when Phigon stops an agent, runs a command or restarts it, and, on a computer enrolled with a company's code, that collection started. On by default. |
 | `PHIGON_UPDATE_CHECK` | Set to `false` to turn off the once-a-day update check. |
 | `PHIGON_LOG_LEVEL` | What `run` prints and writes to its log: `debug`, `info` (default), `warn` or `error`. |
@@ -409,11 +409,18 @@ and overlapping signals are rejected instead of guessed. Custom activity stays
 labeled by its source unless independent process evidence proves an exact
 match.
 
-## Optional agent actions
+## Agent actions
 
-Remote actions are off on every computer by default.
+From observer 8.8.0, the owner agrees at pairing (or the company, with an
+enrollment code) that administrators may stop AI agents and run the commands
+they approve; the consent prompt says so, and the pairing stores the answer.
+`--no-remote-commands` allows only stopping agents, and `--no-remote-actions`
+allows neither. A computer paired by an earlier observer allows neither until
+it pairs again. `PHIGON_REMOTE_ACTIONS_ENABLED` and
+`PHIGON_REMOTE_COMMANDS_ENABLED` set to `true` or `false` override the
+stored answer.
 
-- `PHIGON_REMOTE_ACTIONS_ENABLED=true` lets administrators stop or force-stop
+- **Stopping agents** lets administrators stop or force-stop
   one exact running agent process. Each stop needs an operator proposal and a
   separate administrator confirmation, expires quickly, and leaves a receipt.
   A stop acts on one exact process lifetime (process ID plus start time, checked
@@ -426,7 +433,7 @@ Remote actions are off on every computer by default.
   exited, access was denied, or the agent or a child is still running. It does
   not enable shell access, file access, screen capture or general remote
   control.
-- `PHIGON_REMOTE_COMMANDS_ENABLED=true` additionally allows
+- **Commands** additionally allow
   administrator-reviewed commands (executable and arguments, no shell), system
   inspection, and scheduled shutdown or restart. Commands run as the observer's
   account, are limited to 1–120 seconds and return at most 32 KB of redacted

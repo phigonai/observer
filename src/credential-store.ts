@@ -30,7 +30,16 @@ export type StoredMachineCredential = Readonly<{
   /** The enrollment code the company consented with, by ID and label. */
   enrollmentCodeId?: string;
   enrollmentCodeLabel?: string;
+  /**
+   * What whoever consented let the company's administrators do on this
+   * computer: stop its AI agents, and also run the commands they approve.
+   * Pairings made before it was asked have none, and allow neither.
+   */
+  remoteActions?: RemoteActionConsent;
 }>;
+
+/** "none", "stop_agents" (stop and force-stop agents), or "all" (also run approved commands). */
+export type RemoteActionConsent = "none" | "stop_agents" | "all";
 
 export type ConsentSource = "owner" | "company";
 
@@ -170,7 +179,9 @@ function validateCredential(
       (typeof value.enrollmentCodeId !== "string" || value.enrollmentCodeId.length > 64)) ||
     ("enrollmentCodeLabel" in value &&
       (typeof value.enrollmentCodeLabel !== "string" ||
-        value.enrollmentCodeLabel.length > maxEnrollmentCodeLabelLength))
+        value.enrollmentCodeLabel.length > maxEnrollmentCodeLabelLength)) ||
+    ("remoteActions" in value &&
+      (value.remoteActions !== "none" && value.remoteActions !== "stop_agents" && value.remoteActions !== "all"))
   ) {
     throw new Error("Stored machine consent evidence is invalid.");
   }
