@@ -150,10 +150,10 @@ test("a Guardian request that gets no answer says why, without anything it sent"
   const conflict = (async () => new Response(JSON.stringify({ error: { message: "do not repeat me" } }), { status: 409 })) as typeof fetch;
   await assert.rejects(
     hosted(conflict).post("/v1/machine/guardian/coverage", {}),
-    { message: "Phigon Guardian could not verify hosted enforcement (the server returned 409); the action remains blocked." },
+    { message: "Phigon Guardian could not reach your company's Phigon server (the server returned 409); the action remains blocked." },
   );
   await assert.rejects(
     hosted(refused).post("/v1/machine/guardian/coverage", {}),
-    { message: "Phigon Guardian could not verify hosted enforcement (ECONNREFUSED); the action remains blocked." },
+    { message: "Phigon Guardian could not reach your company's Phigon server (ECONNREFUSED); the action remains blocked." },
   );
 });

@@ -288,7 +288,7 @@ test("a coverage report that fails waits before the next and is logged once", as
     decisionClient: { decide: async () => { throw new Error("No processes should be reviewed"); } },
     containment: { execute: async () => { throw new Error("No processes should be stopped"); } },
     journal: { append: async () => undefined },
-    coverageClient: { post: async () => { posts++; if (failing) throw new Error("Phigon Guardian could not verify hosted enforcement (the server returned 503); the action remains blocked."); return {}; } },
+    coverageClient: { post: async () => { posts++; if (failing) throw new Error("Phigon Guardian could not reach your company's Phigon server (the server returned 503); the action remains blocked."); return {}; } },
   });
   const signal = new AbortController().signal;
   for (let pass = 0; pass < 7; pass++) {
@@ -325,7 +325,7 @@ test("waiting for a policy and incomplete discovery are logged when they start, 
   await monitor.review(create(AgentInventorySchema, { machineId: "machine", agents: [] }), signal);
   await monitor.review(partial, signal);
   assert.deepEqual(statuses, [
-    "Guardian process review is waiting for its administrator policy.",
+    "Guardian waits for the rules from your company's Phigon server, and reviews running agents once they arrive.",
     "Guardian discovery is incomplete; process protection coverage is degraded.",
     "Guardian discovery is incomplete; process protection coverage is degraded.",
   ]);

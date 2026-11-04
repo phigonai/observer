@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   machineRemovedFileName,
   rememberMachineRemoved,
+  removalConfirmed,
   removedAtStart,
 } from "../src/machine-removed.js";
 
@@ -43,8 +44,12 @@ test("a removal is confirmed by the server before a service stops quietly, then 
       dataDirectory: directory, machine, controlPlaneUrl, recheckAfterMs: hour, now: () => at, fetcher: server.fetcher,
     });
     // The stream's refusal alone is not enough: the first start asks.
+    assert.equal(await removalConfirmed(directory, machine), false);
     const confirmed = new Date(removedAt.getTime() + 60_000);
     assert.equal(await check(confirmed), "removed");
+    // doctor --check now says the computer was removed, instead of "start it".
+    assert.equal(await removalConfirmed(directory, machine), true);
+    assert.equal(await removalConfirmed(directory, { ...machine, createdAt: "2026-11-04T00:00:00.000Z" }), false);
     assert.equal(server.requests.length, 1);
     assert.equal(server.requests[0]?.method, "POST");
     assert.equal(new URL(server.requests[0]!.url).pathname, "/v1/machine/heartbeat");

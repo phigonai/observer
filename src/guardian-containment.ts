@@ -49,7 +49,7 @@ export class GuardianContainmentExecutor {
       return result("not_requested", "action_blocked", "The proposed action was blocked; process containment was not authorized.");
     }
     if (!this.#enabled) {
-      return result("rejected", "containment_disabled", "Guardian process containment is unavailable in this executor.", true);
+      return result("rejected", "containment_disabled", "This computer does not allow Phigon to stop agents.", true);
     }
     if (
       request.agentId.trim() === "" || request.agentId.length > 128 ||

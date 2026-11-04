@@ -245,7 +245,14 @@ export async function runServiceCommand(
 
   const refusal = await installRefusal(config);
   if (refusal !== undefined) throw new Error(refusal);
-  const settings = { ...serviceSettings(environment), PHIGON_OBSERVABILITY_PROFILE: config.observabilityProfile };
+  // Without --profile or PHIGON_OBSERVABILITY_PROFILE, the service collects
+  // what this computer consented to: a full-activity pairing or enrollment
+  // code is not quietly narrowed to metadata by installing it again.
+  const chosen = flags.some((flag) => flag === "--profile" || flag.startsWith("--profile=")) ||
+    (environment["PHIGON_OBSERVABILITY_PROFILE"]?.trim() ?? "") !== "";
+  const consented = chosen ? undefined : (await new FileCredentialStore(config.dataDirectory).load().catch(() => null))?.consentProfile;
+  const profile = consented ?? config.observabilityProfile;
+  const settings = { ...serviceSettings(environment), PHIGON_OBSERVABILITY_PROFILE: profile };
   const alreadyRunning = (await InstanceLock.inspect(context.dataDirectory)).running;
   const result = await installService(context, settings);
   const notes = [
@@ -258,10 +265,10 @@ export async function runServiceCommand(
       : []),
   ];
   output.stdout(json
-    ? `${JSON.stringify({ status: "installed", name, platform: context.platform, definition: result.definition, settingsFile: result.settingsFile, logFile, profile: config.observabilityProfile, notes }, null, 2)}\n`
+    ? `${JSON.stringify({ status: "installed", name, platform: context.platform, definition: result.definition, settingsFile: result.settingsFile, logFile, profile, notes }, null, 2)}\n`
     : [
         `Background service installed: ${name}`,
-        `Collection profile: ${config.observabilityProfile}`,
+        `Collection profile: ${profile}`,
         ...notes,
         `Settings: ${result.settingsFile}`,
         `Log: ${logFile}`,

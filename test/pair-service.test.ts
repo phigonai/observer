@@ -223,3 +223,26 @@ test("a service runs Node.js from a path that survives upgrades", () => {
   assert.equal(stableNodePath("C:\\Program Files\\nodejs\\node.exe", real), "C:\\Program Files\\nodejs\\node.exe");
   assert.equal(stableNodePath("/usr/bin/node", real), "/usr/bin/node");
 });
+
+test("installing the service again keeps the profile the computer consented to", async () => {
+  const setup = await setUp();
+  try {
+    // Paired with full-activity consent, but without the service.
+    const paired = await setup.pair(["--consent-profile", "full", "--accept-consent", "--no-service"]);
+    assert.equal(paired.code, 0, paired.stderr);
+    let stdout = "";
+    const code = await run(
+      ["service", "install"],
+      { PHIGON_DATA_DIR: join(setup.root, "data"), PHIGON_UPDATE_CHECK: "false", PHIGON_LOG_LEVEL: "warn", PATH: "/usr/bin" },
+      { stdout: (value) => { stdout += value; }, stderr: () => undefined },
+      Readable.from([]),
+      { serviceRunner: setup.runner, platform: "linux", homeDirectory: setup.root, stopTimeoutMs: 50 },
+    );
+    assert.equal(code, 0);
+    assert.match(stdout, /Collection profile: full/u);
+    const settings = JSON.parse(await readFile(join(setup.root, "data", "service-settings.json"), "utf8")) as { environment: Record<string, string> };
+    assert.equal(settings.environment["PHIGON_OBSERVABILITY_PROFILE"], "full");
+  } finally {
+    await setup.close();
+  }
+});

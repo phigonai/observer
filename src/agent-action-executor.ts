@@ -14,7 +14,7 @@ import {
 import { AgentState } from "./generated/phigon/v1/common_pb.js";
 import type { AgentInventory } from "./generated/phigon/v1/identity_pb.js";
 import { defaultProcessTreeControl, describeTreeOutcome, type ProcessTreeControl, type TreeStopOutcome } from "./process-tree.js";
-import { MachineCommandExecutor, machineActionTypes, pruneCommandReceipts } from "./machine-command-executor.js";
+import { MachineCommandExecutor, availableMachineActions, machineActionTypes, pruneCommandReceipts } from "./machine-command-executor.js";
 import { atomicReplace } from "./atomic-replace.js";
 import type { RunningAgents } from "./system-inspection.js";
 import { noticeAgentName, type UserNotices } from "./user-notices.js";
@@ -103,7 +103,7 @@ export class AgentActionExecutor {
   }
 
   capabilities(): readonly RemoteActionType[] {
-    return [...(this.#enabled ? [RemoteActionType.STOP_AGENT, RemoteActionType.KILL_AGENT] : []), ...(this.#commandsEnabled ? machineActionTypes : [])];
+    return [...(this.#enabled ? [RemoteActionType.STOP_AGENT, RemoteActionType.KILL_AGENT] : []), ...(this.#commandsEnabled ? availableMachineActions() : [])];
   }
 
   async maintainReceipts(): Promise<void> {

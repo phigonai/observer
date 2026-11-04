@@ -9,9 +9,11 @@ export async function connectionEnvironment(
 ): Promise<NodeJS.ProcessEnv> {
   const result = { ...environment };
   for (const [flag, name] of [["--control-plane-url", "PHIGON_CONTROL_PLANE_URL"], ["--grpc-url", "PHIGON_GRPC_URL"]] as const) {
+    // Both "--flag value" and "--flag=value", as every other option.
+    const joined = flags.find((item) => item.startsWith(`${flag}=`));
     const index = flags.indexOf(flag);
-    if (index < 0) continue;
-    const value = flags[index + 1];
+    if (joined === undefined && index < 0) continue;
+    const value = joined === undefined ? flags[index + 1] : joined.slice(flag.length + 1);
     if (!value || value.startsWith("--")) throw new Error(`${flag} requires an endpoint URL.`);
     result[name] = value;
   }

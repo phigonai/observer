@@ -2,6 +2,7 @@ import type { ObserverConfig } from "./config.js";
 import { FileCredentialStore, type StoredMachineCredential } from "./credential-store.js";
 import { consentHealth, type ObserverConsentHealth } from "./health.js";
 import { InstanceLock, type InstanceLockHolder } from "./instance-lock.js";
+import { machineRemovedMessage, removalConfirmed } from "./machine-removed.js";
 import { OBSERVER_CONSENT_POLICY_VERSION } from "./pair.js";
 import { StreamStateStore } from "./stream-state.js";
 
@@ -118,7 +119,10 @@ export async function runDoctorCheck(options: DoctorCheckOptions): Promise<Docto
     const holder = await (options.inspectLock ?? ((directory) => InstanceLock.inspect(directory)))(config.dataDirectory);
     checks.push(holder.running
       ? pass("running", `An observer is running with this data directory${holder.pid === undefined ? "" : ` (process ${holder.pid})`}.`)
-      : fail("running", "No observer is running with this data directory. Start it with phigon-observer service install, or run phigon-observer run."));
+      : credential !== null && await removalConfirmed(config.dataDirectory, credential)
+        // Starting it again would only stop again: the workspace removed it.
+        ? fail("running", machineRemovedMessage)
+        : fail("running", "No observer is running with this data directory. Start it with phigon-observer service install, or run phigon-observer run."));
   } catch {
     checks.push(fail("running", "Could not tell whether an observer is running: its lock file could not be read."));
   }

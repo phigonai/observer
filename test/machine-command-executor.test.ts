@@ -7,7 +7,7 @@ import { join, resolve, sep } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { timestampFromDate } from "@bufbuild/protobuf/wkt";
 import { AgentActionCommandSchema, RemoteActionType as Action, RemoteActionResultState as State } from "../src/generated/phigon/v1/action_pb.js";
-import { MachineCommandExecutor, parseCommand, powerCommand, programName, redactCommandOutput, runCommand, pruneCommandReceipts } from "../src/machine-command-executor.js";
+import { MachineCommandExecutor, availableMachineActions, machineActionTypes, parseCommand, powerCommand, programName, redactCommandOutput, runCommand, pruneCommandReceipts } from "../src/machine-command-executor.js";
 import { UserNotices, type UserNotice } from "../src/user-notices.js";
 
 test("receipt cleanup removes only expired recognized records and preserves unrelated files", async (t) => {
@@ -189,4 +189,15 @@ test("power commands use the reviewed one-minute operating-system schedule", () 
     assert.ok(command.arguments.includes(process.platform === "win32" ? "60" : "+1"));
     // Windows implies force-close for /t > 0, even without an explicit /f.
   }
+});
+
+test("restarting or shutting down is offered only where the observer can do it", () => {
+  // A background service for the signed-in user cannot restart macOS or Linux.
+  for (const platform of ["darwin", "linux"] as const) {
+    const actions = availableMachineActions(platform, false);
+    assert.equal(actions.length, machineActionTypes.length - 2);
+    assert.ok(actions.every((action) => machineActionTypes.includes(action)));
+    assert.deepEqual(availableMachineActions(platform, true), machineActionTypes);
+  }
+  assert.deepEqual(availableMachineActions("win32", false), machineActionTypes);
 });

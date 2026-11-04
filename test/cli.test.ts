@@ -1016,6 +1016,8 @@ test("remove-machine unregisters the paired machine before clearing its credenti
       machineId: "machine-remove-1",
       controlPlaneOrigin: origin,
       credentialRemoved: true,
+      // No background service was installed for this data directory.
+      backgroundServiceRemoved: false,
     });
   } finally {
     await new Promise<void>((resolve, reject) => {
