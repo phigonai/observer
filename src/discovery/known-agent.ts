@@ -19,7 +19,7 @@ import {
   processKeyCapability,
   stableRuntimeAgentID,
 } from "./process-identity.js";
-import { isInterpreterName } from "./script-package.js";
+import { mayBeInterpreterName } from "./script-package.js";
 import type {
   AdapterHealth,
   AdapterResult,
@@ -227,9 +227,11 @@ function isAgentProcess(
   process: ProcessEvidence,
 ): boolean {
   if (spec.processNames.includes(process.executableName)) return true;
+  // A package counts only for an interpreter process (node, bun, deno),
+  // including one Linux lists by its main thread's name.
   return (
     process.scriptPackage !== undefined &&
-    isInterpreterName(process.executableName) &&
+    mayBeInterpreterName(process.executableName) &&
     (spec.scriptPackages?.includes(process.scriptPackage) ?? false)
   );
 }

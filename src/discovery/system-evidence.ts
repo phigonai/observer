@@ -15,6 +15,7 @@ import type {
 import { observedProcessKey } from "./process-identity.js";
 import {
   isInterpreterName,
+  mayBeInterpreterName,
   packageFromScriptPath,
   scriptArgument,
   scriptPackageFromWindowsCommandLine,
@@ -269,7 +270,10 @@ export class SystemEvidenceProvider implements HostEvidenceProvider {
           executableName,
           executablePathDigest,
         });
-        if (isInterpreterName(executableName)) {
+        // Linux reports a process's name, which Node.js may set to its main
+        // thread's ("MainThread"); its command line then says which program
+        // it is.
+        if (isInterpreterName(executableName) || (this.#platform === "linux" && mayBeInterpreterName(executableName))) {
           interpreters.push({
             processId,
             nativeStartIdentity,
@@ -406,10 +410,13 @@ export async function unixScriptPackages(
     ) {
       continue;
     }
-    const script = scriptArgument(
-      interpreter.executableName,
-      (match[4] ?? "").split(/\s+/u).filter((value) => value.length > 0),
-    );
+    const values = (match[4] ?? "").split(/\s+/u).filter((value) => value.length > 0);
+    // The listed name, or for a renamed process the program it started as.
+    const program = isInterpreterName(interpreter.executableName)
+      ? interpreter.executableName
+      : normalizedExecutableName(posix.basename(values[0] ?? ""));
+    if (!isInterpreterName(program)) continue;
+    const script = scriptArgument(program, values);
     let scriptPackage =
       script === undefined ? undefined : packageFromScriptPath(script);
     if (
