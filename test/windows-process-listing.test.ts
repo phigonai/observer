@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { once } from "node:events";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { guardianRunnerPath } from "../src/guardian-native.js";
 import {
@@ -114,5 +117,30 @@ test(
       assert.ok(fromNative, `process ${processId} is listed`);
       assert.deepEqual(fromNative, powerShell.find((entry) => entry.processId === processId));
     }
+  },
+);
+
+test(
+  "the bundled helper and Win32_Process report the same npm package for a real node process",
+  { skip: process.platform !== "win32" || !existsSync(guardianRunnerPath()), timeout: 60_000 },
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "phigon script package "));
+    const script = join(directory, "node_modules", "@phigon-test", "agent", "cli.js");
+    await mkdir(dirname(script), { recursive: true });
+    await writeFile(script, "setInterval(() => {}, 1000);\n");
+    const child = spawn(process.execPath, ["--max-old-space-size=256", script, "--resume"], { stdio: "ignore", windowsHide: true });
+    t.after(async () => {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill();
+        await once(child, "exit");
+      }
+      await rm(directory, { recursive: true, force: true });
+    });
+    await once(child, "spawn");
+    const native = await listWindowsProcesses(runNativeProcessListing, unused);
+    const powerShell = await listWindowsProcesses(undefined, runPowerShellProcessListing);
+    const fromNative = native.find((entry) => entry.processId === child.pid);
+    assert.equal(fromNative?.scriptPackage, "@phigon-test/agent");
+    assert.deepEqual(fromNative, powerShell.find((entry) => entry.processId === child.pid));
   },
 );

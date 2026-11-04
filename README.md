@@ -259,6 +259,12 @@ the profile the computer's owner accepted.
 | Passwords, tokens and API keys | Never | Never (redacted on the machine) |
 | Provider-encrypted model reasoning | Never | Never decoded |
 
+Agents installed with npm (Gemini CLI, GitHub Copilot CLI, Amp, Claude Code)
+run as Node.js. To tell which agent a `node`, `bun` or `deno` process is, the
+observer reads that process's command line on the computer and keeps only the
+npm package it runs, such as `@google/gemini-cli`. The command line itself is
+never stored or sent.
+
 Individual categories can be narrowed further with `PHIGON_COLLECT_*`
 settings. A full description is in
 [privacy and security](https://phigon.online/docs/privacy-and-security/).
