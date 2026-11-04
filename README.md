@@ -161,7 +161,12 @@ records. It starts when the user signs in and again if it stops:
 | Linux | A systemd user unit, `~/.config/systemd/user/phigon-observer.service` | `Restart=on-failure` |
 
 - The service runs the same Node.js and observer that ran `service install`,
-  with the same data directory. The settings it needs (`PHIGON_*`, `PATH`,
+  with the same data directory. A Node.js from Homebrew runs through its
+  `opt` link and one from fnm through its version's folder, so upgrading
+  Node.js does not stop the service. `update` installs the service again with
+  the Node.js and observer it ran with, keeping its settings, which also
+  repairs a service whose Node.js was removed (for example an old nvm
+  version). The settings it needs (`PHIGON_*`, `PATH`,
   the proxy variables, `NODE_EXTRA_CA_CERTS` and the agents' folder settings)
   are saved to `service-settings.json` in the data directory, which only this
   user can read. Settings whose names suggest a secret (token, password and

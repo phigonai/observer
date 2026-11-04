@@ -8,8 +8,8 @@ import { Readable } from "node:stream";
 import test from "node:test";
 import { run } from "../src/cli.js";
 import { loadConfig } from "../src/config.js";
-import { restartServiceAfterUpdate } from "../src/service-command.js";
-import type { CommandResult } from "../src/service.js";
+import { restartServiceAfterUpdate, serviceContext, stableNodePath } from "../src/service-command.js";
+import { serviceDefinitionPath, type CommandResult } from "../src/service.js";
 
 // Built at runtime so secret scanners never see a key-shaped string.
 const key = ["phg", "m", "k".repeat(43)].join("_");
@@ -143,9 +143,61 @@ test("an update starts the background service again so it runs the new version",
     assert.equal(paired.code, 0, paired.stderr);
     setup.calls.length = 0;
     assert.equal(await restartServiceAfterUpdate(config, {}, dependencies), "restarted");
-    const systemctl = setup.calls.filter((call) => call.command === "systemctl").map((call) => call.args.find((arg) => arg === "stop" || arg === "start"));
-    assert.deepEqual(systemctl.filter(Boolean), ["stop", "start"]);
+    const systemctl = setup.calls.filter((call) => call.command === "systemctl").map((call) => call.args.find((arg) => ["stop", "start", "restart"].includes(arg)));
+    assert.deepEqual(systemctl.filter(Boolean), ["stop", "restart"]);
   } finally {
     await setup.close();
   }
+});
+
+test("an update points a service at the Node.js it ran with and keeps its settings", async () => {
+  const setup = await setUp();
+  try {
+    const dependencies = { serviceRunner: setup.runner, platform: "linux" as const, homeDirectory: setup.root, stopTimeoutMs: 50 };
+    const config = loadConfig({ PHIGON_DATA_DIR: join(setup.root, "data") });
+    const paired = await setup.pair(["--consent-profile", "full", "--accept-consent"]);
+    assert.equal(paired.code, 0, paired.stderr);
+    const settingsFile = join(setup.root, "data", "service-settings.json");
+    const settings = JSON.parse(await readFile(settingsFile, "utf8")) as { version: number; environment: Record<string, string> };
+    settings.environment["PHIGON_REMOTE_ACTIONS_ENABLED"] = "true";
+    await writeFile(settingsFile, JSON.stringify(settings));
+    // A Node.js that an upgrade removed since the service was installed.
+    const unit = serviceDefinitionPath(serviceContext(config, {}, dependencies))!;
+    const gone = "/opt/homebrew/Cellar/node/24.0.0/bin/node";
+    await writeFile(unit, (await readFile(unit, "utf8")).replace(JSON.stringify(stableNodePath(process.execPath)), JSON.stringify(gone)));
+    assert.match(await readFile(unit, "utf8"), /Cellar\/node\/24\.0\.0/u);
+
+    assert.equal(await restartServiceAfterUpdate(config, {}, dependencies), "restarted");
+    const updated = await readFile(unit, "utf8");
+    assert.doesNotMatch(updated, /Cellar\/node\/24\.0\.0/u);
+    assert.ok(updated.includes(JSON.stringify(stableNodePath(process.execPath))), updated);
+    const kept = JSON.parse(await readFile(settingsFile, "utf8")) as { environment: Record<string, string> };
+    assert.equal(kept.environment["PHIGON_REMOTE_ACTIONS_ENABLED"], "true");
+    assert.equal(kept.environment["PHIGON_OBSERVABILITY_PROFILE"], "full");
+  } finally {
+    await setup.close();
+  }
+});
+
+test("a service runs Node.js from a path that survives upgrades", () => {
+  // Homebrew's opt link follows the installed version; the Cellar folder does not survive an upgrade.
+  const cellar = "/opt/homebrew/Cellar/node/24.5.0/bin/node";
+  const links: Record<string, string> = { "/opt/homebrew/opt/node/bin/node": cellar, [cellar]: cellar };
+  const real = (path: string) => {
+    const target = links[path];
+    if (target === undefined) throw new Error("missing");
+    return target;
+  };
+  assert.equal(stableNodePath(cellar, real), "/opt/homebrew/opt/node/bin/node");
+  assert.equal(stableNodePath("/usr/local/Cellar/node@24/24.5.0/bin/node", real), "/usr/local/Cellar/node@24/24.5.0/bin/node");
+  // An opt link that points at another version is not the Node.js that ran.
+  links["/opt/homebrew/opt/node/bin/node"] = "/opt/homebrew/Cellar/node/25.0.0/bin/node";
+  assert.equal(stableNodePath(cellar, real), cellar);
+  // fnm's folder for one terminal is replaced by the version's own folder.
+  const shell = "C:\\Users\\dev\\AppData\\Local\\fnm_multishells\\1234_5678\\node.exe";
+  links[shell] = "C:\\Users\\dev\\AppData\\Roaming\\fnm\\node-versions\\v24.5.0\\installation\\node.exe";
+  assert.equal(stableNodePath(shell, real), links[shell]);
+  // Anything else is kept as it is.
+  assert.equal(stableNodePath("C:\\Program Files\\nodejs\\node.exe", real), "C:\\Program Files\\nodejs\\node.exe");
+  assert.equal(stableNodePath("/usr/bin/node", real), "/usr/bin/node");
 });

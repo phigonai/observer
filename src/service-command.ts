@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -55,7 +56,7 @@ export function serviceContext(
     platform,
     dataDirectory,
     defaultDataDirectory: same(dataDirectory, fallback),
-    nodePath: process.execPath,
+    nodePath: stableNodePath(process.execPath),
     entryPath: fileURLToPath(new URL("./entry.js", import.meta.url)),
     homeDirectory: dependencies.homeDirectory ?? homedir(),
     user: platform === "windows"
@@ -65,6 +66,25 @@ export function serviceContext(
     systemRoot: process.env["SystemRoot"] ?? process.env["SYSTEMROOT"],
     run: dependencies.serviceRunner ?? runCommand,
   });
+}
+
+/**
+ * The path to Node.js a background service keeps working with after Node.js
+ * is upgraded. Homebrew runs it from a folder named after its version, which
+ * an upgrade deletes, so the service uses Homebrew's opt link, which follows
+ * the installed version. fnm runs it from a folder for each terminal, which
+ * it deletes later, so the service uses the version's own folder.
+ */
+export function stableNodePath(execPath: string, real: (path: string) => string = realpathSync.native): string {
+  try {
+    if (/[\\/]fnm_multishells[\\/]/u.test(execPath)) return real(execPath);
+    const brew = /^(.*)\/Cellar\/([^/]+)\/[^/]+\/(bin\/node)$/u.exec(execPath);
+    if (brew === null) return execPath;
+    const opt = `${brew[1]}/opt/${brew[2]}/${brew[3]}`;
+    return real(opt) === real(execPath) ? opt : execPath;
+  } catch {
+    return execPath;
+  }
 }
 
 /** Why collection cannot start on this computer, or undefined when it can. */
@@ -145,6 +165,9 @@ export async function installServiceAfterPairing(
 /**
  * After an update, starts the background service again, so it runs the new
  * version instead of the old one until the next sign-in. Says what happened.
+ * The service is installed again with the Node.js and observer this update
+ * ran with and the settings it had, so a service left pointing at a Node.js
+ * that was upgraded or removed works again.
  */
 export async function restartServiceAfterUpdate(
   config: ObserverConfig,
@@ -152,16 +175,21 @@ export async function restartServiceAfterUpdate(
   dependencies: ServiceDependencies = {},
 ): Promise<"restarted" | "not_installed" | "failed"> {
   let context: ServiceContext;
+  let kept: Record<string, string> | undefined;
   try {
     context = serviceContext(config, environment, dependencies);
-    if (!(await stopService(context))) return "not_installed";
+    if (!(await serviceInstalled(context))) return "not_installed";
+    kept = await readServiceSettings(serviceSettingsPath(context.dataDirectory)).catch(() => undefined);
+    await stopService(context);
   } catch {
     return "failed";
   }
   // Started again even if the old observer is slow to stop: it takes over then.
   await waitUntilStopped(context.dataDirectory, dependencies.stopTimeoutMs ?? 15_000).catch(() => false);
   try {
-    await startService(context);
+    // Settings that cannot be read are left for service install to replace.
+    if (kept === undefined) await startService(context);
+    else await installService(context, kept);
     return "restarted";
   } catch {
     return "failed";
