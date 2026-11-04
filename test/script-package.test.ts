@@ -146,6 +146,22 @@ test("macOS and Linux arguments name the npm package, following bin links", asyn
   assert.deepEqual(resolved, ["/Users/dev/.nvm/versions/node/v22.12.0/bin/gemini"]);
 });
 
+test("Linux lists Node.js by its main thread's name; its command line says which program it is", async () => {
+  const renamed = [
+    { processId: 201, nativeStartIdentity: startA, startedAt: new Date("2026-11-04T09:00:00Z"), executableName: "mainthread" },
+    { processId: 202, nativeStartIdentity: startA, startedAt: new Date("2026-11-04T09:00:00Z"), executableName: "mainthread" },
+  ];
+  const rows = [
+    `  201     1 ${startA} /opt/hostedtoolcache/node/24.11.0/x64/bin/node /tmp/work/node_modules/@google/gemini-cli/dist/index.js`,
+    // Another program that named its thread the same: not an interpreter.
+    `  202     1 ${startA} /usr/lib/firefox/firefox /tmp/work/node_modules/@google/gemini-cli/dist/index.js`,
+  ].join("\n");
+  const packages = await unixScriptPackages(renamed, async () => rows, async () => {
+    throw new Error("No path must be resolved.");
+  });
+  assert.deepEqual([...packages.entries()], [[201, "@google/gemini-cli"]]);
+});
+
 test("macOS and Linux need no second ps pass without interpreters", async () => {
   const packages = await unixScriptPackages([], async () => {
     throw new Error("This listing must not run.");
@@ -263,6 +279,14 @@ test("npm-installed agents running as node are discovered as running processes",
   assert.equal(claude?.kind, AgentKind.CLAUDE);
 });
 
+test("a node process Linux lists by its main thread's name is discovered by its package", async () => {
+  const inventory = await discover([{ ...geminiProcess, processKey: "process-mainthread-gemini-start-a", processId: 605, executableName: "mainthread" }]);
+  const running = inventory.agents
+    .filter((agent) => agent.state === AgentState.RUNNING && agent.capabilities.includes("process-instance"))
+    .map((agent) => [agent.displayName, Number(agent.processId)]);
+  assert.deepEqual(running, [["Gemini CLI · PID 605", 605]]);
+});
+
 test("other node processes and Codex are discovered exactly as before", async () => {
   const codex: ProcessEvidence = {
     processKey: "process-codex-start-a",
@@ -312,7 +336,8 @@ test(
     if (listing.status !== "ok") return;
     const observed = listing.value.find((entry) => entry.processId === child.pid);
     assert.ok(observed, "the node process is listed");
-    assert.equal(observed.scriptPackage, "@phigon-test/agent");
+    // Says which name the system listed it by when the package is missing.
+    assert.equal(observed.scriptPackage, "@phigon-test/agent", `listed as ${observed.executableName}`);
     assert.doesNotMatch(JSON.stringify(listing.value), new RegExp(`${marker}|phigon-script-package-`, "u"));
   },
 );

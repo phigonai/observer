@@ -50,6 +50,19 @@ export function isInterpreterName(executableName: string): boolean {
   return interpreterNames.has(executableName);
 }
 
+// Names Linux shows for an interpreter process that named its main thread:
+// Node.js calls it "MainThread", and Linux lists a process by that name.
+const renamedInterpreterNames: ReadonlySet<string> = new Set(["mainthread"]);
+
+/**
+ * Whether a process listed by this name may be an interpreter: one by name,
+ * or one Linux lists by its main thread's name, whose command line says
+ * which program it is.
+ */
+export function mayBeInterpreterName(executableName: string): boolean {
+  return interpreterNames.has(executableName) || renamedInterpreterNames.has(executableName);
+}
+
 /**
  * Splits a Windows command line as CommandLineToArgvW and the Microsoft C
  * runtime do: the program name ends at the first space outside quotes, and
