@@ -15,6 +15,10 @@ export type ProcessEvidence = Readonly<{
   startedAt: Date;
   executableName: string;
   executablePathDigest: string;
+  // For an interpreter process (node, bun, deno): the npm package that owns
+  // the script it runs, such as `@google/gemini-cli`. Only this name is kept;
+  // the command line it was read from is never stored or sent.
+  scriptPackage?: string;
 }>;
 
 export type ExecutableEvidence = Readonly<{

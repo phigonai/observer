@@ -22,6 +22,7 @@ const genericAgents: readonly KnownAgentSpec[] = [
     displayName: "Amp",
     executableNames: ["amp"],
     processNames: ["amp"],
+    scriptPackages: ["@sourcegraph/amp"],
     configurationPaths: ["~/.config/amp"],
     capabilities: ["activity", "filesystem", "git", "terminal"],
   },
@@ -61,6 +62,7 @@ const genericAgents: readonly KnownAgentSpec[] = [
     displayName: "Gemini CLI",
     executableNames: ["gemini"],
     processNames: ["gemini"],
+    scriptPackages: ["@google/gemini-cli"],
     configurationPaths: ["~/.gemini"],
     capabilities: ["activity", "filesystem", "mcp", "terminal"],
   },
@@ -88,6 +90,7 @@ const genericAgents: readonly KnownAgentSpec[] = [
     displayName: "GitHub Copilot CLI",
     executableNames: ["copilot"],
     processNames: ["copilot"],
+    scriptPackages: ["@github/copilot"],
     configurationPaths: ["~/.copilot"],
     capabilities: [
       "activity",

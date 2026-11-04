@@ -20,6 +20,10 @@ type processEntry struct {
 	// Path is the executable's Win32 path. It is empty when the process
 	// cannot be opened with limited query rights.
 	Path string `json:"path,omitempty"`
+	// Script is, for an interpreter process (node, bun, deno), the npm
+	// package of the script it runs, such as @google/gemini-cli. Only this
+	// name is reported, never the command line. Empty is omitted.
+	Script string `json:"script,omitempty"`
 }
 
 // listProcesses writes every process as one JSON array. It only reads

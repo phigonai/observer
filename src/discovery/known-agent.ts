@@ -19,6 +19,7 @@ import {
   processKeyCapability,
   stableRuntimeAgentID,
 } from "./process-identity.js";
+import { isInterpreterName } from "./script-package.js";
 import type {
   AdapterHealth,
   AdapterResult,
@@ -30,6 +31,12 @@ export type KnownAgentSpec = Readonly<{
   displayName: string;
   executableNames: readonly string[];
   processNames: readonly string[];
+  /**
+   * npm packages of the agent. A CLI installed with npm runs as `node` (or
+   * bun or deno); an interpreter process running a script from one of these
+   * packages is this agent's process too.
+   */
+  scriptPackages?: readonly string[];
   configurationPaths: readonly string[];
   capabilities: readonly string[];
   /**
@@ -61,9 +68,7 @@ export async function discoverKnownAgent(
   const processMatches =
     processProbe.status === "ok"
       ? processProbe.value
-          .filter((process) =>
-            spec.processNames.includes(process.executableName),
-          )
+          .filter((process) => isAgentProcess(spec, process))
           .sort((left, right) => left.processId - right.processId)
       : [];
   const processKeyCounts = new Map<string, number>();
@@ -215,6 +220,18 @@ export function combineAdapterResults(
       notices: notices.slice(0, 32),
     },
   };
+}
+
+function isAgentProcess(
+  spec: KnownAgentSpec,
+  process: ProcessEvidence,
+): boolean {
+  if (spec.processNames.includes(process.executableName)) return true;
+  return (
+    process.scriptPackage !== undefined &&
+    isInterpreterName(process.executableName) &&
+    (spec.scriptPackages?.includes(process.scriptPackage) ?? false)
+  );
 }
 
 function agentState(

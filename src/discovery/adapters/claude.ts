@@ -11,6 +11,7 @@ const spec: KnownAgentSpec = {
   displayName: "Claude Code",
   executableNames: ["claude"],
   processNames: ["claude", "claude-code"],
+  scriptPackages: ["@anthropic-ai/claude-code"],
   configurationPaths: [
     "~/.claude",
     "~/Library/Application Support/Claude",
