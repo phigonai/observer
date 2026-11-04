@@ -80,6 +80,7 @@ import {
 } from "./enroll.js";
 import { removeMachine } from "./remove-machine.js";
 import { forgetServerAuthority, parseAuthorityFingerprint, trustAuthority } from "./server-authority.js";
+import { followServer, saveMovedServer } from "./server-follow.js";
 import { preparePairingAuthority } from "./server-move.js";
 import { pairingChanged, pairingChangedExitCode, watchPairing, type PairingChange, type PairingWatch } from "./pairing-watch.js";
 import { moveServiceEndpoints, readServiceSettings, startService, stopService, uninstallService } from "./service.js";
@@ -239,7 +240,7 @@ export async function run(
         return latest === null ? 1 : 0;
       }
       if (command === "update" && !interactive && !flags.includes("--yes")) throw new Error("Use update --check for a read-only check, or update --yes to explicitly authorize an unattended update.");
-      const updated = await offerObserverUpdate({ current: version, latest, write: output.stdout, confirm: () => command === "update" && flags.includes("--yes") ? Promise.resolve("yes") : readConfirmation(input) });
+      const updated = await offerObserverUpdate({ current: version, latest, write: output.stdout, confirm: command === "update" && flags.includes("--yes") ? undefined : () => readConfirmation(input) });
       if (updated) {
         const restart = await restartServiceAfterUpdate(config, callerEnvironment, dependencies);
         if (restart === "restarted") output.stdout("The background service now runs the new version.\n");
@@ -1055,10 +1056,26 @@ export async function run(
             catch { break; }
           }
         })();
+        // A background service follows the Phigon app's server when its
+        // computer gets a new address; the pairing watch then restarts it.
+        const following = serviceSettingsFile === undefined ? Promise.resolve() : followServer({
+          dataDirectory: config.dataDirectory,
+          credential,
+          signal: controller.signal,
+          proxyFor: (url) => proxyForUrl(url, proxySettings(callerEnvironment)),
+          onMoved: async (moved) => {
+            try {
+              return await saveMovedServer(config.dataDirectory, credential, moved);
+            } catch {
+              output.stderr(`Phigon's server now answers at ${moved.controlPlaneOrigin}, but the new address could not be saved. The observer tries again in a few minutes.\n`);
+              return false;
+            }
+          },
+        }).catch(() => undefined);
         let removedWhileRunning = false;
         try {
           await settleObserverTasks(
-            [streaming, discovering, collecting, monitoring, maintaining],
+            [streaming, discovering, collecting, monitoring, maintaining, following],
             controller,
             () => fatalPersistenceError,
           );

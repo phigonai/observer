@@ -71,12 +71,18 @@ export async function installObserverUpdate(version: string): Promise<void> {
 }
 
 export async function offerObserverUpdate(options: {
-  current: string; latest: string | null; confirm: () => Promise<string>;
+  current: string; latest: string | null;
+  /** Asks the person at the computer; without it, `update --yes` approved the update already. */
+  confirm?: (() => Promise<string>) | undefined;
   write: (message: string) => void; install?: (version: string) => Promise<void>;
 }): Promise<boolean> {
   if (!options.latest || !newerVersion(options.current, options.latest)) return false;
-  options.write(`A new Phigon observer version is available: ${options.current} → ${options.latest}.\nType "yes" to update, or press Enter to continue: `);
-  if ((await options.confirm()).trim().toLowerCase() !== "yes") return false;
+  if (options.confirm === undefined) {
+    options.write(`Updating the Phigon observer from ${options.current} to ${options.latest}.\n`);
+  } else {
+    options.write(`A new Phigon observer version is available: ${options.current} → ${options.latest}.\nType "yes" to update, or press Enter to continue: `);
+    if ((await options.confirm()).trim().toLowerCase() !== "yes") return false;
+  }
   await (options.install ?? installObserverUpdate)(options.latest);
   options.write("Observer updated. Your pairing and queued activity are preserved. Run your command again.\n");
   return true;

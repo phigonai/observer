@@ -312,9 +312,14 @@ connection trusts it. A server that presents another certificate is refused
 before anything is sent. `remove-machine` deletes the file. This needs
 Node.js 24.5 or newer.
 
-When that server's address changes (a new IP address from the network, or
-the company moves the Phigon app to another network), run the new **Connect
-machine** command on each computer with the same data directory. The
+When that server's address changes because its computer got a new IP address
+from the network, the background service finds it again by itself. It looks
+up the computer's name, which the Phigon app puts in its authority, as
+`<name>` and `<name>.local`. It moves only to a private network address that
+proves it holds a certificate from the pinned authority. Then it saves the
+new address and restarts there. Where the network does not resolve computer
+names, or the company moves the Phigon app to another network, run the new
+**Connect machine** command on each computer with the same data directory. The
 computer keeps its machine and the activity it has not delivered yet, and
 sends them to the new address; a running observer and its background service
 restart with it, and service settings that named the old address are

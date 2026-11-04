@@ -39,6 +39,9 @@ const watchedFields = [
   "enrollmentCodeId",
 ] as const satisfies readonly (keyof StoredMachineCredential)[];
 
+// Where the server answers; the same machine and consent at a new address.
+const endpointFields: readonly (keyof StoredMachineCredential)[] = ["controlPlaneOrigin", "grpcOrigin"];
+
 /**
  * Watches the pairing a running observer started with. Pairing again while
  * it runs rewrites the stored credential, for example to lower the owner's
@@ -113,6 +116,12 @@ function describeChange(
     };
   }
   if (watchedFields.every((field) => stored[field] === current[field])) return undefined;
+  if (watchedFields.every((field) => endpointFields.includes(field) || stored[field] === current[field])) {
+    return {
+      narrowedConsent: false,
+      message: `Phigon's server is now at ${stored.controlPlaneOrigin}, so the observer stops and starts again there. Its background service starts it again; if you started it yourself, run it again.`,
+    };
+  }
   const narrowedConsent = current.consentProfile === "full" && stored.consentProfile !== "full";
   return {
     narrowedConsent,
