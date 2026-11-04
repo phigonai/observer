@@ -37,6 +37,14 @@ test("update installs only after yes and asks for a restart", async () => {
   assert.match(text, /queued activity are preserved/u);
 });
 
+test("update --yes says it is updating instead of asking", async () => {
+  const installed: string[] = []; let text = "";
+  assert.equal(await offerObserverUpdate({ current: "8.6.0", latest: "8.6.1", write: (value) => { text += value; }, install: async (version) => { installed.push(version); } }), true);
+  assert.deepEqual(installed, ["8.6.1"]);
+  assert.match(text, /^Updating the Phigon observer from 8\.6\.0 to 8\.6\.1\.\n/u);
+  assert.doesNotMatch(text, /Type "yes"/u);
+});
+
 test("a failed update check is retried soon instead of hiding updates for a day", async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-updates-retry-"));
   let requests = 0;

@@ -80,18 +80,19 @@ test("a renewed pairing that changes only its dates is not a change", async () =
 });
 
 test("a new address, a new key or a removed pairing is a change", async () => {
-  for (const next of [
-    { ...paired, controlPlaneOrigin: "https://192.168.1.11:26962" },
-    { ...paired, credential: key("x") },
-    { ...paired, consentSource: "company" as const },
-  ]) {
+  for (const [next, message] of [
+    [{ ...paired, controlPlaneOrigin: "https://192.168.1.11:26962" }, /^Phigon's server is now at https:\/\/192\.168\.1\.11:26962, so the observer stops/u],
+    [{ ...paired, controlPlaneOrigin: "https://192.168.1.11:26962", credential: key("x") }, /pairing changed, so the observer stops/u],
+    [{ ...paired, credential: key("x") }, /pairing changed, so the observer stops/u],
+    [{ ...paired, consentSource: "company" as const }, /pairing changed, so the observer stops/u],
+  ] as const) {
     await withPairing(async (directory, store) => {
       const { watcher, changed } = watch(directory);
       try {
         await store.save(next);
         const change = await changed;
         assert.equal(change.narrowedConsent, false);
-        assert.match(change.message, /pairing changed, so the observer stops/u);
+        assert.match(change.message, message);
       } finally {
         watcher.stop();
       }
