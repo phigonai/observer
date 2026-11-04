@@ -1,4 +1,4 @@
-import { X509Certificate } from "node:crypto";
+import { createHash, X509Certificate } from "node:crypto";
 import { lookup as lookupName } from "node:dns/promises";
 import { readFile } from "node:fs/promises";
 import { isIP } from "node:net";
@@ -23,6 +23,49 @@ type Reach = Readonly<{
 // The Phigon app names the authority of the server it runs after the
 // computer it runs on.
 const authorityPrefix = "Phigon server authority ";
+
+/** Phigon's relay, which reaches a Phigon app's server from any network. */
+export const RELAY_DOMAIN = "relay.phigon.online";
+
+/**
+ * Where the Phigon app's server whose authority is `pem` answers through
+ * Phigon's relay: under the first 80 bits of the authority's SHA-256
+ * fingerprint, the one pinned at pairing, in lowercase base32. Only the
+ * server holding that authority's key can connect there, and it proves the
+ * same certificate pairing checked. Undefined for an unreadable authority.
+ */
+export function relayServer(pem: string, domain = RELAY_DOMAIN): MovedServer | undefined {
+  let raw: Buffer;
+  try {
+    raw = new X509Certificate(pem).raw;
+  } catch {
+    return undefined;
+  }
+  const label = relayLabel(raw);
+  return { controlPlaneOrigin: `https://${label}.${domain}`, grpcOrigin: `https://${label}-grpc.${domain}` };
+}
+
+/** The relay's name for an authority with the DER bytes `raw` (relay.Label on the server). */
+export function relayLabel(raw: Uint8Array): string {
+  return base32(createHash("sha256").update(raw).digest().subarray(0, 10));
+}
+
+function base32(bytes: Uint8Array): string {
+  const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+  let bits = 0;
+  let value = 0;
+  let output = "";
+  for (const byte of bytes) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      output += alphabet[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) output += alphabet[(value << (5 - bits)) & 31];
+  return output;
+}
 
 /**
  * The name of the computer whose Phigon app issued the authority `pem`;
@@ -61,7 +104,8 @@ export function canFollow(credential: StoredMachineCredential, authority: string
 
 /**
  * Looks for the server this computer is paired with under the name of the
- * computer that runs it. An address counts only on the company network and
+ * computer that runs it, then through Phigon's relay. An address counts
+ * only on the company network or at the server's own relay address, and
  * only once it proves it holds a certificate the pinned authority issued
  * for that address, the same proof pairing at a new address asks for, so
  * the stored key is never sent anywhere else.
@@ -70,6 +114,8 @@ export async function findMovedServer(options: Reach & Readonly<{
   credential: StoredMachineCredential;
   authority: string;
   lookup?: Lookup;
+  /** Phigon's relay; RELAY_DOMAIN unless a test names another. */
+  relayDomain?: string;
 }>): Promise<MovedServer | undefined> {
   const name = authorityComputerName(options.authority);
   if (name === undefined || options.credential.grpcOrigin === undefined) return undefined;
@@ -93,7 +139,19 @@ export async function findMovedServer(options: Reach & Readonly<{
     }
     return { controlPlaneOrigin: candidate.origin, grpcOrigin: withHost(grpc, address).origin };
   }
-  return undefined;
+  // The Phigon app connects its server to the relay, so it is found there
+  // from any network: after the computer that runs it moved to another
+  // network, or this one did.
+  const relayed = relayServer(options.authority, options.relayDomain);
+  if (relayed === undefined || relayed.controlPlaneOrigin === current.origin) return undefined;
+  const candidate = new URL(relayed.controlPlaneOrigin);
+  try {
+    await verifyServerAuthority(candidate, options.authority, options.connect, { proxy: options.proxyFor?.(candidate) });
+    await verifyServerAuthority(new URL(relayed.grpcOrigin), options.authority, options.connect, { proxy: options.proxyFor?.(new URL(relayed.grpcOrigin)) });
+  } catch {
+    return undefined;
+  }
+  return relayed;
 }
 
 /**
@@ -138,6 +196,7 @@ export type ServerFollowOptions = Reach & Readonly<{
   /** Saves where the server answers now; false to keep looking. */
   onMoved: (moved: MovedServer) => Promise<boolean>;
   lookup?: Lookup;
+  relayDomain?: string;
   /** How often the server is checked. */
   intervalMs?: number;
   /** Failed checks in a row before the server is looked for elsewhere. */
@@ -151,8 +210,9 @@ export type ServerFollowOptions = Reach & Readonly<{
  * Follows the Phigon app's server when the computer that runs it gets a new
  * address from the network. Once a minute the server is checked where this
  * computer reaches it; after three failures in a row it is looked for under
- * its computer's name, at most every five minutes while it stays away. A
- * server that is only switched off is found again where it was.
+ * its computer's name, then through Phigon's relay, at most every five
+ * minutes while it stays away. A server that is only switched off is found
+ * again where it was.
  */
 export async function followServer(options: ServerFollowOptions): Promise<void> {
   const authority = await readFile(serverAuthorityPath(options.dataDirectory), "utf8").catch(() => undefined);

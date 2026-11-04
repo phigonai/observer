@@ -14,6 +14,8 @@ import {
   canFollow,
   findMovedServer,
   followServer,
+  relayLabel,
+  relayServer,
   saveMovedServer,
   type MovedServer,
 } from "../src/server-follow.js";
@@ -155,14 +157,70 @@ test("a server that cannot prove the pinned authority is not followed", async ()
       credential: paired,
       authority: pinned.certificate,
       connect,
+      relayDomain: "relay.test",
       lookup: async () => [newAddress, "192.168.50.8"],
     });
     assert.equal(found, undefined);
-    assert.deepEqual(reached, [newAddress, "192.168.50.8"]);
+    // The relay is asked last; nothing answers there either.
+    assert.deepEqual(reached, [newAddress, "192.168.50.8", new URL(relayed.controlPlaneOrigin).hostname]);
   } finally {
     await stop(impostor.server);
     await stop(misnamed.server);
   }
+});
+
+const relayed = relayServer(pinned.certificate, "relay.test") as MovedServer;
+const relayHosts = [new URL(relayed.controlPlaneOrigin).hostname, new URL(relayed.grpcOrigin).hostname];
+
+test("the relay names a server after the first 80 bits of its pinned authority's fingerprint", () => {
+  // The same values as relay.Label in the control plane.
+  assert.equal(relayLabel(Buffer.from("authority")), "r53p2ua3w2hpoh2o");
+  assert.equal(relayLabel(new Uint8Array()), "4oymiquy7qobjgx3");
+  assert.match(relayed.controlPlaneOrigin, /^https:\/\/[a-z2-7]{16}\.relay\.test$/u);
+  assert.equal(relayed.grpcOrigin, relayed.controlPlaneOrigin.replace(".relay.test", "-grpc.relay.test"));
+  assert.match(relayServer(pinned.certificate)?.controlPlaneOrigin ?? "", /\.relay\.phigon\.online$/u);
+  assert.equal(relayServer("not a certificate"), undefined);
+});
+
+test("a server not found on the network is found through the relay once it proves the pinned authority", async () => {
+  const genuine = await startServer(serverCertificate(pinned, relayHosts));
+  try {
+    const { connect, reached } = routed({ [relayHosts[0]!]: genuine.port, [relayHosts[1]!]: genuine.port });
+    const found = await findMovedServer({
+      credential: paired,
+      authority: pinned.certificate,
+      connect,
+      relayDomain: "relay.test",
+      lookup: async () => [],
+    });
+    assert.deepEqual(found, relayed);
+    assert.deepEqual(reached, relayHosts);
+  } finally {
+    await stop(genuine.server);
+  }
+});
+
+test("the relay is not followed when what answers there cannot prove the pinned authority", async () => {
+  const other = testAuthority("Phigon server authority DESKTOP-Follow");
+  const impostor = await startServer(serverCertificate(other, relayHosts));
+  try {
+    const { connect } = routed({ [relayHosts[0]!]: impostor.port, [relayHosts[1]!]: impostor.port });
+    const found = await findMovedServer({
+      credential: paired, authority: pinned.certificate, connect, relayDomain: "relay.test", lookup: async () => [],
+    });
+    assert.equal(found, undefined);
+  } finally {
+    await stop(impostor.server);
+  }
+});
+
+test("a server already reached through the relay is not looked for there again", async () => {
+  const { connect, reached } = routed({});
+  const found = await findMovedServer({
+    credential: { ...paired, ...relayed }, authority: pinned.certificate, connect, relayDomain: "relay.test", lookup: async () => [],
+  });
+  assert.equal(found, undefined);
+  assert.deepEqual(reached, []);
 });
 
 test("a server that answers where it was is not looked for elsewhere", async () => {
