@@ -228,3 +228,33 @@ test("a running observer is recognised after the clock changed, as it can just a
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("a running observer is recognised when the clock was corrected between its start and its lock", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-instance-lock-corrected-"));
+  const now = Date.parse("2026-11-04T07:43:45.000Z");
+  // Windows recorded the service's start with a clock almost four hours
+  // slow; the clock was corrected before the observer took its lock.
+  const systemStart = Date.parse("2026-11-04T03:01:53.988Z");
+  const corrected = Date.parse("2026-11-04T06:53:13.872Z");
+  const options = { isAlive: () => true, bootedAt: () => corrected - 27_000, now: () => now };
+  try {
+    const lock = await InstanceLock.acquire(directory, {
+      ...options,
+      pid: 9_208,
+      startedAt: new Date(corrected),
+      processStartedAt: () => Promise.resolve(systemStart),
+    });
+    const written = JSON.parse(await readFile(join(directory, "observer.lock"), "utf8")) as Record<string, unknown>;
+    assert.deepEqual(written, { pid: 9_208, started_at: "2026-11-04T06:53:13.872Z", process_started_at: "2026-11-04T03:01:53.988Z" });
+    // The system still gives the start time it recorded, which the lock holds.
+    const sameProcess = { ...options, processStartedAt: () => Promise.resolve(systemStart) };
+    assert.deepEqual(await InstanceLock.inspect(directory, sameProcess), { running: true, pid: 9_208, startedAt: "2026-11-04T06:53:13.872Z" });
+    await assert.rejects(InstanceLock.acquire(directory, sameProcess), ObserverAlreadyRunningError);
+    // Another program that got the process ID started at neither time.
+    const otherProcess = { ...options, processStartedAt: () => Promise.resolve(now - 60_000) };
+    assert.deepEqual(await InstanceLock.inspect(directory, otherProcess), { running: false });
+    await lock.release();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
