@@ -37,7 +37,7 @@ import {
   type ObserverConfig,
 } from "./config.js";
 import { FileCredentialStore, type RemoteActionConsent, type StoredMachineCredential } from "./credential-store.js";
-import { remoteActionConsent, remoteActionSentence, remoteActionsAllowed } from "./remote-actions.js";
+import { containmentAllowed, remoteActionConsent, remoteActionSentence, remoteActionsAllowed } from "./remote-actions.js";
 import {
   CustomAgentRegistry,
   customAgentRegistration,
@@ -84,7 +84,7 @@ import { forgetServerAuthority, parseAuthorityFingerprint, trustAuthority } from
 import { followServer, saveMovedServer } from "./server-follow.js";
 import { preparePairingAuthority } from "./server-move.js";
 import { pairingChanged, pairingChangedExitCode, watchPairing, type PairingChange, type PairingWatch } from "./pairing-watch.js";
-import { moveServiceEndpoints, readServiceSettings, startService, stopService, uninstallService } from "./service.js";
+import { moveServiceEndpoints, readServiceSettings, serviceSettingsPath, startService, stopService, uninstallService } from "./service.js";
 import {
   installServiceAfterPairing,
   restartServiceAfterUpdate,
@@ -430,7 +430,8 @@ export async function run(
         decision.intervention !== "block_action"
       ) {
         const containment = await new GuardianContainmentExecutor({
-          enabled: true,
+          // An owner who refused stopping agents is never overruled.
+          enabled: containmentAllowed(credential, environment, config),
           inventory: async () => (await new DiscoveryEngine({
             customAgentRegistry,
           }).discover(credential.machineId)).inventory,
@@ -611,10 +612,18 @@ export async function run(
       } finally {
         await removalLock.release();
       }
+      // A background service left behind would start the unpaired observer
+      // again every minute, for good. Its collected activity is not touched.
+      let serviceRemoved = false;
+      try {
+        serviceRemoved = await uninstallService(serviceContext(config, callerEnvironment, dependencies));
+      } catch {
+        // No service on this computer, or it could not be asked: nothing runs from here.
+      }
       output.stdout(
         json
-          ? `${JSON.stringify(result, null, 2)}\n`
-          : formatRemoveMachineResult(result),
+          ? `${JSON.stringify({ ...result, backgroundServiceRemoved: serviceRemoved }, null, 2)}\n`
+          : formatRemoveMachineResult(result, serviceRemoved),
       );
       return 0;
     }
@@ -768,6 +777,7 @@ export async function run(
         });
         const client = new ObserverStreamClient({
           config,
+          containmentEnabled: containmentAllowed(credential, environment, config),
           actionExecutor,
           serverClock,
           observerVersion: version,
@@ -931,7 +941,7 @@ export async function run(
             timeoutMs: config.guardianDecisionTimeoutMs,
           }),
           containment: new GuardianContainmentExecutor({
-            enabled: true,
+            enabled: containmentAllowed(credential, environment, config),
             inventory: async () => (await discoveryEngine.discover(credential.machineId)).inventory,
           }),
           journal: new GuardianDecisionJournal(config.dataDirectory),
@@ -1033,9 +1043,13 @@ export async function run(
           const historyCollector = collector;
           const initialHistory = async () => {
             if (config.observabilityProfile !== "full" || credential.consentProfile !== "full") return;
+            // Said once: a workspace that keeps a category off would
+            // otherwise repeat it every 30 seconds for good.
+            let waitingSaid = false;
             while (!controller.signal.aborted) {
               if (!fullHistoryPolicyEnabled(effectivePolicy)) {
-                output.stdout("Saved-history sync is waiting for the workspace full-activity policy.\n");
+                if (!waitingSaid) output.stdout("Saved-history sync waits until the workspace allows every kind of full activity. Live collection remains active.\n");
+                waitingSaid = true;
               } else {
                 try {
                   output.stdout("Synchronizing saved agent history in the background. Live collection remains active.\n");
@@ -1244,9 +1258,19 @@ export async function run(
         streamCursorIssue = "Stored stream cursor could not be read.";
       }
     }
+    // Report what the background service collects, not this terminal's
+    // default: the service's profile, narrowed to the consent as `run` does.
+    let shown = config;
+    if (flagValue(flags, "--profile") === undefined && (environment["PHIGON_OBSERVABILITY_PROFILE"]?.trim() ?? "") === "") {
+      const serviceProfile = (await readServiceSettings(serviceSettingsPath(config.dataDirectory)).catch(() => undefined))?.["PHIGON_OBSERVABILITY_PROFILE"];
+      const profile = serviceProfile === "full" && storedCredential?.consentProfile === "full" ? "full" : serviceProfile === undefined ? undefined : "metadata";
+      if (profile !== undefined && profile !== config.observabilityProfile) {
+        shown = loadConfig({ ...environment, PHIGON_OBSERVABILITY_PROFILE: profile });
+      }
+    }
     const health = createHealthSnapshot(
       {
-        ...config,
+        ...shown,
         machineTokenConfigured:
           config.machineTokenConfigured || storedCredential !== null,
       },
@@ -2047,6 +2071,7 @@ function removeMachinePrompt(machineId: string): string {
 
 function formatRemoveMachineResult(
   result: Awaited<ReturnType<typeof removeMachine>>,
+  serviceRemoved = false,
 ): string {
   return [
     result.status === "already_removed"
@@ -2055,6 +2080,7 @@ function formatRemoveMachineResult(
     `Machine: ${result.machineId}`,
     `Control plane: ${result.controlPlaneOrigin}`,
     "Collection: stopped; the observer key is revoked",
+    ...(serviceRemoved ? ["Background service: removed"] : []),
     "Machine credential: removed from this device",
     "Collected activity: kept until an administrator deletes this computer or it expires",
     "Next step: pair again to reconnect this observer.",

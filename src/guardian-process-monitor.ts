@@ -2,7 +2,7 @@ import { timestampDate, type Timestamp } from "@bufbuild/protobuf/wkt";
 import { AgentState } from "./generated/phigon/v1/common_pb.js";
 import type { AgentInventory } from "./generated/phigon/v1/identity_pb.js";
 import type { ActionPolicyPersistence } from "./action-policy.js";
-import type { GuardianSemanticDecision, HTTPGuardianDecisionClient } from "./agentic-guardian.js";
+import { GuardianDecisionUnavailableError, type GuardianSemanticDecision, type HTTPGuardianDecisionClient } from "./agentic-guardian.js";
 import type { GuardianContainmentExecutor, GuardianContainmentResult } from "./guardian-containment.js";
 import type { GuardianDecisionJournal } from "./guardian-decision-journal.js";
 import type { GuardianHostedClient } from "./guardian-hosted-client.js";
@@ -27,6 +27,10 @@ const coverageRefreshMs = 60_000;
 // doubling after each failure up to the maximum.
 const retryInitialMs = 10_000;
 const retryMaxMs = 5 * 60_000;
+// A process the service would not decide about alone is asked again after a
+// minute; at most this many such waits are kept.
+const agentRetryMs = 60_000;
+const maxAgentRetries = 256;
 // A problem that lasts is written to the log again this often.
 const statusRepeatMs = 30 * 60_000;
 
@@ -50,6 +54,9 @@ export class GuardianProcessMonitor {
   #decisionsDigest: string | undefined;
   #lastCoverage: Readonly<{ report: string; at: number }> | undefined;
   readonly #decisionRetry = new RetryBackoff(retryInitialMs, retryMaxMs);
+  // When each process may be asked about again after the service refused to
+  // decide about it alone (it changed, or the model was unsure), by lifetime.
+  readonly #agentRetry = new Map<string, number>();
   readonly #coverageRetry = new RetryBackoff(retryInitialMs, retryMaxMs);
   readonly #status: StatusChanges;
   readonly #now: () => number;
@@ -81,7 +88,7 @@ export class GuardianProcessMonitor {
   private async reviewWithinDeadline(inventory: AgentInventory, signal: AbortSignal, coverageSignal: AbortSignal): Promise<void> {
     const policy = await this.options.policyStore.load(this.options.machineId);
     if (policy === null) {
-      this.#status.report("policy", "Guardian process review is waiting for its administrator policy.");
+      this.#status.report("policy", "Guardian waits for the rules from your company's Phigon server, and reviews running agents once they arrive.");
       return;
     }
     this.#status.clear("policy");
@@ -217,7 +224,7 @@ export class GuardianProcessMonitor {
     }
     if (decision.decision !== "allow" && (reportFailure || containment?.state === "succeeded")) {
       const { resource, context } = reviewProposal(agent);
-      const detail = containment?.detail ?? "The running process was not stopped: its policy did not authorize process containment.";
+      const detail = containment?.detail ?? "The agent kept running: the rule does not stop agents.";
       this.options.onStatus(`Phigon Guardian: ${agent.agentId}. ${decision.reason} ${detail}`);
       await this.options.journal.append({
         agentId: agent.agentId, action: "agent.start", resource,
@@ -242,6 +249,9 @@ export class GuardianProcessMonitor {
     // After a failed call the decision service is not asked again until the
     // wait is over; the process counts as unverified meanwhile.
     if (!this.#decisionRetry.ready(this.#now())) return undefined;
+    const key = lifetimeKey(agent);
+    const waitUntil = this.#agentRetry.get(key);
+    if (waitUntil !== undefined && this.#now() < waitUntil) return undefined;
     const { resource, context } = reviewProposal(agent);
     let decision: GuardianSemanticDecision;
     try {
@@ -254,6 +264,15 @@ export class GuardianProcessMonitor {
       // A review cut short by its deadline or by shutdown is not a failure
       // of the decision service.
       if (signal.aborted) return undefined;
+      // A refusal about this process alone (409: it or the rules changed;
+      // 422: the model was unsure) waits for it only; every other agent is
+      // still asked, blocked ones first among them.
+      if (error instanceof GuardianDecisionUnavailableError && (error.status === 409 || error.status === 422)) {
+        this.#agentRetry.delete(key);
+        this.#agentRetry.set(key, this.#now() + agentRetryMs);
+        while (this.#agentRetry.size > maxAgentRetries) this.#agentRetry.delete(this.#agentRetry.keys().next().value!);
+        return undefined;
+      }
       this.#decisionRetry.failed(this.#now());
       this.#status.report(
         "review",
@@ -262,6 +281,7 @@ export class GuardianProcessMonitor {
       return undefined;
     }
     if (signal.aborted) return undefined;
+    this.#agentRetry.delete(key);
     this.#decisionRetry.succeeded();
     this.#status.clear("review", "Guardian reviews running agents again.");
     return decision;
@@ -304,7 +324,8 @@ export class GuardianProcessMonitor {
       this.#coverageRetry.failed(now);
       this.#status.report(
         "coverage",
-        `Guardian could not deliver its coverage report (${errorSummary(error)}); the workspace shows its protection status as stale until it can.`,
+        // Only the connection problem: no action is blocked by a missed report.
+        `Guardian could not deliver its coverage report (${coverageProblem(error)}); agents keep running, and the workspace shows its protection status as stale until it can.`,
       );
     }
   }
@@ -382,4 +403,10 @@ function abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
     signal.addEventListener("abort", abort, { once: true });
     work.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
   });
+}
+
+/** The connection problem behind a failed coverage report, such as "ECONNREFUSED". */
+function coverageProblem(error: unknown): string {
+  const summary = errorSummary(error);
+  return /could not reach your company's Phigon server \(([^()]+)\)/u.exec(summary)?.[1] ?? summary;
 }

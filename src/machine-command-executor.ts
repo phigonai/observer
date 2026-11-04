@@ -13,6 +13,21 @@ import { AgentActionResultSchema, RemoteActionResultState as State, RemoteAction
 import type { UserNotices } from "./user-notices.js";
 
 export const machineActionTypes: readonly Action[] = [Action.RUN_COMMAND, Action.INSPECT_SYSTEM, Action.SHUTDOWN_MACHINE, Action.RESTART_MACHINE];
+
+/**
+ * The computer actions this observer can carry out. Restarting or shutting
+ * down needs an administrator account on macOS and Linux, which a
+ * background service for the signed-in user is not, so those are offered
+ * there only to an observer running as root; Windows lets the user do it.
+ */
+export function availableMachineActions(
+  platform: NodeJS.Platform = process.platform,
+  root: boolean = process.getuid?.() === 0,
+): readonly Action[] {
+  return platform === "win32" || root
+    ? machineActionTypes
+    : machineActionTypes.filter((action) => action !== Action.SHUTDOWN_MACHINE && action !== Action.RESTART_MACHINE);
+}
 export type CommandSpec = { executable: string; arguments: string[]; working_directory?: string; timeout_seconds: number };
 const outputLimit = 32768;
 const outputDrainMs = 500;

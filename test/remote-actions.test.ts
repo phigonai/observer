@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { StoredMachineCredential } from "../src/credential-store.js";
-import { remoteActionConsent, remoteActionSentence, remoteActionsAllowed } from "../src/remote-actions.js";
+import { containmentAllowed, remoteActionConsent, remoteActionSentence, remoteActionsAllowed } from "../src/remote-actions.js";
 
 // Machine keys are built at run time, so no key-shaped text is stored.
 const paired: StoredMachineCredential = {
@@ -28,18 +28,33 @@ test("a computer allows what was consented to when it paired", () => {
   assert.deepEqual(remoteActionsAllowed(paired, {}, off), { stopAgents: false, commands: false });
 });
 
-test("the observer's settings override the consent stored with the pairing", () => {
+test("the observer's settings can narrow the consent stored with the pairing, never widen it", () => {
   const consented = { ...paired, remoteActions: "all" as const };
   assert.deepEqual(
     remoteActionsAllowed(consented, { PHIGON_REMOTE_ACTIONS_ENABLED: "false", PHIGON_REMOTE_COMMANDS_ENABLED: "false" }, off),
     { stopAgents: false, commands: false },
   );
+  // Settings saved before 8.8 to make Stop work do not overrule an owner who said no since.
+  const on = { remoteActionsEnabled: true, remoteCommandsEnabled: true };
+  const settings = { PHIGON_REMOTE_ACTIONS_ENABLED: "true", PHIGON_REMOTE_COMMANDS_ENABLED: "true" };
+  assert.deepEqual(remoteActionsAllowed({ ...paired, remoteActions: "none" }, settings, on), { stopAgents: false, commands: false });
+  assert.deepEqual(remoteActionsAllowed({ ...paired, remoteActions: "stop_agents" }, settings, on), { stopAgents: true, commands: false });
+  // A computer paired before the question follows the settings alone, as it always did.
   assert.deepEqual(
     remoteActionsAllowed(paired, { PHIGON_REMOTE_ACTIONS_ENABLED: "true" }, { ...off, remoteActionsEnabled: true }),
     { stopAgents: true, commands: false },
   );
   // An empty setting is no setting.
   assert.deepEqual(remoteActionsAllowed(consented, { PHIGON_REMOTE_ACTIONS_ENABLED: " " }, off), { stopAgents: true, commands: true });
+});
+
+test("Guardian stops agents only where the owner did not refuse it", () => {
+  // Paired before the question: Guardian keeps the containment it always had.
+  assert.equal(containmentAllowed(paired, {}, off), true);
+  assert.equal(containmentAllowed({ ...paired, remoteActions: "all" }, {}, off), true);
+  assert.equal(containmentAllowed({ ...paired, remoteActions: "stop_agents" }, {}, off), true);
+  assert.equal(containmentAllowed({ ...paired, remoteActions: "none" }, {}, off), false);
+  assert.equal(containmentAllowed({ ...paired, remoteActions: "all" }, { PHIGON_REMOTE_ACTIONS_ENABLED: "false" }, off), false);
 });
 
 test("the person at the computer is told what administrators may do", () => {

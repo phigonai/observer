@@ -27,7 +27,7 @@ export class GuardianHostedClient {
       // Only the status or the connection error's code: never the response.
       const reason = error instanceof HostedStatusError ? error.message : connectionFailure(error, false);
       throw new GuardianDecisionUnavailableError(
-        `Phigon Guardian could not verify hosted enforcement${reason === undefined ? "" : ` (${reason})`}; the action remains blocked.`,
+        `Phigon Guardian could not reach your company's Phigon server${reason === undefined ? "" : ` (${reason})`}; the action remains blocked.`,
       );
     }
   }

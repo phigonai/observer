@@ -106,6 +106,11 @@ export type ActionExecutor = Pick<AgentActionExecutor, "execute" | "manifest">;
 
 export type StreamClientOptions = Readonly<{
   config: ObserverConfig;
+  /**
+   * Whether Guardian may stop agents here (see containmentAllowed); the
+   * policy receipt tells the server. Allowed unless said otherwise.
+   */
+  containmentEnabled?: boolean;
   credentialStore?: CredentialStore;
   stateStore?: StreamStatePersistence;
   queue?: BoundedEventQueue<EventEnvelope>;
@@ -147,6 +152,7 @@ export class ObserverStreamClient {
     sequence: bigint,
   ) => void | Promise<void>;
   readonly #actionExecutor: ActionExecutor | undefined;
+  readonly #containmentEnabled: boolean;
   readonly #onHistorySync:
     | ((command: HistorySyncCommand) => Promise<HistorySyncResult>)
     | undefined;
@@ -198,6 +204,7 @@ export class ObserverStreamClient {
     this.#onAcknowledgement =
       options.onAcknowledgement ?? (() => undefined);
     this.#actionExecutor = options.actionExecutor;
+    this.#containmentEnabled = options.containmentEnabled ?? true;
     this.#onHistorySync = options.onHistorySync;
   }
 
@@ -522,8 +529,8 @@ export class ObserverStreamClient {
               capabilities: state === PolicyReceiptState.APPLIED
                 ? [...managedGatewayCapabilities]
                 : [],
-              containmentEnabled: state === PolicyReceiptState.APPLIED,
-              containmentCapabilities: state === PolicyReceiptState.APPLIED
+              containmentEnabled: state === PolicyReceiptState.APPLIED && this.#containmentEnabled,
+              containmentCapabilities: state === PolicyReceiptState.APPLIED && this.#containmentEnabled
                 ? [...guardianContainmentCapabilities]
                 : [],
               ...(state === PolicyReceiptState.REJECTED

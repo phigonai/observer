@@ -16,6 +16,11 @@ test("a new terminal restores the paired customer's API and telemetry endpoints"
   assert.equal(loadConfig(resolved).controlPlaneUrl.origin, "https://api.customer.test");
   const explicit = await connectionEnvironment({ PHIGON_DATA_DIR:directory }, ["--grpc-url", "https://changed.customer.test"]);
   assert.equal(explicit["PHIGON_GRPC_URL"], "https://changed.customer.test");
+  // "--flag=value" works as for every other option, instead of being ignored.
+  const joined = await connectionEnvironment({ PHIGON_DATA_DIR:directory }, ["--control-plane-url=https://joined.customer.test", "--grpc-url=https://joined.customer.test:4317"]);
+  assert.equal(joined["PHIGON_CONTROL_PLANE_URL"], "https://joined.customer.test");
+  assert.equal(joined["PHIGON_GRPC_URL"], "https://joined.customer.test:4317");
+  await assert.rejects(connectionEnvironment({ PHIGON_DATA_DIR:directory }, ["--grpc-url="]), /requires/u);
   await assert.rejects(connectionEnvironment({ PHIGON_DATA_DIR:directory }, ["--grpc-url"]), /requires/u);
  } finally { await rm(directory, { recursive:true, force:true }); }
 });

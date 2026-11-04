@@ -105,6 +105,17 @@ export async function removedAtStart(options: Readonly<{
 }
 
 /** True or false when the server says so; undefined when it cannot be asked. */
+/**
+ * Whether the server confirmed that the workspace removed this pairing,
+ * from the file `run` keeps; nothing is asked. `doctor --check` uses it to
+ * say why no observer runs instead of suggesting to start it again.
+ */
+export async function removalConfirmed(dataDirectory: string, machine: MachineKey): Promise<boolean> {
+  const removed = await readRemoved(join(dataDirectory, machineRemovedFileName)).catch(() => undefined);
+  return removed !== undefined && removed.machineId === machine.machineId &&
+    removed.key === pairingDigest(machine) && removed.confirmedAt !== undefined;
+}
+
 async function keyAccepted(fetcher: typeof fetch, controlPlaneUrl: URL, credential: string): Promise<boolean | undefined> {
   let response: Response;
   try {

@@ -41,7 +41,15 @@ export type GuardianSemanticDecision = Readonly<{
   approvalExpiresAt?: string;
 }>;
 
-export class GuardianDecisionUnavailableError extends Error {}
+export class GuardianDecisionUnavailableError extends Error {
+  /** The decision service's HTTP status, when it answered with an error. */
+  readonly status: number | undefined;
+
+  constructor(message: string, status?: number) {
+    super(message);
+    this.status = status;
+  }
+}
 
 export class HTTPGuardianDecisionClient {
   readonly #controlPlaneURL: URL;
@@ -106,6 +114,7 @@ export class HTTPGuardianDecisionClient {
       if (!response.ok) {
         throw new GuardianDecisionUnavailableError(
           `Guardian decision service returned ${response.status}.`,
+          response.status,
         );
       }
       let value: unknown;
