@@ -17,7 +17,15 @@ const bootToleranceMs = 60_000;
 const processStartToleranceMs = 10_000;
 const processStartReadTimeoutMs = 15_000;
 
-type LockRecord = Readonly<{ pid: number; started_at: string }>;
+type LockRecord = Readonly<{
+  pid: number;
+  started_at: string;
+  /**
+   * The start time the operating system gave for the holder when it took
+   * the lock, read the way later checks read it (absent in older locks).
+   */
+  process_started_at?: string;
+}>;
 
 export type InstanceLockOptions = Readonly<{
   pid?: number;
@@ -79,7 +87,14 @@ export class InstanceLock {
     const bootedAt = options.bootedAt ?? (() => Date.now() - uptime() * 1_000);
     const now = options.now ?? Date.now;
     const path = join(dataDirectory, lockFileName);
-    const content = `${JSON.stringify({ pid, started_at: startedAt.toISOString() })}\n`;
+    // Windows and macOS keep a process's start time as it was when it
+    // started, so a later clock correction does not change it.
+    const systemStartedAt = await readStart(pid, processStartedAt);
+    const content = `${JSON.stringify({
+      pid,
+      started_at: startedAt.toISOString(),
+      ...(systemStartedAt === null ? {} : { process_started_at: new Date(systemStartedAt).toISOString() }),
+    })}\n`;
     await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
     await makeDirectoryPrivate(dataDirectory);
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -214,18 +229,30 @@ function parseLock(raw: string): LockRecord | undefined {
   ) {
     return undefined;
   }
-  return { pid: value.pid, started_at: value.started_at };
+  const systemStartedAt = "process_started_at" in value && typeof value.process_started_at === "string" &&
+    Number.isFinite(Date.parse(value.process_started_at))
+    ? value.process_started_at
+    : undefined;
+  return {
+    pid: value.pid,
+    started_at: value.started_at,
+    ...(systemStartedAt === undefined ? {} : { process_started_at: systemStartedAt }),
+  };
 }
 
 /**
  * Whether the holder still runs. After a hard kill the operating system can
  * give its process ID to an unrelated program, so a live process counts only
- * when the start time the system recorded for it matches the lock. That
- * holds even when the clock changed since: a computer whose clock is wrong
- * when it starts, and is corrected a few minutes later, would otherwise make
- * its own background service look like one from before the restart. Only
- * when the start time cannot be read does the holder have to have started
- * since the computer did.
+ * when the start time the system recorded for it matches the lock: the one
+ * the system gave when the lock was taken, or the time the observer wrote.
+ * That holds even when the clock changed since: a computer whose clock is
+ * wrong when it starts, and is corrected a few minutes later, would
+ * otherwise make its own background service look like one from before the
+ * restart. The observer may also take the lock just after the correction,
+ * when its own clock no longer matches the time the system recorded, which
+ * the system's start time in the lock still matches. Only when the start
+ * time cannot be read does the holder have to have started since the
+ * computer did.
  */
 async function holderIsLive(
   holder: LockRecord,
@@ -235,7 +262,10 @@ async function holderIsLive(
 ): Promise<boolean> {
   if (!isAlive(holder.pid)) return false;
   const started = await readStart(holder.pid, processStartedAt);
-  if (started !== null) return Math.abs(started - Date.parse(holder.started_at)) <= processStartToleranceMs;
+  if (started !== null) {
+    const recorded = [holder.started_at, holder.process_started_at].filter((value) => value !== undefined);
+    return recorded.some((value) => Math.abs(started - Date.parse(value)) <= processStartToleranceMs);
+  }
   return Date.parse(holder.started_at) >= bootedAt() - bootToleranceMs;
 }
 
