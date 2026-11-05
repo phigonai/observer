@@ -319,16 +319,28 @@ with an authority of its own, so the **Connect machine** command adds
 On first contact, pairing finds the authority in the server's certificate
 chain whose SHA-256 matches the fingerprint. It saves that authority as
 `server-ca.pem` in the data directory, and every later HTTPS and gRPC
-connection trusts it. A server that presents another certificate is refused
-before anything is sent. `remove-machine` deletes the file. This needs
-Node.js 24.5 or newer.
+connection to that server trusts it and nothing else, not even the public
+authorities; requests to other hosts, such as the npm registry, trust the
+system's authorities as usual. A server that presents another certificate is
+refused before anything is sent. When the presented certificate leads to no
+Phigon authority, the observer says that a proxy or security software on the
+network is inspecting HTTPS, and what to ask IT to exempt
+(`*.relay.phigon.online` or the server's address). `remove-machine` deletes
+the file. This needs Node.js 24.5 or newer.
 
-When that server's address changes because its computer got a new IP address
-from the network, the background service finds it again by itself. It looks
-up the computer's name, which the Phigon app puts in its authority, as
-`<name>` and `<name>.local`. It moves only to a private network address that
-proves it holds a certificate from the pinned authority. Then it saves the
-new address and restarts there. Where the network does not resolve computer
+The background service follows that server between its network address and
+Phigon's relay (`<label>.relay.phigon.online`, which reaches the server from
+any network), in both directions. It learns the network address from
+pairing on the network or from the server, and works out the relay address
+from the pinned authority.
+It prefers the network address: on the relay it tries it every 5 minutes and
+moves back after two good tries in a row (not within 15 minutes of leaving
+it). When the address it uses stops answering for three checks a minute
+apart, it tries the network address, then the computer's name, which the
+Phigon app puts in its authority, as `<name>` and `<name>.local`, then the
+relay. It moves only to an address whose API and telemetry names both prove
+they hold certificates from the pinned authority. Then it saves the new
+address and restarts there. Where the network does not resolve computer
 names, or the company moves the Phigon app to another network, run the new
 **Connect machine** command on each computer with the same data directory. The
 computer keeps its machine and the activity it has not delivered yet, and

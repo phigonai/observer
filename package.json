@@ -1,6 +1,6 @@
 {
   "name": "@phigon/observer",
-  "version": "8.10.0",
+  "version": "8.11.0",
   "description": "Open-source observer that connects computers and their AI coding agents to Phigon: agent discovery, consented activity and history, local redaction, and Guardian checks.",
   "type": "module",
   "private": false,
@@ -56,7 +56,8 @@
   },
   "dependencies": {
     "@bufbuild/protobuf": "2.13.0",
-    "@grpc/grpc-js": "1.14.6"
+    "@grpc/grpc-js": "1.14.6",
+    "undici": "7.30.1"
   },
   "overrides": {
     "minimatch@10.2.5": {

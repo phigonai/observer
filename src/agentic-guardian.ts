@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { redactSecrets } from "./content-redaction.js";
+import { serverFetch } from "./server-fetch.js";
 import type { GuardianIntervention } from "./action-policy.js";
 
 const maxResponseBytes = 64 << 10;
@@ -66,7 +67,7 @@ export class HTTPGuardianDecisionClient {
     this.#controlPlaneURL = options.controlPlaneURL;
     this.#credential = options.credential;
     this.#timeoutMs = options.timeoutMs;
-    this.#fetch = options.fetcher ?? fetch;
+    this.#fetch = options.fetcher ?? serverFetch;
   }
 
   async decide(

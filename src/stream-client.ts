@@ -75,6 +75,7 @@ import {
   type ResourceReference,
 } from "./generated/phigon/v1/telemetry_pb.js";
 import { MachineRemovedError } from "./machine-removed.js";
+import { inspectionMessage, relayHost, relayNotConnectedMessage } from "./server-authority.js";
 import type { ServerClock } from "./server-clock.js";
 import { StreamStateStore } from "./stream-state.js";
 import { noProxyForAll } from "./proxy.js";
@@ -265,6 +266,8 @@ export class ObserverStreamClient {
   async #run(signal: AbortSignal): Promise<void> {
     const initialBackoffMs = 250;
     let backoffMs = initialBackoffMs;
+    // Whether this outage began with a connection that worked dropping.
+    let afterDrop = false;
     while (!signal.aborted) {
       this.#establishedSinceConnect = false;
       try {
@@ -280,19 +283,23 @@ export class ObserverStreamClient {
         // A connection that completed its handshake ends the outage; the
         // next disconnect (for example a server restart) retries promptly
         // instead of inheriting the longest delay of an earlier outage.
-        if (this.#establishedSinceConnect) backoffMs = initialBackoffMs;
+        if (this.#establishedSinceConnect) {
+          backoffMs = initialBackoffMs;
+          afterDrop = true;
+        }
         this.#reconnects++;
-        const summary = telemetryErrorSummary(error);
+        const summary = telemetryErrorSummary(error, this.#config.grpcUrl);
+        const waitMs = reconnectDelay(backoffMs, Math.random, afterDrop);
         const now = Date.now();
         const last = this.#lastLoggedFailure;
         if (this.#establishedSinceConnect || last?.summary !== summary || now - last.at >= failureRepeatMs) {
           this.#lastLoggedFailure = { summary, at: now };
-          this.#onStatus(`Telemetry disconnected (${summary}); retrying in ${backoffMs}ms.`);
+          this.#onStatus(`Telemetry disconnected (${summary}); retrying in ${waitMs}ms.`);
         }
         // The first attempt after a connection that worked starts a new
         // outage, so it says it is connecting; the ones after it do not.
         this.#reconnectingQuietly = !this.#establishedSinceConnect;
-        await abortableDelay(reconnectDelay(backoffMs), signal);
+        await abortableDelay(waitMs, signal);
         backoffMs = Math.min(backoffMs * 2, maxReconnectDelayMs);
       }
     }
@@ -1016,7 +1023,9 @@ export function describeSpoolRestore(notice: SpoolRestoreNotice): string {
   }
 }
 
-function telemetryErrorSummary(error: unknown): string {
+function telemetryErrorSummary(error: unknown, grpcUrl?: URL): string {
+  const plain = grpcUrl === undefined ? undefined : plainTelemetryProblem(error, grpcUrl);
+  if (plain !== undefined) return plain;
   if (isServiceError(error)) {
     const codeName = Object.entries(status).find(
       ([, value]) => typeof value === "number" && value === error.code,
@@ -1026,6 +1035,23 @@ function telemetryErrorSummary(error: unknown): string {
   }
   if (error instanceof Error) return safeStatusDetail(error.message);
   return "unknown transport error";
+}
+
+/**
+ * What grpc-js reports in its own words, said plainly where a person can
+ * act on it: a relay that closed the connection because the server is not
+ * connected to it, or a certificate re-signed on the way. Undefined for
+ * anything else.
+ */
+export function plainTelemetryProblem(error: unknown, grpcUrl: URL): string | undefined {
+  const text = error instanceof Error ? `${(error as Partial<ServiceError>).details ?? ""} ${error.message}` : "";
+  if (/unable to verify|unable to get (?:local )?issuer|self[- ]signed certificate|certificate signature failure/iu.test(text)) {
+    return inspectionMessage(grpcUrl).replace(/\.$/u, "");
+  }
+  if (relayHost(grpcUrl.hostname) && /ECONNRESET|socket disconnected before secure TLS|socket hang up/iu.test(text)) {
+    return relayNotConnectedMessage.replace(/\.$/u, "");
+  }
+  return undefined;
 }
 
 function safeStatusDetail(value: string): string {
@@ -1263,12 +1289,22 @@ function sanitizeResource(
 }
 
 /**
+ * After a connection that worked drops, the first attempts wait anywhere
+ * up to this long: every computer behind a server or relay that restarted
+ * lost it at the same moment, and would otherwise come back in waves.
+ */
+export const dropSpreadMs = 5_000;
+
+/**
  * The wait before a reconnect attempt: up to a quarter less than the
  * backoff, at random, so computers that lost the same server do not all
  * try at once, and never longer than the backoff, so a computer is back
- * within a minute of the server.
+ * within a minute of the server. After a connection that worked dropped
+ * (`afterDrop`), the attempts whose backoff is still under five seconds
+ * wait any time up to five seconds instead.
  */
-export function reconnectDelay(backoffMs: number, random: () => number = Math.random): number {
+export function reconnectDelay(backoffMs: number, random: () => number = Math.random, afterDrop = false): number {
+  if (afterDrop && backoffMs < dropSpreadMs) return Math.floor(random() * dropSpreadMs);
   return backoffMs - Math.floor(random() * backoffMs / 4);
 }
 

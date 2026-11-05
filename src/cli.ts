@@ -80,8 +80,9 @@ import {
   type EnrollResult,
 } from "./enroll.js";
 import { removeMachine } from "./remove-machine.js";
-import { forgetServerAuthority, parseAuthorityFingerprint, trustAuthority } from "./server-authority.js";
-import { followServer, saveMovedServer } from "./server-follow.js";
+import { addDefaultAuthority, forgetServerAuthority, parseAuthorityFingerprint } from "./server-authority.js";
+import { useServerProxy } from "./server-fetch.js";
+import { followServer, reconcileServiceEndpoints, saveMovedServer } from "./server-follow.js";
 import { preparePairingAuthority } from "./server-move.js";
 import { pairingChanged, pairingChangedExitCode, watchPairing, type PairingChange, type PairingWatch } from "./pairing-watch.js";
 import { moveServiceEndpoints, readServiceSettings, serviceSettingsPath, startService, stopService, uninstallService } from "./service.js";
@@ -206,8 +207,15 @@ export async function run(
   let proxy: ProxySetup | undefined;
   try {
     if (serviceSettingsFile !== undefined) {
-      const settings = await readServiceSettings(serviceSettingsFile);
-      environment = { ...environment, ...settings, PHIGON_DATA_DIR: dirname(resolve(serviceSettingsFile)) };
+      const dataDirectory = dirname(resolve(serviceSettingsFile));
+      // A move to a new server address that stopped between its two writes
+      // leaves the settings at one address and the pairing at another.
+      const reconciled = await reconcileServiceEndpoints(dataDirectory, await readServiceSettings(serviceSettingsFile));
+      const settings = reconciled.settings;
+      if (reconciled.moved !== undefined) {
+        output.stdout(`The background service settings named another address of this computer's Phigon server, so it uses the paired address, ${reconciled.moved}.\n`);
+      }
+      environment = { ...environment, ...settings, PHIGON_DATA_DIR: dataDirectory };
       if (ownEnvironment) {
         // PATH (to find agents) and the proxy variables (for grpc-js) are
         // read from the process itself.
@@ -224,6 +232,9 @@ export async function run(
     // Every HTTPS call and the telemetry stream go through the proxy that
     // HTTPS_PROXY, HTTP_PROXY and NO_PROXY name, when there is one.
     proxy = useProxyFromEnvironment(callerEnvironment, { streamUrl: config.grpcUrl });
+    // Requests to the paired server pick their proxy themselves, since they
+    // trust only its pinned authority.
+    useServerProxy(proxySettings(callerEnvironment));
     if (proxy.notice !== undefined) output.stderr(`${proxy.notice}\n`);
     const version = await readVersion();
     const json = flags.includes("--json");
@@ -1081,6 +1092,7 @@ export async function run(
           credential,
           signal: controller.signal,
           proxyFor: (url) => proxyForUrl(url, proxySettings(callerEnvironment)),
+          onStatus: (message) => output.stderr(`${message}\n`),
           onMoved: async (moved) => {
             try {
               return await saveMovedServer(config.dataDirectory, credential, moved);
@@ -1300,6 +1312,7 @@ export async function run(
     return 1;
   } finally {
     proxy?.restore();
+    useServerProxy(undefined);
   }
 }
 
@@ -1694,7 +1707,7 @@ function trustExtraCertificates(file: string | undefined, output: Output): void 
   try {
     const certificates = readFileSync(file, "utf8")
       .match(/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/gu) ?? [];
-    for (const certificate of certificates) trustAuthority(`${certificate}\n`);
+    for (const certificate of certificates) addDefaultAuthority(`${certificate}\n`);
   } catch {
     output.stderr(`The certificates in NODE_EXTRA_CA_CERTS (${file}) could not be read; HTTPS uses the system's authorities only.\n`);
   }

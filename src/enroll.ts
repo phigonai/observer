@@ -19,6 +19,7 @@ import {
   type ExchangeOutcome,
   type PairResult,
 } from "./pair.js";
+import { serverFetch } from "./server-fetch.js";
 import { plainText } from "./user-notices.js";
 
 /**
@@ -154,7 +155,7 @@ export type EnrollOptions = Readonly<{
 export async function enrollMachine(options: EnrollOptions): Promise<EnrollResult> {
   const code = checkedEnrollmentCode(options.code);
   const endpoint = new URL("/v1/machines/enroll", options.config.controlPlaneUrl);
-  const fetcher = options.fetcher ?? fetch;
+  const fetcher = options.fetcher ?? serverFetch;
   const version = reportableVersion(options.observerVersion);
   const connected = await connectMachine<EnrolledMachine>({
     config: options.config,

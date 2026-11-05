@@ -66,9 +66,17 @@ import {
   VendorEventSchema,
   type EventEnvelope,
 } from "../src/generated/phigon/v1/telemetry_pb.js";
+import { connectionEnvironment } from "../src/connection-config.js";
+import { FileCredentialStore } from "../src/credential-store.js";
+import { serverAuthorityPath } from "../src/server-authority.js";
+import { trustServerAuthority } from "../src/server-fetch.js";
+import { relayServer } from "../src/server-follow.js";
+import { serverCertificate, testAuthority } from "./support/certificates.js";
+import { startConnectProxy } from "./support/connect-proxy.js";
 import {
   muteIpServerNameWarning,
   ObserverStreamClient,
+  plainTelemetryProblem,
   reconnectDelay,
   sanitizeEventForPolicy,
 } from "../src/stream-client.js";
@@ -1576,6 +1584,120 @@ test("a stream that keeps failing the same way is logged once, not on every atte
   } finally { clearTimeout(deadline); controller.abort(); server.forceShutdown(); await rm(directory, { recursive:true, force:true }); }
 });
 
+test("after a connection that worked drops, computers spread their first attempts over five seconds", () => {
+  // Every computer behind a restarted relay drops at once; the first tries are spread fully.
+  assert.equal(reconnectDelay(250, () => 0, true), 0);
+  assert.equal(reconnectDelay(250, () => 0.999_999, true), 4_999);
+  assert.equal(reconnectDelay(4_000, () => 0.5, true), 2_500);
+  // Once the backoff is past five seconds, it grows as before, a minute at the longest.
+  assert.equal(reconnectDelay(8_000, () => 0, true), 8_000);
+  assert.equal(reconnectDelay(60_000, () => 0.999_999, true), 45_001);
+  const spread = new Set<number>();
+  for (let index = 0; index < 1_000; index++) {
+    const delay = reconnectDelay(250, Math.random, true);
+    assert.ok(delay >= 0 && delay < 5_000, String(delay));
+    spread.add(Math.floor(delay / 1_000));
+  }
+  assert.equal(spread.size, 5, "every second of the window is used");
+});
+
+test("grpc-js errors a person can act on are said plainly", () => {
+  const relay = new URL("https://abcdefghabcdefgh-grpc.relay.phigon.online");
+  const network = new URL("https://192.168.1.20:17090");
+  const unavailable = (details: string) => Object.assign(new Error(`14 UNAVAILABLE: ${details}`), { code: status.UNAVAILABLE, details });
+  assert.equal(
+    plainTelemetryProblem(unavailable("No connection established. Last error: Error: Client network socket disconnected before secure TLS connection was established"), relay),
+    "The Phigon server is not connected to the relay right now (for example, the admin's computer is off)",
+  );
+  assert.equal(plainTelemetryProblem(unavailable("No connection established. Last error: read ECONNRESET"), network), undefined);
+  assert.match(
+    plainTelemetryProblem(unavailable("No connection established. Last error: Error: unable to get local issuer certificate"), relay) ?? "",
+    /^A proxy or security software on this network is inspecting HTTPS .* exempt \*\.relay\.phigon\.online from HTTPS inspection$/u,
+  );
+  assert.match(
+    plainTelemetryProblem(unavailable("Last error: Error: self-signed certificate in certificate chain"), network) ?? "",
+    /exempt 192\.168\.1\.20 from HTTPS inspection$/u,
+  );
+  assert.equal(plainTelemetryProblem(unavailable("server is starting"), relay), undefined);
+  assert.equal(plainTelemetryProblem("not an error", relay), undefined);
+});
+
+test("a background service restarted after a move to the relay trusts its pinned authority and streams to the relay's telemetry name", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-stream-relay-"));
+  const machineId = "5f1b4cb4-a77d-4f53-af66-197e184683f4";
+  const pinned = testAuthority("Phigon server authority RELAYED");
+  const relay = relayServer(pinned.certificate, "relay.test")!;
+  const grpcHost = new URL(relay.grpcOrigin).hostname;
+  const leaf = serverCertificate(pinned, [grpcHost]);
+  const server = new Server();
+  server.addService(observerServiceDefinition, {
+    streamTelemetry(call: ServerDuplexStream<StreamTelemetryRequest, StreamTelemetryResponse>) {
+      call.on("data", (request: StreamTelemetryRequest) => {
+        if (request.payload.case !== "resume") return;
+        call.write(policySnapshot(machineId));
+        call.write(acknowledgement(machineId, 0n));
+      });
+      call.on("end", () => call.end());
+    },
+  });
+  const port = await new Promise<number>((resolve, reject) => {
+    server.bindAsync(
+      "127.0.0.1:0",
+      ServerCredentials.createSsl(null, [{ private_key: Buffer.from(leaf.key), cert_chain: Buffer.from(leaf.certificate) }], false),
+      (error, bound) => error ? reject(error) : resolve(bound),
+    );
+  });
+  // The relay name does not resolve here; a CONNECT proxy routes it, and
+  // TLS still runs end to end with the server.
+  const proxy = await startConnectProxy({ [`${grpcHost}:443`]: port });
+  const names = ["grpc_proxy", "https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY", "no_proxy", "NO_PROXY", "no_grpc_proxy"];
+  const saved = new Map(names.map((name) => [name, process.env[name]]));
+  for (const name of names) delete process.env[name];
+  process.env["grpc_proxy"] = proxy.url;
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const credential: StoredMachineCredential = {
+      machineId,
+      tenantId: "7d1b4cb4-a77d-4f53-af66-197e184683f4",
+      credential: `phg_m_${"r".repeat(43)}`,
+      ...relay,
+      createdAt: "2026-11-01T00:00:00.000Z",
+      consentProfile: "metadata",
+      consentPolicyVersion: "observer-policy-v1",
+      consentedAt: "2026-11-01T00:00:00.000Z",
+    };
+    await new FileCredentialStore(directory).save(credential);
+    await writeFile(serverAuthorityPath(directory), pinned.certificate);
+    // What the service starts with once the move rewrote its settings.
+    const environment = await connectionEnvironment({
+      PHIGON_DATA_DIR: directory,
+      PHIGON_CONTROL_PLANE_URL: relay.controlPlaneOrigin,
+      PHIGON_GRPC_URL: relay.grpcOrigin,
+    });
+    const config = loadConfig(environment);
+    assert.equal(config.tlsCaFile, serverAuthorityPath(directory));
+    assert.equal(config.grpcUrl.origin, relay.grpcOrigin);
+    const client = new ObserverStreamClient({ config, credentialStore: new FileCredentialStore(directory) });
+    const running = client.run(controller.signal);
+    assert.equal(await client.waitUntilReady(controller.signal), 0n);
+    controller.abort();
+    await running;
+    assert.deepEqual(proxy.tunnels, [`${grpcHost}:443`]);
+  } finally {
+    clearTimeout(deadline);
+    controller.abort();
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    trustServerAuthority(undefined);
+    server.forceShutdown();
+    await proxy.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("a reconnect waits at most its backoff, a minute at the longest, with some randomness", () => {
   assert.equal(reconnectDelay(60_000, () => 0), 60_000);
   assert.equal(reconnectDelay(60_000, () => 0.999_999), 45_001);
@@ -1652,10 +1774,14 @@ test("reconnect backoff starts over after a connection completed its handshake",
       const delay = /retrying in (\d+)ms/u.exec(message)?.[1];
       if (delay !== undefined) retries.push(Number(delay));
     } });
-  const deadline = setTimeout(() => controller.abort(), 8_000);
+  const deadline = setTimeout(() => controller.abort(), 10_000);
   try {
     await client.run(controller.signal);
-    assert.deepEqual(retries, [250, 500, 250]);
+    assert.equal(retries.length, 3, retries.join(", "));
+    assert.ok(retries[0]! > 187 && retries[0]! <= 250, String(retries[0]));
+    assert.ok(retries[1]! > 375 && retries[1]! <= 500, String(retries[1]));
+    // After the healthy connection dropped: anywhere in the first five seconds.
+    assert.ok(retries[2]! >= 0 && retries[2]! < 5_000, String(retries[2]));
     assert.equal(connecting, 2, "once per outage, not once per attempt");
     assert.ok(connections >= 3, `expected at least three connections, got ${connections}`);
   } finally { clearTimeout(deadline); controller.abort(); server.forceShutdown(); await rm(directory, { recursive:true, force:true }); }

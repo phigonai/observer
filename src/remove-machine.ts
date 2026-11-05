@@ -1,5 +1,6 @@
 import type { ObserverConfig } from "./config.js";
 import type { StoredMachineCredential } from "./credential-store.js";
+import { serverFetch } from "./server-fetch.js";
 
 export type RemoveMachineResult = Readonly<{
   /**
@@ -28,7 +29,7 @@ export async function removeMachine(options: Readonly<{
   }
 
   const endpoint = new URL("/v1/machine", options.config.controlPlaneUrl);
-  const fetcher = options.fetcher ?? fetch;
+  const fetcher = options.fetcher ?? serverFetch;
   let response: Response;
   try {
     response = await fetcher(endpoint, {

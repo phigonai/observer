@@ -10,6 +10,7 @@ import {
 import { retirePairingState } from "./event-spool.js";
 import { installationFileName, loadOrCreateInstallationID } from "./installation.js";
 import { InstanceLock } from "./instance-lock.js";
+import { serverFetch } from "./server-fetch.js";
 
 export const OBSERVER_CONSENT_POLICY_VERSION = "observer-policy-v1";
 export type ConsentProfile = "metadata" | "full";
@@ -93,7 +94,7 @@ export async function pairMachine(options: PairOptions): Promise<PairResult> {
     "/v1/pairing/exchange",
     options.config.controlPlaneUrl,
   );
-  const fetcher = options.fetcher ?? fetch;
+  const fetcher = options.fetcher ?? serverFetch;
   const connected = await connectMachine<ConnectedMachine>({
     config: options.config,
     endpoint,

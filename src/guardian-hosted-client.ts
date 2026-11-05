@@ -1,4 +1,5 @@
 import { connectionFailure, GuardianDecisionUnavailableError } from "./agentic-guardian.js";
+import { serverFetch } from "./server-fetch.js";
 
 /** A response the server sent with an error status. */
 class HostedStatusError extends Error {}
@@ -9,7 +10,7 @@ export class GuardianHostedClient {
   async post(path: string, body: unknown, signal?: AbortSignal, timeoutMs = 370_000): Promise<Record<string, unknown>> {
     try {
       const timeout = AbortSignal.timeout(timeoutMs);
-      const response = await (this.options.fetcher ?? fetch)(new URL(path, this.options.controlPlaneURL), {
+      const response = await (this.options.fetcher ?? serverFetch)(new URL(path, this.options.controlPlaneURL), {
         method: "POST", redirect: "error", headers: { Authorization: `Bearer ${this.options.credential}`, "Content-Type": "application/json" },
         body: JSON.stringify(body), signal: signal === undefined ? timeout : AbortSignal.any([timeout, signal]),
       });
