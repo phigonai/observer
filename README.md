@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://phigon.online">
-    <img src="https://phigon.online/brand/phigon-black.svg" alt="Phigon" width="64" />
+    <img src="https://raw.githubusercontent.com/phigonai/observer/main/docs/images/banner.jpg" alt="Phigon at the centre of the AI coding agents it watches: Claude Code, Codex, GitHub Copilot, Gemini CLI, Cursor, VS Code and more" width="100%" />
   </a>
 </p>
 
