@@ -1,9 +1,6 @@
 <p align="center">
   <a href="https://phigon.online">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://phigon.online/brand/phigon-white.svg" />
-      <img src="https://phigon.online/brand/phigon-black.svg" alt="Phigon" width="64" />
-    </picture>
+    <img src="https://phigon.online/brand/phigon-black.svg" alt="Phigon" width="64" />
   </a>
 </p>
 
@@ -17,6 +14,15 @@
   <a href="https://www.npmjs.com/package/@phigon/observer"><img alt="npm" src="https://img.shields.io/npm/v/@phigon/observer?color=000000&label=npm"></a>
   <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-000000"></a>
   <a href="https://github.com/phigonai/observer/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/phigonai/observer/actions/workflows/ci.yml/badge.svg"></a>
+</p>
+
+<p align="center">
+  <a href="https://phigon.online">Website</a> ·
+  <a href="https://phigon.online/docs/">Documentation</a> ·
+  <a href="https://github.com/phigonai/observer/blob/main/docs/cli.md">Command reference</a> ·
+  <a href="https://phigon.online/book/">Book a demo</a> ·
+  <a href="mailto:nikku@phigon.online">Email us</a> ·
+  <a href="https://x.com/phigonai">X</a>
 </p>
 
 The Phigon Observer runs on a computer where people use AI coding agents such as
@@ -37,6 +43,23 @@ exactly what runs on your computers and what leaves them.
   before anything is sent. Local settings can only narrow what is shared.
 - **Survives disconnects.** Activity waits in an encrypted local queue and is
   delivered, in order and without duplicates, when the connection returns.
+
+## About this repository
+
+This repository is a read-only mirror of the `observer/` folder in Phigon's
+private main repository:
+
+- **Development happens there.** A sync job copies each change that touches
+  the observer here as one commit with the same contents, so the code you read
+  here is exactly what is shipped.
+- **Releases come from here.** The sync maps release tags (`observer-vX.Y.Z`
+  there, `vX.Y.Z` here), and pushing `vX.Y.Z` publishes `@phigon/observer` to
+  npm from this repository, with provenance.
+- **Pull requests and issues are welcome here.** A maintainer applies an
+  accepted pull request in the main repository, keeping you as the author, and
+  it comes back here with the next sync; the pull request is then closed.
+- **Every commit is tested here.** CI runs the tests on Linux, macOS and
+  Windows for every synced commit and pull request.
 
 ## Supported agents
 
@@ -287,7 +310,9 @@ settings. A full description is in
 | `update [--check] [--yes]` | Checks for or installs a new release, then starts the background service again so it runs the new version. |
 | `remove-machine [--purge]` | Stops collection and revokes this computer's key. Activity already collected stays with the company until an administrator deletes the computer or it expires. `--purge` also removes the background service and the observer's local files; see [Uninstall](#uninstall). |
 
-Run `phigon-observer help` for every flag.
+Every command, option, exit code and setting is explained in the
+[command reference](https://github.com/phigonai/observer/blob/main/docs/cli.md).
+`phigon-observer help` prints the short form.
 
 ### Checking a computer from scripts
 
@@ -613,10 +638,19 @@ sh scripts/check-generated.sh
 
 ## Contributing
 
-Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first. This
-repository is published from Phigon's main repository; a maintainer applies
-accepted pull requests there, keeping you as the author, and they appear here
-automatically.
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first, and
+see [About this repository](#about-this-repository) for how a pull request
+reaches the code.
+
+## Getting help
+
+- [Documentation](https://phigon.online/docs/) and the
+  [command reference](https://github.com/phigonai/observer/blob/main/docs/cli.md)
+- [Book a demo](https://phigon.online/book/) to set Phigon up for your team,
+  or a call about a problem
+- Email [nikku@phigon.online](mailto:nikku@phigon.online), or
+  [@phigonai](https://x.com/phigonai) on X
+- Bugs and ideas: [GitHub issues](https://github.com/phigonai/observer/issues)
 
 ## Security
 
