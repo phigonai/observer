@@ -1,6 +1,7 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { once } from "node:events";
+import { serverFetch } from "./server-fetch.js";
 
 export async function startGuardianModelBridge(options: Readonly<{
   controlPlaneURL: URL; credential: string; agentId: string; provider: string;
@@ -37,7 +38,7 @@ export async function startGuardianModelBridge(options: Readonly<{
           chunks.push(data);
         }
         if (controller.signal.aborted) return;
-        const upstream = await (options.fetcher ?? fetch)(new URL(`/v1/machine/guardian/models/${options.provider}${request.url}`, options.controlPlaneURL), {
+        const upstream = await (options.fetcher ?? serverFetch)(new URL(`/v1/machine/guardian/models/${options.provider}${request.url}`, options.controlPlaneURL), {
           method: "POST", redirect: "error", headers: { Authorization: `Bearer ${options.credential}`, "Content-Type": "application/json", "X-Phigon-Agent-ID": options.agentId },
           body: Buffer.concat(chunks), signal: AbortSignal.any([controller.signal, AbortSignal.timeout(370_000)]),
         });

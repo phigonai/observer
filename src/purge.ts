@@ -18,6 +18,7 @@ const observerFiles = new Set([
   "machine-removed.json",
   "observer.lock",
   "server-ca.pem",
+  "server-endpoints.json",
   "service-settings.json",
   "stream-state.json",
   "telemetry-spool.jsonl",

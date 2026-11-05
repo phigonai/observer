@@ -3,6 +3,7 @@ import { chmod, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { atomicReplace } from "./atomic-replace.js";
 import type { StoredMachineCredential } from "./credential-store.js";
+import { serverFetch } from "./server-fetch.js";
 
 /**
  * Remembers that the workspace no longer accepts this computer's key, so a
@@ -95,7 +96,7 @@ export async function removedAtStart(options: Readonly<{
   if (Number.isFinite(confirmedAt) && sinceConfirmed >= 0 && sinceConfirmed < options.recheckAfterMs) {
     return "still_removed";
   }
-  const accepted = await keyAccepted(options.fetcher ?? fetch, options.controlPlaneUrl, options.machine.credential);
+  const accepted = await keyAccepted(options.fetcher ?? serverFetch, options.controlPlaneUrl, options.machine.credential);
   if (accepted === false) {
     await writeRemoved(path, { ...removed, confirmedAt: now.toISOString() });
     return "removed";

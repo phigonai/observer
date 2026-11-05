@@ -15,7 +15,7 @@ import {
   proxySettings,
   useProxyFromEnvironment,
 } from "../src/proxy.js";
-import { pinServerAuthority, trustAuthority } from "../src/server-authority.js";
+import { addDefaultAuthority, pinServerAuthority } from "../src/server-authority.js";
 import { serverCertificate, testAuthority, type TestCertificate } from "./support/certificates.js";
 import { startConnectProxy } from "./support/connect-proxy.js";
 
@@ -168,10 +168,10 @@ test("an older Node.js or an https:// proxy is explained instead of ignored", ()
   assert.match(secure.notice ?? "", /telemetry stream can use only an http:\/\/ proxy/u);
 });
 
-test("HTTPS goes through a CONNECT proxy and still checks the pinned authority", { skip: !nativeProxySupport && "needs Node.js 24.14" }, async () => {
+test("HTTPS goes through a CONNECT proxy and still checks the authorities it trusts", { skip: !nativeProxySupport && "needs Node.js 24.14" }, async () => {
   const authority = testAuthority();
   const stranger = testAuthority("Unrelated authority");
-  trustAuthority(authority.certificate);
+  addDefaultAuthority(authority.certificate);
   const trusted = await startHttpsServer(serverCertificate(authority));
   const untrusted = await startHttpsServer(serverCertificate(stranger));
   const proxy = await startConnectProxy();

@@ -17,6 +17,7 @@ import {
 } from "../src/doctor-check.js";
 import { InstanceLock } from "../src/instance-lock.js";
 import { serverAuthorityPath } from "../src/server-authority.js";
+import { trustServerAuthority } from "../src/server-fetch.js";
 import { StreamStateStore } from "../src/stream-state.js";
 import { serverCertificate, testAuthority } from "./support/certificates.js";
 
@@ -264,6 +265,43 @@ test("doctor says whether the owner or the company consented, with the code's la
       controlPlaneOrigin: origin, createdAt: "2026-11-01T00:00:00.000Z",
     });
     assert.match(await doctor([]), /^Consent: none current \(last given by the computer's owner, at pairing\)$/mu);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("doctor says plainly when the relay has no server or HTTPS is inspected on the way", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-doctor-relay-"));
+  const relayOrigin = "https://abcdefghabcdefgh.relay.phigon.online";
+  const failing = (code: string): typeof fetch => async () => {
+    throw Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error("socket hang up"), { code }) });
+  };
+  const probe = async (fetcher: typeof fetch, controlPlane = relayOrigin) => (await runDoctorCheck({
+    config: loadConfig({ PHIGON_CONTROL_PLANE_URL: controlPlane, PHIGON_DATA_DIR: directory }),
+    observerVersion: "9.9.9",
+    inspectLock: async () => ({ running: true }),
+    fetcher,
+  })).checks.find((item) => item.name === "control_plane")?.detail;
+  const notConnected = "The Phigon server is not connected to the relay right now (for example, the admin's computer is off).";
+  try {
+    assert.equal(await probe(failing("ECONNRESET")), notConnected);
+    assert.equal(await probe(failing("UND_ERR_SOCKET")), notConnected);
+    // Elsewhere a reset is just a reset.
+    assert.match(await probe(failing("ECONNRESET"), origin) ?? "", /\(ECONNRESET\)/u);
+    // Without a pinned authority, an unknown certificate is reported as it is.
+    trustServerAuthority(undefined);
+    assert.match(await probe(failing("UNABLE_TO_GET_ISSUER_CERT_LOCALLY")) ?? "", /\(UNABLE_TO_GET_ISSUER_CERT_LOCALLY\)/u);
+    trustServerAuthority(testAuthority("Phigon server authority DOCTOR").certificate);
+    try {
+      assert.equal(
+        await probe(failing("UNABLE_TO_GET_ISSUER_CERT_LOCALLY")),
+        "A proxy or security software on this network is inspecting HTTPS to abcdefghabcdefgh.relay.phigon.online, " +
+          "so this computer cannot check that it is your company's Phigon server. " +
+          "Ask your IT team to exempt *.relay.phigon.online from HTTPS inspection.",
+      );
+    } finally {
+      trustServerAuthority(undefined);
+    }
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

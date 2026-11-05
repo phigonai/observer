@@ -13,8 +13,10 @@ export type ConnectProxy = Readonly<{
 /**
  * A minimal HTTP proxy that only opens CONNECT tunnels, as a corporate
  * proxy does for HTTPS. It sees the target host and nothing inside TLS.
+ * `routes` sends a `host:port` to a port on this computer instead, for
+ * names that do not resolve here.
  */
-export async function startConnectProxy(): Promise<ConnectProxy> {
+export async function startConnectProxy(routes: Readonly<Record<string, number>> = {}): Promise<ConnectProxy> {
   const tunnels: string[] = [];
   const authorizations: (string | undefined)[] = [];
   const sockets = new Set<Socket>();
@@ -26,7 +28,8 @@ export async function startConnectProxy(): Promise<ConnectProxy> {
     tunnels.push(request.url ?? "");
     authorizations.push(request.headers["proxy-authorization"]);
     sockets.add(client);
-    const [host, port] = splitAuthority(request.url ?? "");
+    const routed = routes[request.url ?? ""];
+    const [host, port] = routed === undefined ? splitAuthority(request.url ?? "") : ["127.0.0.1", routed];
     const upstream = connect(port, host, () => {
       client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
       if (head.length > 0) upstream.write(head);

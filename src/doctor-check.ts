@@ -4,6 +4,8 @@ import { consentHealth, type ObserverConsentHealth } from "./health.js";
 import { InstanceLock, type InstanceLockHolder } from "./instance-lock.js";
 import { machineRemovedMessage, removalConfirmed } from "./machine-removed.js";
 import { OBSERVER_CONSENT_POLICY_VERSION } from "./pair.js";
+import { inspectionMessage, relayHost, relayNotConnectedMessage } from "./server-authority.js";
+import { serverFetch, trustedServerAuthority } from "./server-fetch.js";
 import { StreamStateStore } from "./stream-state.js";
 
 /**
@@ -149,7 +151,7 @@ export async function runDoctorCheck(options: DoctorCheckOptions): Promise<Docto
     }
   }
 
-  checks.push(await probeControlPlane(config.controlPlaneUrl, options.fetcher ?? fetch, options.probeTimeoutMs ?? probeTimeoutMs));
+  checks.push(await probeControlPlane(config.controlPlaneUrl, options.fetcher ?? serverFetch, options.probeTimeoutMs ?? probeTimeoutMs));
 
   const failed = checks.find((check) => check.status === "fail");
   return Object.freeze({
@@ -182,12 +184,33 @@ async function probeControlPlane(url: URL, fetcher: typeof fetch, timeoutMs: num
     }
     return pass("control_plane", `The control plane at ${url.origin} answered in ${Math.round(performance.now() - started)} ms.`);
   } catch (error) {
-    const reason = error instanceof Error && error.name === "TimeoutError"
+    const timedOut = error instanceof Error && error.name === "TimeoutError";
+    const code = errorCode(error);
+    // The relay closes a connection for a server that is not connected to it.
+    if (!timedOut && relayHost(url.hostname) && (code === "ECONNRESET" || code === "UND_ERR_SOCKET" || code === "EPIPE")) {
+      return fail("control_plane", relayNotConnectedMessage);
+    }
+    // Only the pinned authority is trusted, so a certificate it did not
+    // issue was re-signed on the way.
+    if (!timedOut && trustedServerAuthority() !== undefined && code !== undefined && untrustedChainCodes.has(code)) {
+      return fail("control_plane", inspectionMessage(url));
+    }
+    const reason = timedOut
       ? `no answer within ${Math.round(timeoutMs / 1_000)} seconds`
-      : errorCode(error) ?? "the connection failed";
+      : code ?? "the connection failed";
     return fail("control_plane", `Could not reach the control plane at ${url.origin} (${reason}).`);
   }
 }
+
+/** Node.js codes for a certificate chain that does not lead to a trusted authority. */
+const untrustedChainCodes = new Set([
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  "UNABLE_TO_GET_ISSUER_CERT",
+  "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+  "SELF_SIGNED_CERT_IN_CHAIN",
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "CERT_SIGNATURE_FAILURE",
+]);
 
 /** A system error code such as ENOTFOUND or a certificate error, never a message with data. */
 function errorCode(error: unknown): string | undefined {

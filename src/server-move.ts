@@ -4,11 +4,13 @@ import type * as tls from "node:tls";
 import type { ObserverConfig } from "./config.js";
 import { FileCredentialStore } from "./credential-store.js";
 import {
+  forgetServerAuthority,
   readServerAuthority,
   saveServerAuthority,
   savedAuthorityFingerprint,
   verifyServerAuthority,
 } from "./server-authority.js";
+import { trustServerAuthority } from "./server-fetch.js";
 
 /**
  * What a pairing needs to know about the server it is about to reach:
@@ -38,8 +40,8 @@ export type PairingAuthorityOptions = Readonly<{
 }>;
 
 /**
- * Reads the authority a pairing command names, and trusts it for this
- * process only. A computer paired with a server at another address may
+ * Reads the authority a pairing command names, and trusts it alone for the
+ * pairing's requests, in this process only. A computer paired with a server at another address may
  * follow it when that server proves it is the same one: it holds a
  * certificate from the authority pinned when the computer paired, which
  * the command names again. A server on this computer may also move between
@@ -56,7 +58,17 @@ export async function preparePairingAuthority(
   const pem = options.fingerprint === undefined
     ? undefined
     : await readServerAuthority(target, options.fingerprint, options.connect, authorityOptions);
+  const previous = await new FileCredentialStore(config.dataDirectory).load();
+  // A first pairing without a fingerprint is with a server whose certificate
+  // the system's authorities check: an authority left from an earlier
+  // pairing does not apply to it, and is forgotten once it succeeds.
+  const stale = pem === undefined && previous === null && savedAuthorityFingerprint(config.dataDirectory) !== undefined;
+  if (stale) trustServerAuthority(undefined);
   const commit = async () => {
+    if (stale) {
+      await forgetServerAuthority(config.dataDirectory).catch(() => undefined);
+      return;
+    }
     if (pem === undefined) return;
     try {
       await saveServerAuthority(config.dataDirectory, pem);
@@ -64,7 +76,6 @@ export async function preparePairingAuthority(
       throw new Error("This computer is paired, but the server's certificate authority could not be saved in the data directory. Run the same pair command again.");
     }
   };
-  const previous = await new FileCredentialStore(config.dataDirectory).load();
   if (previous === null || previous.controlPlaneOrigin === target.origin) {
     return { serverMoved: false, commit };
   }
