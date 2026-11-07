@@ -44,22 +44,6 @@ exactly what runs on your computers and what leaves them.
 - **Survives disconnects.** Activity waits in an encrypted local queue and is
   delivered, in order and without duplicates, when the connection returns.
 
-## About this repository
-
-This repository is a read-only mirror of the `observer/` folder in Phigon's
-private main repository:
-
-- **Development happens there.** A sync job copies each change that touches
-  the observer here as one commit with the same contents, so the code you read
-  here is exactly what is shipped.
-- **Releases come from here.** The sync maps release tags (`observer-vX.Y.Z`
-  there, `vX.Y.Z` here), and pushing `vX.Y.Z` publishes `@phigon/observer` to
-  npm from this repository, with provenance.
-- **Pull requests and issues are welcome here.** A maintainer applies an
-  accepted pull request in the main repository, keeping you as the author, and
-  it comes back here with the next sync; the pull request is then closed.
-- **Every commit is tested here.** CI runs the tests on Linux, macOS and
-  Windows for every synced commit and pull request.
 
 ## Supported agents
 
