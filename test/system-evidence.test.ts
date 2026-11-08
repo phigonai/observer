@@ -38,7 +38,9 @@ async function npmInstall(prefix: string, version: string): Promise<string> {
 }
 
 test("an npm-installed CLI's version comes from its package.json, without starting it", async () => {
-  const prefix = await mkdtemp(join(tmpdir(), "phigon-npm-prefix-"));
+  // The version is read from the real file, and macOS's temporary folder
+  // /var/folders is really /private/var/folders.
+  const prefix = await fsPromises.realpath(await mkdtemp(join(tmpdir(), "phigon-npm-prefix-")));
   // Every child process starts through this method.
   const spawned: string[] = [];
   const prototype = childProcess.ChildProcess.prototype as unknown as {
