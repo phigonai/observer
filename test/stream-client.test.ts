@@ -26,7 +26,7 @@ import type {
 } from "../src/credential-store.js";
 import { BoundedEventQueue } from "../src/event-queue.js";
 import { FileBackedEventQueue } from "../src/event-spool.js";
-import { PrivacyClass } from "../src/generated/phigon/v1/common_pb.js";
+import { ActivityKind, PrivacyClass } from "../src/generated/phigon/v1/common_pb.js";
 import {
   AgentInventorySchema,
   type AgentInventory,
@@ -54,6 +54,7 @@ import {
   PolicySnapshotSchema,
 } from "../src/generated/phigon/v1/policy_pb.js";
 import {
+  ActivityEventSchema,
   BrowserEventSchema,
   EventEnvelopeSchema,
   FilesystemEventSchema,
@@ -346,6 +347,7 @@ test("observer reconciles a restored server cursor and persists new acknowledgem
           "phg_m_0123456789012345678901234567890123456789012",
         controlPlaneOrigin: "http://127.0.0.1:8080",
         createdAt: new Date().toISOString(),
+        ...fullConsent,
       }),
       stateStore,
       queue,
@@ -923,6 +925,7 @@ test("observer waits for resume policy and sanitizes queued content", async () =
           "phg_m_0123456789012345678901234567890123456789012",
         controlPlaneOrigin: "http://127.0.0.1:8080",
         createdAt: new Date().toISOString(),
+        ...fullConsent,
       }),
       queue,
     });
@@ -976,6 +979,86 @@ test("observer waits for resume policy and sanitizes queued content", async () =
     await new Promise<void>((resolve) => {
       server.tryShutdown(() => resolve());
     });
+    await rm(dataDirectory, { recursive: true, force: true });
+  }
+});
+
+test("content queued under full consent is not sent after the computer was paired again with metadata only", async () => {
+  const dataDirectory = await mkdtemp(join(tmpdir(), "phigon-stream-narrowed-"));
+  const machineId = "5f1b4cb4-a77d-4f53-af66-197e184683f4";
+  const tenantId = "7d1b4cb4-a77d-4f53-af66-197e184683f4";
+  const server = new Server();
+  const controller = new AbortController();
+  const received: EventEnvelope[] = [];
+  server.addService(observerServiceDefinition, {
+    streamTelemetry(call: ServerDuplexStream<StreamTelemetryRequest, StreamTelemetryResponse>) {
+      call.on("data", (request: StreamTelemetryRequest) => {
+        if (request.payload.case === "resume") {
+          // The server's policy is the same for every computer: content allowed.
+          call.write(policySnapshot(machineId, {
+            promptContent: true, responseContent: true, commandArguments: true, toolOutput: true,
+            vendorPayload: true, filePaths: true, processMetadata: true,
+          }));
+          call.write(acknowledgement(machineId, 0n));
+        }
+        if (request.payload.case === "event") {
+          received.push(request.payload.value);
+          if (received.length === 3) controller.abort();
+        }
+      });
+      call.on("end", () => call.end());
+    },
+  });
+  const port = await bindServer(server);
+  try {
+    const queue = new FileBackedEventQueue(dataDirectory, 16);
+    const credential = `phg_m_${"1".repeat(43)}`;
+    queue.restore(tenantId, machineId, credential);
+    const envelope = (sequence: bigint, payload: EventEnvelope["payload"]) => create(EventEnvelopeSchema, {
+      tenantId, machineId, agentId: "agent-test", sessionId: "session-test", sequence,
+      observedAt: timestampFromDate(new Date()), schemaVersion: 1, privacyClass: PrivacyClass.USER_CONTENT, payload,
+    });
+    // Queued while the owner's consent covered full activity.
+    queue.enqueue(envelope(1n, { case: "activity", value: create(ActivityEventSchema, {
+      kind: ActivityKind.PROMPT, content: "queued private prompt",
+    }) }), 1n);
+    queue.enqueue(envelope(2n, { case: "tool", value: create(ToolEventSchema, {
+      invocationId: "call-test", toolName: "shell", phase: ToolPhase.SUCCEEDED,
+      argumentsJson: JSON.stringify({ command: "cat queued-private-file" }), output: JSON.stringify({ text: "queued private output" }),
+      resources: [create(ResourceReferenceSchema, { kind: "file", identifier: "/queued/private/path" })],
+    }) }), 2n);
+    queue.enqueue(envelope(3n, { case: "vendor", value: create(VendorEventSchema, {
+      source: "codex", vendorType: "response_item", sourceRecordDigest: "a".repeat(64),
+      payloadJson: JSON.stringify({ prompt: "queued private vendor prompt" }),
+    }) }), 3n);
+    queue.flush();
+    // Paired again, while offline, with the metadata profile; an old queue
+    // entry is read back as it was written.
+    const client = new ObserverStreamClient({
+      config: streamConfig(dataDirectory, port),
+      credentialStore: new StaticCredentialStore({
+        machineId, tenantId, credential, controlPlaneOrigin: "http://127.0.0.1:8080", createdAt: new Date().toISOString(),
+        consentProfile: "metadata", consentPolicyVersion: "observer-policy-v1", consentedAt: new Date().toISOString(),
+      }),
+      queue: new FileBackedEventQueue(dataDirectory, 16),
+    });
+    const deadline = setTimeout(() => controller.abort(), 10_000);
+    try {
+      await client.run(controller.signal);
+    } finally {
+      clearTimeout(deadline);
+    }
+    assert.equal(received.length, 3);
+    // Everything sent, as it went on the wire.
+    const sent = received.map((event) => Buffer.from(toBinary(EventEnvelopeSchema, event)).toString("utf8")).join("\n");
+    assert.doesNotMatch(sent, /queued private|queued-private|\/queued\/private/u);
+    const [prompt, tool, vendor] = received;
+    assert.equal(prompt?.payload.case === "activity" && prompt.payload.value.contentRedacted, true);
+    assert.equal(tool?.payload.case === "tool" && tool.payload.value.argumentsRedacted && tool.payload.value.outputRedacted, true);
+    assert.equal(vendor?.payload.case === "vendor" && vendor.payload.value.payloadOmitted, true);
+  } finally {
+    controller.abort();
+    server.forceShutdown();
     await rm(dataDirectory, { recursive: true, force: true });
   }
 });
@@ -1398,6 +1481,13 @@ test("observer refuses queue overflow before an unacknowledged event is evicted"
   assert.equal(queue.metrics().dropped, 0);
 });
 
+/** The owner consented to full activity, so queued content may be sent. */
+const fullConsent = {
+  consentProfile: "full",
+  consentPolicyVersion: "observer-policy-v1",
+  consentedAt: "2026-11-01T00:00:00.000Z",
+} as const;
+
 class StaticCredentialStore implements CredentialStore {
   readonly #value: StoredMachineCredential;
 
@@ -1559,7 +1649,8 @@ test("a clean server disconnect uses reconnect backoff instead of a busy loop", 
   let connections = 0; const messages: string[] = [];
   server.addService(observerServiceDefinition, { streamTelemetry(call: ServerDuplexStream<StreamTelemetryRequest, StreamTelemetryResponse>) { connections++; call.resume(); call.end(); } });
   const port = await bindServer(server);
-  const client = new ObserverStreamClient({ config:streamConfig(directory, port), credentialStore:testCredentialStore("machine"), onStatus: message => { messages.push(message); } });
+  // Waits of half their window: 125 ms, 250 ms, 500 ms.
+  const client = new ObserverStreamClient({ config:streamConfig(directory, port), credentialStore:testCredentialStore("machine"), reconnectRandom: () => 0.5, onStatus: message => { messages.push(message); } });
   const deadline = setTimeout(() => controller.abort(), 700);
   try {
     await client.run(controller.signal);
@@ -1574,7 +1665,8 @@ test("a stream that keeps failing the same way is logged once, not on every atte
   let connections = 0; const messages: string[] = [];
   server.addService(observerServiceDefinition, { streamTelemetry(call: ServerDuplexStream<StreamTelemetryRequest, StreamTelemetryResponse>) { connections++; call.resume(); call.end(); } });
   const port = await bindServer(server);
-  const client = new ObserverStreamClient({ config:streamConfig(directory, port), credentialStore:testCredentialStore("machine"), onStatus: message => { messages.push(message); } });
+  // Waits of half their window (125 ms, 250 ms), so a busy computer still fits several attempts.
+  const client = new ObserverStreamClient({ config:streamConfig(directory, port), credentialStore:testCredentialStore("machine"), reconnectRandom: () => 0.5, onStatus: message => { messages.push(message); } });
   const deadline = setTimeout(() => controller.abort(), 1_500);
   try {
     await client.run(controller.signal);
@@ -1589,9 +1681,9 @@ test("after a connection that worked drops, computers spread their first attempt
   assert.equal(reconnectDelay(250, () => 0, true), 0);
   assert.equal(reconnectDelay(250, () => 0.999_999, true), 4_999);
   assert.equal(reconnectDelay(4_000, () => 0.5, true), 2_500);
-  // Once the backoff is past five seconds, it grows as before, a minute at the longest.
-  assert.equal(reconnectDelay(8_000, () => 0, true), 8_000);
-  assert.equal(reconnectDelay(60_000, () => 0.999_999, true), 45_001);
+  // Once the backoff is past five seconds, the window grows with it, a minute at the longest.
+  assert.equal(reconnectDelay(8_000, () => 0.5, true), 4_000);
+  assert.equal(reconnectDelay(60_000, () => 0.999_999, true), 59_999);
   const spread = new Set<number>();
   for (let index = 0; index < 1_000; index++) {
     const delay = reconnectDelay(250, Math.random, true);
@@ -1698,14 +1790,18 @@ test("a background service restarted after a move to the relay trusts its pinned
   }
 });
 
-test("a reconnect waits at most its backoff, a minute at the longest, with some randomness", () => {
-  assert.equal(reconnectDelay(60_000, () => 0), 60_000);
-  assert.equal(reconnectDelay(60_000, () => 0.999_999), 45_001);
-  assert.equal(reconnectDelay(250, () => 0.5), 219);
+test("a reconnect waits any time up to its backoff, a minute at the longest", () => {
+  // Full jitter: computers that lost the same server spread over the whole window.
+  assert.equal(reconnectDelay(60_000, () => 0), 0);
+  assert.equal(reconnectDelay(60_000, () => 0.999_999), 59_999);
+  assert.equal(reconnectDelay(250, () => 0.5), 125);
+  const spread = new Set<number>();
   for (let index = 0; index < 1_000; index++) {
     const delay = reconnectDelay(60_000);
-    assert.ok(delay > 45_000 && delay <= 60_000, String(delay));
+    assert.ok(delay >= 0 && delay < 60_000, String(delay));
+    spread.add(Math.floor(delay / 10_000));
   }
+  assert.equal(spread.size, 6, "every part of the window is used");
 });
 
 test("only Node's warning about an IP address as the TLS server name is left out", async () => {
@@ -1747,16 +1843,19 @@ test("a stream the workspace refuses ends with a removed-computer error instead 
   } finally { server.forceShutdown(); await rm(directory, { recursive:true, force:true }); }
 });
 
-test("reconnect backoff starts over after a connection completed its handshake", async () => {
+/**
+ * Two failed attempts grow the backoff; the third connection completes its
+ * handshake and closes 50 ms later, as a restarting or failing control plane
+ * would. Returns the waits the observer announced, until it connects again.
+ */
+async function waitsAroundAHandshake(healthyStreamMs: number | undefined): Promise<number[]> {
   const directory = await mkdtemp(join(tmpdir(), "phigon-backoff-reset-"));
   const machineId = "5f1b4cb4-a77d-4f53-af66-197e184683f4";
   const server = new Server(); const controller = new AbortController();
   let connections = 0; const retries: number[] = [];
   server.addService(observerServiceDefinition, { streamTelemetry(call: ServerDuplexStream<StreamTelemetryRequest, StreamTelemetryResponse>) {
     connections++;
-    // Two failed attempts grow the backoff; the third connection is healthy
-    // and then closes, as a restarting control plane would. The two
-    // failures differ, so both are logged.
+    // The two failures differ, so both are logged.
     if (connections === 1) { call.resume(); call.end(); return; }
     if (connections === 2) { call.resume(); call.emit("error", { code: status.UNAVAILABLE, details: "server is starting" }); return; }
     call.on("data", (request: StreamTelemetryRequest) => {
@@ -1768,8 +1867,10 @@ test("reconnect backoff starts over after a connection completed its handshake",
   const port = await bindServer(server);
   let connecting = 0;
   const client = new ObserverStreamClient({ config:streamConfig(directory, port), credentialStore:testCredentialStore(machineId), queue:new BoundedEventQueue<EventEnvelope>(8),
+    ...(healthyStreamMs === undefined ? {} : { healthyStreamMs }),
+    reconnectRandom: () => 0.1,
     onStatus: message => {
-      // Said at the start, and again after the healthy connection ends.
+      // Said at the start, and again after the connection that worked ends.
       if (message.startsWith("Connecting telemetry") && ++connecting === 2) controller.abort();
       const delay = /retrying in (\d+)ms/u.exec(message)?.[1];
       if (delay !== undefined) retries.push(Number(delay));
@@ -1777,14 +1878,24 @@ test("reconnect backoff starts over after a connection completed its handshake",
   const deadline = setTimeout(() => controller.abort(), 10_000);
   try {
     await client.run(controller.signal);
-    assert.equal(retries.length, 3, retries.join(", "));
-    assert.ok(retries[0]! > 187 && retries[0]! <= 250, String(retries[0]));
-    assert.ok(retries[1]! > 375 && retries[1]! <= 500, String(retries[1]));
-    // After the healthy connection dropped: anywhere in the first five seconds.
-    assert.ok(retries[2]! >= 0 && retries[2]! < 5_000, String(retries[2]));
     assert.equal(connecting, 2, "once per outage, not once per attempt");
     assert.ok(connections >= 3, `expected at least three connections, got ${connections}`);
+    return retries;
   } finally { clearTimeout(deadline); controller.abort(); server.forceShutdown(); await rm(directory, { recursive:true, force:true }); }
+}
+
+test("reconnect backoff starts over after a connection stayed healthy", async () => {
+  const retries = await waitsAroundAHandshake(20);
+  // Each wait is a tenth of its window: 250 ms, then 500 ms; after the
+  // healthy connection dropped, anywhere in the first five seconds.
+  assert.deepEqual(retries, [25, 50, 500]);
+});
+
+test("a connection that drops soon after its handshake keeps the growing wait", async () => {
+  // A server that accepts streams and drops them at once must not have every
+  // computer straight back: the third wait is a tenth of a 1 s window.
+  const retries = await waitsAroundAHandshake(undefined);
+  assert.deepEqual(retries, [25, 50, 100]);
 });
 
 test("telemetry refuses a credential bound to another stream origin", async () => {

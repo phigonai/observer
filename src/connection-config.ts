@@ -18,10 +18,12 @@ export async function connectionEnvironment(
     result[name] = value;
   }
   const initial = loadConfig(result);
-  // A company's own server: trust the authority pinned when this computer paired.
-  const authority = trustSavedAuthority(initial.dataDirectory);
-  if (authority !== undefined) result["PHIGON_TLS_CA_FILE"] ||= authority;
   const credential = await new FileCredentialStore(initial.dataDirectory).load();
+  // A company's own server: trust the authority pinned when this computer
+  // paired, and only it. The stream trusts it too, whatever
+  // PHIGON_TLS_CA_FILE says (see streamTrust).
+  const authority = trustSavedAuthority(initial.dataDirectory, credential?.serverAuthoritySha256);
+  if (authority !== undefined) result["PHIGON_TLS_CA_FILE"] ||= authority;
   if (!credential) return result;
   result["PHIGON_CONTROL_PLANE_URL"] ||= credential.controlPlaneOrigin;
   if (credential.grpcOrigin) result["PHIGON_GRPC_URL"] ||= credential.grpcOrigin;

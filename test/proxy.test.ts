@@ -12,6 +12,7 @@ import {
   grpcNoProxy,
   noProxyForAll,
   proxyForUrl,
+  proxyPasswords,
   proxySettings,
   useProxyFromEnvironment,
 } from "../src/proxy.js";
@@ -319,4 +320,39 @@ test("commands refuse a malformed proxy address with a plain sentence", async ()
   assert.equal(code, 1);
   assert.match(stderr, /HTTPS_PROXY is not a valid proxy address/u);
   assert.doesNotMatch(stderr, new RegExp(secret, "u"));
+});
+
+test("a proxy password a remote command prints never leaves this computer", async () => {
+  const { redactCommandOutput } = await import("../src/machine-command-executor.js");
+  // Built at run time; one with characters a URL must encode.
+  const secret = ["Tr0ub4dor", "&3/x@y"].join("");
+  const encoded = encodeURIComponent(secret);
+  const names = ["HTTPS_PROXY", "https_proxy", "grpc_proxy"];
+  const saved = new Map(names.map((name) => [name, process.env[name]]));
+  try {
+    for (const name of names) delete process.env[name];
+    process.env["HTTPS_PROXY"] = `http://admin:${encoded}@proxy.example:3128`;
+    process.env["grpc_proxy"] = "proxy.example:3128";
+    assert.deepEqual(proxyPasswords(process.env), [encoded, secret]);
+    // A background service keeps the proxy in its settings and the command
+    // inherits it, so it can print the password in any form.
+    const output = redactCommandOutput(`decoded ${secret}\nencoded ${encoded}\nurl http://admin:${encoded}@proxy.example:3128\n`);
+    assert.ok(!output.includes(secret) && !output.includes(encoded), output);
+    assert.match(output, /proxy\.example:3128/u, "the proxy's address stays readable");
+    assert.deepEqual(proxyPasswords({ HTTP_PROXY: "http://proxy.example:3128", ALL_PROXY: "not a url[", PATH: `http://a:${encoded}@b` }), []);
+
+    // However short: printed alone it is masked, and words that only
+    // contain its letters stay readable.
+    process.env["HTTPS_PROXY"] = "http://admin:x1@proxy.example:3128";
+    assert.deepEqual(proxyPasswords(process.env), ["x1"]);
+    assert.equal(redactCommandOutput("x1\n"), "[REDACTED]\n");
+    assert.equal(redactCommandOutput("proxy x1, box1 x10 ax1"), "proxy [REDACTED], box1 x10 ax1");
+    process.env["HTTPS_PROXY"] = "http://admin:a.*@proxy.example:3128";
+    assert.equal(redactCommandOutput("pass a.* and aXX"), "pass [REDACTED] and aXX");
+  } finally {
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
 });

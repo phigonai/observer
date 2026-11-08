@@ -19,6 +19,7 @@ import {
   type ExchangeOutcome,
   type PairResult,
 } from "./pair.js";
+import { pairingAttempt } from "./installation.js";
 import { serverFetch } from "./server-fetch.js";
 import { plainText } from "./user-notices.js";
 
@@ -140,6 +141,10 @@ export type EnrollOptions = Readonly<{
   fetcher?: typeof fetch;
   /** See `ConnectOptions.serverMoved`. */
   serverMoved?: boolean;
+  /** See `ConnectOptions.storedKeyAllowed`. */
+  storedKeyAllowed?: boolean;
+  /** See `ConnectOptions.serverAuthoritySha256`. */
+  serverAuthoritySha256?: string | undefined;
   /** Called before each retry of a busy server, with the wait. */
   onRetry?: (waitMs: number, attempt: number) => void;
   sleep?: (ms: number) => Promise<void>;
@@ -163,6 +168,9 @@ export async function enrollMachine(options: EnrollOptions): Promise<EnrollResul
     fetcher,
     ...(options.credentialStore === undefined ? {} : { credentialStore: options.credentialStore }),
     ...(options.serverMoved === true ? { serverMoved: true } : {}),
+    ...(options.storedKeyAllowed === false ? { storedKeyAllowed: false } : {}),
+    attempt: pairingAttempt(code),
+    serverAuthoritySha256: options.serverAuthoritySha256,
     exchange: (installationID, existingCredential) => exchangeWithRetries(options, fetcher, endpoint, {
       enrollment_code: code,
       installation_id: installationID,

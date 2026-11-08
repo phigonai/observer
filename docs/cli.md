@@ -415,7 +415,7 @@ effect when it was installed.
 | --- | --- |
 | `PHIGON_DATA_DIR` | Where the observer keeps its key, settings, queue and logs. Default `~/.phigon/observer`. Use a separate folder for each workspace. |
 | `PHIGON_CONTROL_PLANE_URL`, `PHIGON_GRPC_URL` | The server's addresses. Pairing saves them; you rarely set them. |
-| `PHIGON_TLS_CA_FILE` | A private certificate authority for the stream. Pairing with `--server-ca-sha256` sets this up. |
+| `PHIGON_TLS_CA_FILE` | A private certificate authority for the stream. Pairing with `--server-ca-sha256` sets this up; a server paired that way is trusted under its pinned authority only, and this setting is not used for it. |
 | `PHIGON_TLS_CLIENT_CERT_FILE`, `PHIGON_TLS_CLIENT_KEY_FILE` | A client certificate, when the server requires mutual TLS. |
 | `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` | The company proxy. HTTPS goes through it as a tunnel, so certificate checks still apply. |
 | `grpc_proxy`, `no_grpc_proxy` | A different proxy for the stream only (an `http://` address). |

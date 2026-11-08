@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { lstat, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
@@ -22,13 +23,24 @@ export function verifyNativeHeader(bytes, platform, architecture) {
 }
 
 export async function verifyGuardianRelease() {
+  // The observer refuses to start a runner that does not match this.
+  let manifest;
+  try {
+    manifest = JSON.parse(await readFile(new URL("../dist/bin/guardian-runner.sha256.json", import.meta.url), "utf8"));
+  } catch {
+    throw new Error("Release requires dist/bin/guardian-runner.sha256.json. Build the runners with npm run build:platforms.");
+  }
   for (const platform of ["windows", "linux", "darwin"]) {
     for (const architecture of ["amd64", "arm64"]) {
       const name = `guardian-runner-${platform}-${architecture}${platform === "windows" ? ".exe" : ""}`;
       const file = new URL(`../dist/bin/${name}`, import.meta.url);
       const stat = await lstat(file);
       if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`Release requires a regular native executable: ${name}`);
-      verifyNativeHeader(await readFile(file), platform, architecture);
+      const bytes = await readFile(file);
+      verifyNativeHeader(bytes, platform, architecture);
+      if (manifest?.files?.[name] !== createHash("sha256").update(bytes).digest("hex")) {
+        throw new Error(`${name} does not match its checksum in guardian-runner.sha256.json. Build the runners again with npm run build:platforms.`);
+      }
       if (platform !== "windows" && (stat.mode & 0o111) !== 0o111) {
         throw new Error(`${name} lacks Unix executable permissions. Build and pack the portable release on Linux or macOS using the release workflow.`);
       }

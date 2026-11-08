@@ -1,7 +1,8 @@
 import { execFileSync } from "node:child_process";
 import { chmodSync } from "node:fs";
 import { chmod } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
+import { windowsSystemTool } from "./system-tools.js";
 
 // chmod only changes the read-only flag on Windows, so the credential store and
 // event spool would otherwise rely on the profile folder's default ACL. Owner
@@ -21,8 +22,7 @@ export function currentUserSID(): string | undefined {
     processUserSID = null;
     try {
       // By full path: Git for Windows puts another whoami on PATH.
-      const whoami = join(process.env["SystemRoot"] ?? "C:\\Windows", "System32", "whoami.exe");
-      const output = execFileSync(whoami, ["/user", "/fo", "csv", "/nh"], {
+      const output = execFileSync(windowsSystemTool("whoami.exe"), ["/user", "/fo", "csv", "/nh"], {
         encoding: "utf8",
         windowsHide: true,
         stdio: ["ignore", "pipe", "ignore"],
@@ -36,6 +36,17 @@ export function currentUserSID(): string | undefined {
   return processUserSID ?? undefined;
 }
 
+/**
+ * The icacls command that leaves `path` to `owner` and SYSTEM. icacls goes
+ * by its full path, never found in the current folder.
+ */
+export function restrictCommand(path: string, owner: string): Readonly<{ file: string; args: readonly string[] }> {
+  return {
+    file: windowsSystemTool("icacls.exe"),
+    args: [resolve(path), "/inheritance:r", "/grant:r", `${owner}:(OI)(CI)F`, "/grant:r", "*S-1-5-18:(OI)(CI)F"],
+  };
+}
+
 function restrictWindowsDirectory(path: string): void {
   const key = resolve(path).toLowerCase();
   if (restricted.has(key)) return;
@@ -44,11 +55,8 @@ function restrictWindowsDirectory(path: string): void {
     ? `${process.env["USERDOMAIN"] ?? ""}\\${process.env["USERNAME"] ?? ""}`
     : `*${sid}`;
   try {
-    execFileSync(
-      "icacls",
-      [resolve(path), "/inheritance:r", "/grant:r", `${owner}:(OI)(CI)F`, "/grant:r", "*S-1-5-18:(OI)(CI)F"],
-      { windowsHide: true, stdio: "ignore", timeout: 15_000 },
-    );
+    const command = restrictCommand(path, owner);
+    execFileSync(command.file, command.args, { windowsHide: true, stdio: "ignore", timeout: 15_000 });
   } catch {
     // Storing a credential or activity under an open ACL would defeat the
     // point of this directory, so refuse instead of continuing silently.

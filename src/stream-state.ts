@@ -2,11 +2,14 @@ import { makeDirectoryPrivate } from "./private-directory.js";
 import {
   chmod,
   mkdir,
+  readdir,
   readFile,
+  rm,
+  stat,
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { atomicReplace } from "./atomic-replace.js";
 
@@ -19,6 +22,9 @@ export type StreamState = Readonly<{
 
 /** The stream cursor's file name in the data directory. */
 export const streamStateFileName = "stream-state.json";
+
+/** How many copies of unreadable cursors are kept beside it, newest first. */
+export const maxCorruptStreamStateCopies = 3;
 
 export class StreamStateStore {
   readonly #dataDirectory: string;
@@ -101,14 +107,50 @@ export class StreamStateStore {
     if (acknowledgedSequence === undefined || acknowledgedSequence < 0n) {
       throw new Error("Stored stream state is invalid and has no verified delivery checkpoint.");
     }
-    await writeFile(`${this.#path}.${randomUUID()}.corrupt`, raw, {
-      encoding: "utf8", flag: "wx", mode: 0o600, flush: true,
-    });
+    await this.#keepCorruptCopy(raw);
     if (acknowledgedSequence === 0n) {
       return { machineId, acknowledgedSequence, updatedAt: new Date(0).toISOString(), recoveryPending: true };
     }
     await this.save(machineId, acknowledgedSequence);
     return { machineId, acknowledgedSequence, updatedAt: new Date().toISOString() };
+  }
+
+  /**
+   * Keeps the unreadable cursor for whoever looks into it. While recovery
+   * waits for the server, every reconnect reads the same file again, so a
+   * copy is named after its content and written once; only the newest few
+   * copies are kept.
+   */
+  async #keepCorruptCopy(raw: string): Promise<void> {
+    const digest = createHash("sha256").update(raw, "utf8").digest("hex").slice(0, 32);
+    const copy = `${this.#path}.${digest}.corrupt`;
+    try {
+      await writeFile(copy, raw, {
+        encoding: "utf8", flag: "wx", mode: 0o600, flush: true,
+      });
+    } catch (error) {
+      if (isNodeError(error) && error.code === "EEXIST") return;
+      throw error;
+    }
+    await this.#pruneCorruptCopies(copy).catch(() => undefined);
+  }
+
+  /** Removes all but the newest copies; `kept`, just written, always stays. */
+  async #pruneCorruptCopies(kept: string): Promise<void> {
+    const prefix = `${streamStateFileName}.`;
+    const copies = await Promise.all(
+      (await readdir(this.#dataDirectory))
+        .filter((name) => name.startsWith(prefix) && name.endsWith(".corrupt"))
+        .map((name) => join(this.#dataDirectory, name))
+        .filter((path) => path !== kept)
+        .map(async (path) => {
+          return { path, modified: (await stat(path).catch(() => undefined))?.mtimeMs ?? 0 };
+        }),
+    );
+    copies.sort((a, b) => b.modified - a.modified);
+    for (const older of copies.slice(maxCorruptStreamStateCopies - 1)) {
+      await rm(older.path, { force: true });
+    }
   }
 
   async save(

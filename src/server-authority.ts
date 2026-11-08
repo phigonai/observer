@@ -5,7 +5,15 @@ import { isIP, type Socket } from "node:net";
 import { join } from "node:path";
 import * as tls from "node:tls";
 import { connectThroughProxy } from "./proxy.js";
-import { trustServerAuthority } from "./server-fetch.js";
+import { pinnedAuthorityMissingMessage, RELAY_DOMAIN, relayHost } from "./relay-host.js";
+import { refuseServerRequests, trustServerAuthority } from "./server-fetch.js";
+
+export {
+  pinnedAuthorityMissingMessage,
+  RELAY_DOMAIN,
+  relayHost,
+  relayNeedsAuthorityMessage,
+} from "./relay-host.js";
 
 /**
  * A company's own Phigon server (run by the Phigon app) signs its HTTPS
@@ -17,9 +25,6 @@ export const SERVER_AUTHORITY_FILE = "server-ca.pem";
 
 /** What the observer learned about where its server answers (server-endpoints.ts). */
 export const SERVER_ENDPOINTS_FILE = "server-endpoints.json";
-
-/** Phigon's relay, which reaches a Phigon app's server from any network. */
-export const RELAY_DOMAIN = "relay.phigon.online";
 
 const FINGERPRINT = /^[0-9a-f]{64}$/u;
 
@@ -61,16 +66,18 @@ export function addDefaultAuthority(pem: string): void {
 /**
  * Trusts the authority saved when this computer paired for requests to its
  * server, and returns its file; without one, requests use the system's
- * authorities.
+ * authorities, except to an address on Phigon's relay. A machine key
+ * issued under a pinned authority (`issuedUnder`) is never sent under any
+ * other: when the saved one is missing or changed, requests are refused.
  */
-export function trustSavedAuthority(dataDirectory: string): string | undefined {
+export function trustSavedAuthority(dataDirectory: string, issuedUnder?: string): string | undefined {
   const file = serverAuthorityPath(dataDirectory);
-  if (!existsSync(file)) {
-    trustServerAuthority(undefined);
-    return undefined;
+  const pem = existsSync(file) ? readFileSync(file, "utf8") : undefined;
+  trustServerAuthority(pem);
+  if (issuedUnder !== undefined && (pem === undefined || authorityFingerprint(pem) !== issuedUnder)) {
+    refuseServerRequests(pinnedAuthorityMissingMessage);
   }
-  trustServerAuthority(readFileSync(file, "utf8"));
-  return file;
+  return pem === undefined ? undefined : file;
 }
 
 /** Forgets the pinned authority and what was learned about its server's addresses. */
@@ -96,11 +103,6 @@ export function authorityFingerprint(pem: string): string | undefined {
   } catch {
     return undefined;
   }
-}
-
-/** Whether `hostname` is a server's name on Phigon's relay. */
-export function relayHost(hostname: string, domain = RELAY_DOMAIN): boolean {
-  return hostname.toLowerCase().endsWith(`.${domain}`);
 }
 
 /** Why a server on the relay cannot be reached: the relay closed the connection. */

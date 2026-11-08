@@ -4,6 +4,7 @@ import {
   mkdir,
   readFile,
   rename,
+  stat,
   unlink,
   writeFile,
 } from "node:fs/promises";
@@ -36,6 +37,13 @@ export type StoredMachineCredential = Readonly<{
    * Pairings made before it was asked have none, and allow neither.
    */
   remoteActions?: RemoteActionConsent;
+  /**
+   * The SHA-256 of the certificate authority pinned when this computer
+   * paired (`--server-ca-sha256`). The key is issued under it and never
+   * sent under any other; without it, the saved server-ca.pem decides, and
+   * the system's authorities when there is none. Older observers ignore it.
+   */
+  serverAuthoritySha256?: string;
 }>;
 
 /** "none", "stop_agents" (stop and force-stop agents), or "all" (also run approved commands). */
@@ -63,14 +71,16 @@ export class FileCredentialStore implements CredentialStore {
   readonly #dataDirectory: string;
   readonly #credentialPath: string;
   readonly #rename: typeof rename;
+  readonly #chmod: typeof chmod;
 
   constructor(
     dataDirectory: string,
-    options: Readonly<{ rename?: typeof rename }> = {},
+    options: Readonly<{ rename?: typeof rename; chmod?: typeof chmod }> = {},
   ) {
     this.#dataDirectory = dataDirectory;
     this.#credentialPath = join(dataDirectory, credentialFileName);
     this.#rename = options.rename ?? rename;
+    this.#chmod = options.chmod ?? chmod;
   }
 
   async save(value: StoredMachineCredential): Promise<void> {
@@ -116,7 +126,38 @@ export class FileCredentialStore implements CredentialStore {
       throw new Error("Stored machine pairing data is unreadable. Restore the credential file from a trusted backup; keep the existing data directory and queued activity.");
     }
     validateCredential(value);
+    await this.#keepPrivate();
     return value;
+  }
+
+  /**
+   * The key is kept in this file, and the queue's encryption key is derived
+   * from it, so only its owner may read either. A directory restored from a
+   * backup or copied by hand can come back readable by others; it is made
+   * owner-only again on the first read instead of at the next pairing.
+   * Windows restricts the data directory itself (private-directory.ts) on
+   * every write.
+   *
+   * The operating system's key store is not used for it: a background
+   * service must never wait on a keychain prompt (the macOS Keychain asks
+   * again whenever Node.js is updated), libsecret needs a desktop session a
+   * systemd user service often lacks, and DPAPI is reachable from Node.js
+   * only through PowerShell, which managed computers often lock down, and
+   * loses what it protected when an administrator resets the account's
+   * password. Each would risk the key and the queue it decrypts.
+   */
+  async #keepPrivate(): Promise<void> {
+    if (process.platform === "win32") return;
+    // A key others can still read, or one in a folder others can write to
+    // (and so swap files in), is not used: it may already be known to them.
+    const file = await tightened(this.#credentialPath, 0o600, 0o077, this.#chmod);
+    const directory = await tightened(this.#dataDirectory, 0o700, 0o022, this.#chmod);
+    if (!file || !directory) {
+      throw new Error(
+        "This computer's Phigon machine key is readable by other users, or kept in a folder they can change, and its permissions could not be fixed. " +
+          `Make ${this.#dataDirectory} and the files in it belong to the account the observer runs as, then run the observer again.`,
+      );
+    }
   }
 
   async clear(): Promise<boolean> {
@@ -184,6 +225,26 @@ function validateCredential(
       (value.remoteActions !== "none" && value.remoteActions !== "stop_agents" && value.remoteActions !== "all"))
   ) {
     throw new Error("Stored machine consent evidence is invalid.");
+  }
+  if (
+    "serverAuthoritySha256" in value &&
+    (typeof value.serverAuthoritySha256 !== "string" || !/^[0-9a-f]{64}$/u.test(value.serverAuthoritySha256))
+  ) {
+    throw new Error("Stored server certificate authority is invalid.");
+  }
+}
+
+/**
+ * Sets `path` to `mode` when any of the `exposed` permission bits is set,
+ * and says whether none is set afterwards.
+ */
+async function tightened(path: string, mode: number, exposed: number, change: typeof chmod): Promise<boolean> {
+  try {
+    if (((await stat(path)).mode & exposed) === 0) return true;
+    await change(path, mode);
+    return ((await stat(path)).mode & exposed) === 0;
+  } catch {
+    return false;
   }
 }
 

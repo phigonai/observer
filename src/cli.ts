@@ -1227,6 +1227,8 @@ export async function run(
         consentProfile,
         remoteActions,
         serverMoved: pairingAuthority.serverMoved,
+        storedKeyAllowed: pairingAuthority.storedKeyAllowed,
+        serverAuthoritySha256: pairingAuthority.keyAuthority,
         ...(displayName === undefined ? {} : { displayName }),
       });
       await pairingAuthority.commit();
@@ -1383,6 +1385,8 @@ async function enrollWithCode(
     observerVersion: version,
     remoteActions,
     serverMoved: pairingAuthority.serverMoved,
+    storedKeyAllowed: pairingAuthority.storedKeyAllowed,
+    serverAuthoritySha256: pairingAuthority.keyAuthority,
     ...(displayName === undefined ? {} : { displayName }),
     onRetry: (waitMs) => output.stderr(
       `The Phigon server is busy. Trying again in ${Math.ceil(waitMs / 1_000)} seconds.\n`,
@@ -1431,7 +1435,7 @@ function formatEnrollResult(result: EnrollResult, remoteActions: RemoteActionCon
     ...(result.replacedMachineId === undefined
       ? []
       : [
-          `Earlier machine: ${result.replacedMachineId} (the workspace no longer accepted its key)`,
+          `Earlier machine: ${result.replacedMachineId} (${result.newServerAuthority === true ? "the server at this address has another certificate authority, so its key was not sent there" : "the workspace no longer accepted its key"})`,
           "This computer was enrolled as a new machine. Activity the earlier machine had not delivered was moved to the retired-pairings folder in the data directory.",
         ]),
     "Next step: phigon-observer service install",
@@ -1902,7 +1906,7 @@ function formatPairResult(
     ...(result.replacedMachineId === undefined
       ? []
       : [
-          `Earlier machine: ${result.replacedMachineId} (the workspace no longer accepted its key)`,
+          `Earlier machine: ${result.replacedMachineId} (${result.newServerAuthority === true ? "the server at this address has another certificate authority, so its key was not sent there" : "the workspace no longer accepted its key"})`,
           "This computer was paired as a new machine. Activity the earlier machine had not delivered was moved to the retired-pairings folder in the data directory.",
         ]),
     ...(observerRestarts

@@ -4,6 +4,7 @@ import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { guardianRunnerPath } from "./guardian-native.js";
 import { parseTreeReport } from "./process-tree.js";
+import { maskPassword, proxyPasswords } from "./proxy.js";
 import { mkdir, readFile, readdir, lstat, unlink, writeFile, type rename } from "node:fs/promises";
 import { formatInspection, inspectSystem, type RunningAgents } from "./system-inspection.js";
 import { join } from "node:path";
@@ -183,6 +184,8 @@ export function powerCommand(restart: boolean): CommandSpec {
 export function redactCommandOutput(value: string): string {
   let safe = redactSecrets(value, "[REDACTED]");
   for (const [key, secret] of Object.entries(process.env)) if (credentialEnvironmentName(key) && secret && secret.length >= 8) safe = safe.split(secret).join("[REDACTED]");
+  // The proxy the command inherits, which a background service keeps in its settings.
+  for (const password of proxyPasswords(process.env)) safe = maskPassword(safe, password);
   // The paired credential lives in the data directory, not the environment;
   // redactSecrets masks its phg_m_ prefix wherever it is printed.
   return safe;
@@ -241,7 +244,9 @@ export async function runCommand(spec: CommandSpec): Promise<CommandExecution> {
         // unrelated process whose dead parent's PID our command reused. The
         // helper accepts only our direct child and descendants created after
         // their parent. Our own child is still held, so killing it is safe.
-        execFile(guardianRunnerPath(), ["--kill-pid", String(child.pid), "--own-child", "--tree"], { windowsHide: true, timeout: 15_000, maxBuffer: 16 << 10, encoding: "utf8" },
+        let runner: string;
+        try { runner = guardianRunnerPath(); } catch { child.kill(); return; }
+        execFile(runner, ["--kill-pid", String(child.pid), "--own-child", "--tree"], { windowsHide: true, timeout: 15_000, maxBuffer: 16 << 10, encoding: "utf8" },
           (error, stdout) => { if (error !== null || parseTreeReport(stdout).outcome !== "dispatched") child.kill(); });
       } else { try { if (child.pid) process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); } }
     }, spec.timeout_seconds * 1000);

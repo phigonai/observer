@@ -1,4 +1,5 @@
-import { mkdirSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -20,3 +21,11 @@ for (const os of targets) {
     if (result.status !== 0) process.exit(result.status ?? 1);
   }
 }
+
+// The observer checks a runner against this before it first starts it
+// (src/guardian-native.ts), and a release against it (verify-guardian-release.mjs).
+const files = {};
+for (const name of readdirSync(destination).filter((entry) => /^guardian-runner-(windows|linux|darwin)-(amd64|arm64)(\.exe)?$/u.test(entry)).sort()) {
+  files[name] = createHash("sha256").update(readFileSync(destination + name)).digest("hex");
+}
+writeFileSync(destination + "guardian-runner.sha256.json", `${JSON.stringify({ version: 1, files }, null, 2)}\n`);

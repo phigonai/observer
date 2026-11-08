@@ -1,5 +1,6 @@
 import { Agent, ProxyAgent, fetch as undiciFetch, type Dispatcher } from "undici";
 import { proxyForUrl, type ProxySettings } from "./proxy.js";
+import { relayHost, relayNeedsAuthorityMessage } from "./relay-host.js";
 
 /**
  * HTTPS to a company's own Phigon server. Its certificates come from the
@@ -59,6 +60,8 @@ export function pinnedFetch(authority: string, proxyFor: ProxyFor = () => undefi
 
 let pinned: Readonly<{ authority: string; fetch: PinnedFetch }> | undefined;
 let proxy: ProxySettings | undefined;
+/** Why HTTPS requests to the paired server are refused, when they are. */
+let refusal: string | undefined;
 
 /**
  * The authority requests to the paired server trust from now on, in this
@@ -66,11 +69,23 @@ let proxy: ProxySettings | undefined;
  * system's authorities check as usual.
  */
 export function trustServerAuthority(authority: string | undefined): void {
+  refusal = undefined;
   if (pinned?.authority === authority) return;
   void pinned?.fetch.close();
   pinned = authority === undefined
     ? undefined
     : { authority, fetch: pinnedFetch(authority, (url) => proxy === undefined ? undefined : proxyForUrl(url, proxy)) };
+}
+
+/**
+ * Refuses every HTTPS request to the paired server with `message` until an
+ * authority is trusted again: the computer was paired under an authority it
+ * no longer has, and the system's authorities must not stand in for it.
+ */
+export function refuseServerRequests(message: string): void {
+  void pinned?.fetch.close();
+  pinned = undefined;
+  refusal = message;
 }
 
 /** The authority `serverFetch` trusts, if one is pinned. */
@@ -85,7 +100,15 @@ export function useServerProxy(settings: ProxySettings | undefined): void {
 
 /**
  * Fetch for requests to the server this computer is paired with: only the
- * pinned authority when there is one, otherwise the global fetch.
+ * pinned authority when there is one, otherwise the global fetch. Without
+ * one, an address on Phigon's relay is refused: TLS through the relay runs
+ * end to end with the company's server, so a public certificate for its
+ * name proves nothing.
  */
-export const serverFetch: typeof fetch = (input, init) =>
-  pinned === undefined ? fetch(input, init) : pinned.fetch(input, init);
+export const serverFetch: typeof fetch = async (input, init) => {
+  if (pinned !== undefined) return await pinned.fetch(input, init);
+  const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
+  if (url.protocol === "https:" && refusal !== undefined) throw new Error(refusal);
+  if (url.protocol === "https:" && relayHost(url.hostname)) throw new Error(relayNeedsAuthorityMessage);
+  return await fetch(input, init);
+};

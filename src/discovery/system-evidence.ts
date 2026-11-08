@@ -24,6 +24,7 @@ import {
   type ScriptProcess,
 } from "./script-package.js";
 import { guardianRunnerPath } from "../guardian-native.js";
+import { windowsPowerShell } from "../system-tools.js";
 
 const execFileAsync = promisify(execFile);
 const executableNamePattern = /^[a-zA-Z0-9._+-]{1,128}$/;
@@ -547,7 +548,7 @@ export async function runPowerShellProcessListing(): Promise<string> {
     "ConvertTo-Json -Compress",
   ].join(" | ");
   const { stdout } = await execFileAsync(
-    "powershell.exe",
+    windowsPowerShell(),
     ["-NoProfile", "-NonInteractive", "-Command", script],
     {
       timeout: 15_000,
@@ -681,7 +682,7 @@ async function readVersion(executablePath: string): Promise<string> {
       : undefined;
     if (script !== undefined) await access(script, constants.F_OK);
     const execution = execFileAsync(
-      script === undefined ? executablePath : "powershell.exe",
+      script === undefined ? executablePath : windowsPowerShell(),
       script === undefined ? ["--version"] : ["-NoProfile", "-NonInteractive", "-File", script, "--version"],
       {
         // Starting PowerShell alone can take several seconds on a busy or

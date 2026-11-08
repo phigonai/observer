@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { readFile, statfs } from "node:fs/promises";
 import { arch, cpus, freemem, hostname, loadavg, platform, release, totalmem, uptime, type CpuInfo } from "node:os";
+import { windowsPowerShell } from "./system-tools.js";
 
 /**
  * inspect_system report. Every field from the first version keeps its name
@@ -230,7 +231,7 @@ async function sampleWindowsProcesses(processIds: readonly number[], windowMs: n
     "$e = $w.Elapsed.TotalMilliseconds; $b = @(Read-Agents)",
     "ConvertTo-Json -Compress -Depth 3 -InputObject @{ a = $a; b = $b; e = $e }",
   ].join("\n");
-  const stdout = await run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {});
+  const stdout = await run(windowsPowerShell(), ["-NoProfile", "-NonInteractive", "-Command", script], {});
   return parseWindowsSample(stdout);
 }
 

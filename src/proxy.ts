@@ -57,6 +57,47 @@ function proxyURL(value: string | undefined, name: string): URL | undefined {
   return url;
 }
 
+/**
+ * The passwords in the proxy addresses `environment` names (HTTPS_PROXY,
+ * HTTP_PROXY, grpc_proxy, ALL_PROXY, any case), as written and decoded, so
+ * output that leaves this computer can mask them. Commands an administrator
+ * runs here inherit the proxy to reach the network, and could print its
+ * password in a form the URL rule in redactSecrets does not see.
+ */
+export function proxyPasswords(environment: NodeJS.ProcessEnv): readonly string[] {
+  const found = new Set<string>();
+  for (const [name, value] of Object.entries(environment)) {
+    if (!/^(?:https?|grpc|all)_proxy$/iu.test(name) || value === undefined) continue;
+    let url: URL;
+    try {
+      url = new URL(/^[a-z][a-z0-9+.-]*:\/\//iu.test(value.trim()) ? value.trim() : `http://${value.trim()}`);
+    } catch {
+      continue;
+    }
+    if (url.password === "") continue;
+    found.add(url.password);
+    try {
+      found.add(decodeURIComponent(url.password));
+    } catch {
+      // Written with a stray %; the form as written is masked.
+    }
+  }
+  return [...found];
+}
+
+/**
+ * Masks `password` in `text`: one of four characters or more wherever it
+ * appears, and a shorter one wherever it stands as a word of its own, so a
+ * command that prints it alone or in a list still leaves nothing, while
+ * words that merely contain those letters stay readable.
+ */
+export function maskPassword(text: string, password: string, marker = "[REDACTED]"): string {
+  if (password === "") return text;
+  if (password.length >= 4) return text.split(password).join(marker);
+  const literal = password.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  return text.replace(new RegExp(`(?<![\\p{L}\\p{N}])${literal}(?![\\p{L}\\p{N}])`, "gu"), marker);
+}
+
 /** Reads HTTPS_PROXY, HTTP_PROXY and NO_PROXY (either case) from `environment`. */
 export function proxySettings(environment: NodeJS.ProcessEnv): ProxySettings {
   const httpsProxy = proxyURL(variable(environment, variables.https), "HTTPS_PROXY");

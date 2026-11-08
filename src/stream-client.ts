@@ -8,6 +8,7 @@ import {
 import { createHash, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { isIP } from "node:net";
+import { resolve as resolvePath } from "node:path";
 import {
   clone,
   create,
@@ -17,7 +18,7 @@ import {
 import { timestampDate, timestampFromDate } from "@bufbuild/protobuf/wkt";
 import { abortableDelay } from "./abortable-delay.js";
 import type { AgentActionExecutor } from "./agent-action-executor.js";
-import { DEFAULT_CONTROL_PLANE_ORIGIN, type ObserverConfig } from "./config.js";
+import { CONTENT_COLLECTION_CATEGORIES, DEFAULT_CONTROL_PLANE_ORIGIN, type ObserverConfig } from "./config.js";
 import {
   ActionCapabilityManifestSchema,
   AgentActionResultSchema,
@@ -33,6 +34,7 @@ import { LocalPolicyEngine } from "./activity/policy.js";
 import {
   FileCredentialStore,
   type CredentialStore,
+  type StoredMachineCredential,
 } from "./credential-store.js";
 import type { BoundedEventQueue, QueueMetrics } from "./event-queue.js";
 import { FileBackedEventQueue, type SpoolRestoreNotice } from "./event-spool.js";
@@ -58,6 +60,7 @@ import {
 } from "./generated/phigon/v1/observer_service_pb.js";
 import {
   ActionGuardrailPolicySchema,
+  CollectionPolicySchema,
   GuardrailIntervention,
   ManagedAction,
   type ActionGuardrailPolicy,
@@ -75,7 +78,15 @@ import {
   type ResourceReference,
 } from "./generated/phigon/v1/telemetry_pb.js";
 import { MachineRemovedError } from "./machine-removed.js";
-import { inspectionMessage, relayHost, relayNotConnectedMessage } from "./server-authority.js";
+import {
+  authorityFingerprint,
+  inspectionMessage,
+  pinnedAuthorityMissingMessage,
+  relayHost,
+  relayNeedsAuthorityMessage,
+  relayNotConnectedMessage,
+  serverAuthorityPath,
+} from "./server-authority.js";
 import type { ServerClock } from "./server-clock.js";
 import { StreamStateStore } from "./stream-state.js";
 import { noProxyForAll } from "./proxy.js";
@@ -94,6 +105,13 @@ export const streamStateRefreshMs = 60 * 1_000;
 const maxReconnectDelayMs = 60_000;
 // The same reason for being disconnected is logged again after this long.
 const failureRepeatMs = 30 * 60_000;
+/**
+ * How long a stream must stay connected before a disconnect starts a new
+ * outage with the shortest wait. A server that accepts the stream and then
+ * drops it at once (overloaded, or failing after the handshake) keeps the
+ * growing wait, so its computers do not all come straight back.
+ */
+export const healthyStreamMs = 30_000;
 
 export type ObserverStreamMetrics = Readonly<{
   reconnects: number;
@@ -135,6 +153,10 @@ export type StreamClientOptions = Readonly<{
   responseTimeoutMs?: number;
   /** This observer's version, sent with every heartbeat. */
   observerVersion?: string;
+  /** See `healthyStreamMs`; tests shorten it. */
+  healthyStreamMs?: number;
+  /** Picks each reconnect wait (`reconnectDelay`); Math.random unless a test fixes it. */
+  reconnectRandom?: () => number;
 }>;
 
 export class ObserverStreamClient {
@@ -167,9 +189,12 @@ export class ObserverStreamClient {
   #sendInventory: ((inventory: AgentInventory) => void) | undefined;
   #readySequence: bigint | undefined;
   #establishedSinceConnect = false;
+  /** When the current connection completed its handshake. */
+  #establishedAt = 0;
   // While the stream stays down, its attempts are not logged one by one:
   // only a new reason, or the same one again after a long while.
   #reconnectingQuietly = false;
+  #ignoredCaFileNoticed = false;
   #lastLoggedFailure: Readonly<{ summary: string; at: number }> | undefined;
   readonly #readyWaiters = new Set<(sequence: bigint) => void>();
   readonly #handshakeTimeoutMs: number;
@@ -177,8 +202,12 @@ export class ObserverStreamClient {
   readonly #responseTimeoutMs: number;
   readonly #serverClock: ServerClock | undefined;
   readonly #observerVersion: string | undefined;
+  readonly #healthyStreamMs: number;
+  readonly #reconnectRandom: () => number;
 
   constructor(options: StreamClientOptions) {
+    this.#healthyStreamMs = options.healthyStreamMs ?? healthyStreamMs;
+    this.#reconnectRandom = options.reconnectRandom ?? Math.random;
     this.#serverClock = options.serverClock;
     this.#observerVersion = reportableVersion(options.observerVersion);
     this.#handshakeTimeoutMs = options.handshakeTimeoutMs ?? 20_000;
@@ -280,16 +309,17 @@ export class ObserverStreamClient {
           throw new MachineRemovedError();
         }
         if (error instanceof PermanentTelemetryError) throw error;
-        // A connection that completed its handshake ends the outage; the
+        // A connection that stayed healthy for a while ends the outage; the
         // next disconnect (for example a server restart) retries promptly
-        // instead of inheriting the longest delay of an earlier outage.
-        if (this.#establishedSinceConnect) {
+        // instead of inheriting the longest delay of an earlier outage. One
+        // that dropped soon after its handshake keeps the growing wait.
+        if (this.#establishedSinceConnect && Date.now() - this.#establishedAt >= this.#healthyStreamMs) {
           backoffMs = initialBackoffMs;
           afterDrop = true;
         }
         this.#reconnects++;
         const summary = telemetryErrorSummary(error, this.#config.grpcUrl);
-        const waitMs = reconnectDelay(backoffMs, Math.random, afterDrop);
+        const waitMs = reconnectDelay(backoffMs, this.#reconnectRandom, afterDrop);
         const now = Date.now();
         const last = this.#lastLoggedFailure;
         if (this.#establishedSinceConnect || last?.summary !== summary || now - last.at >= failureRepeatMs) {
@@ -363,9 +393,17 @@ export class ObserverStreamClient {
     this.#lastAcknowledgedSequence = localAcknowledgement;
     this.#queue.reconcileAcknowledged(localAcknowledgement);
 
+    const trust = streamTrust(this.#config, credential);
+    if (trust.ignoredCaFile && !this.#ignoredCaFileNoticed) {
+      this.#ignoredCaFileNoticed = true;
+      this.#onStatus(
+        "PHIGON_TLS_CA_FILE is not used for this Phigon server: the stream trusts only the certificate authority pinned when this computer paired. " +
+          `If something on this network inspects HTTPS, ask your IT team to exempt ${this.#config.grpcUrl.hostname.replace(/^\[|\]$/gu, "")} from inspection.`,
+      );
+    }
     const client = new Client(
       this.#config.grpcUrl.host,
-      channelCredentials(this.#config),
+      channelCredentials(this.#config, trust.roots),
       {
         "grpc.max_receive_message_length": maxMessageBytes,
         "grpc.max_send_message_length": maxMessageBytes,
@@ -700,7 +738,10 @@ export class ObserverStreamClient {
               stream.cancel();
               return;
             }
-            const collectionPolicy = snapshot.collection;
+            // Never wider than this computer's consent: events queued
+            // before it was paired again with narrower consent are
+            // sanitised to it, on disk too, before any is sent.
+            const collectionPolicy = consentedPolicy(snapshot.collection, credential.consentProfile);
             activePolicy = collectionPolicy;
             try {
               this.#queue.replacePending((event) =>
@@ -929,6 +970,7 @@ export class ObserverStreamClient {
 
   #markReady(sequence: bigint): void {
     this.#establishedSinceConnect = true;
+    this.#establishedAt = Date.now();
     this.#reconnectingQuietly = false;
     this.#readySequence = sequence;
     for (const ready of this.#readyWaiters) ready(sequence);
@@ -1058,6 +1100,23 @@ function safeStatusDetail(value: string): string {
   const detail = value.replace(/[\r\n\t]+/gu, " ").trim();
   if (!detail) return "no error detail";
   return detail.length <= 180 ? detail : `${detail.slice(0, 177)}...`;
+}
+
+/**
+ * The server's collection policy, narrowed to what this computer's consent
+ * covers: every content category stays off unless whoever consented chose
+ * the full profile. A pairing without consent evidence covers metadata
+ * only. The server's policy is the same for every computer, so it may allow
+ * content this one never agreed to send.
+ */
+export function consentedPolicy(
+  policy: CollectionPolicy,
+  consentProfile: StoredMachineCredential["consentProfile"],
+): CollectionPolicy {
+  if (consentProfile === "full") return policy;
+  const narrowed = clone(CollectionPolicySchema, policy);
+  for (const category of CONTENT_COLLECTION_CATEGORIES) narrowed[category] = false;
+  return narrowed;
 }
 
 export function sanitizeEventForPolicy(
@@ -1296,16 +1355,16 @@ function sanitizeResource(
 export const dropSpreadMs = 5_000;
 
 /**
- * The wait before a reconnect attempt: up to a quarter less than the
- * backoff, at random, so computers that lost the same server do not all
- * try at once, and never longer than the backoff, so a computer is back
- * within a minute of the server. After a connection that worked dropped
- * (`afterDrop`), the attempts whose backoff is still under five seconds
- * wait any time up to five seconds instead.
+ * The wait before a reconnect attempt: any time up to the backoff, at
+ * random ("full jitter"), so computers that lost the same server spread
+ * their attempts over the whole window instead of coming back in waves,
+ * and never longer than the backoff, so a computer is back within a minute
+ * of the server. After a connection that worked dropped (`afterDrop`), the
+ * window is at least five seconds.
  */
 export function reconnectDelay(backoffMs: number, random: () => number = Math.random, afterDrop = false): number {
-  if (afterDrop && backoffMs < dropSpreadMs) return Math.floor(random() * dropSpreadMs);
-  return backoffMs - Math.floor(random() * backoffMs / 4);
+  const window = afterDrop ? Math.max(backoffMs, dropSpreadMs) : backoffMs;
+  return Math.floor(random() * window);
 }
 
 let ipServerNameWarningMuted = false;
@@ -1331,12 +1390,47 @@ export function muteIpServerNameWarning(): void {
   }) as typeof process.emitWarning;
 }
 
-function channelCredentials(config: ObserverConfig) {
+/**
+ * The authorities the stream trusts. A server whose authority was pinned at
+ * pairing is trusted under it alone: PHIGON_TLS_CA_FILE cannot replace it
+ * (`ignoredCaFile` says it was set), so HTTPS inspection on the way is
+ * refused rather than trusted. Without a pin, PHIGON_TLS_CA_FILE or the
+ * system's authorities apply, except for an address on Phigon's relay,
+ * which is refused. A key issued under a pinned authority that is now
+ * missing or changed is never sent.
+ */
+export function streamTrust(
+  config: ObserverConfig,
+  credential: Pick<StoredMachineCredential, "serverAuthoritySha256">,
+): Readonly<{ roots: Buffer | undefined; ignoredCaFile: boolean }> {
+  if (config.grpcUrl.protocol !== "https:") return { roots: undefined, ignoredCaFile: false };
+  const pinnedFile = serverAuthorityPath(config.dataDirectory);
+  let pinned: Buffer | undefined;
+  try {
+    pinned = readFileSync(pinnedFile);
+  } catch {
+    pinned = undefined;
+  }
+  const fingerprint = pinned === undefined ? undefined : authorityFingerprint(pinned.toString("utf8"));
+  if (
+    (pinned !== undefined && fingerprint === undefined) ||
+    (credential.serverAuthoritySha256 !== undefined && fingerprint !== credential.serverAuthoritySha256)
+  ) {
+    throw new PermanentTelemetryError(pinnedAuthorityMissingMessage);
+  }
+  if (pinned !== undefined) {
+    return {
+      roots: pinned,
+      ignoredCaFile: config.tlsCaFile !== undefined && resolvePath(config.tlsCaFile) !== resolvePath(pinnedFile),
+    };
+  }
+  if (relayHost(config.grpcUrl.hostname)) throw new PermanentTelemetryError(relayNeedsAuthorityMessage);
+  return { roots: config.tlsCaFile === undefined ? undefined : readFileSync(config.tlsCaFile), ignoredCaFile: false };
+}
+
+function channelCredentials(config: ObserverConfig, rootCertificates: Buffer | undefined) {
   if (config.grpcUrl.protocol === "https:") {
     if (isIP(config.grpcUrl.hostname.replace(/^\[|\]$/gu, "")) !== 0) muteIpServerNameWarning();
-    const rootCertificates = config.tlsCaFile === undefined
-      ? undefined
-      : readFileSync(config.tlsCaFile);
     const privateKey = config.tlsClientKeyFile === undefined
       ? undefined
       : readFileSync(config.tlsClientKeyFile);

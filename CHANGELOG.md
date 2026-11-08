@@ -20,7 +20,34 @@ from the matching `vX.Y.Z` tag in this repository.
 - Redaction fixes.
 - Safer consent defaults.
 - Lower CPU use while the observer is idle.
-- Trust fixes.
+- Trust and network fixes:
+  - A server paired with `--server-ca-sha256` is trusted under that
+    authority only. `PHIGON_TLS_CA_FILE` no longer replaces it for the
+    stream; a network that inspects HTTPS must exempt the server or
+    `*.relay.phigon.online`, and the observer says so.
+  - Addresses on Phigon's relay are never trusted without a pinned
+    authority, and pairing there needs `--server-ca-sha256`.
+  - The machine key is stored with the authority it was issued under. If
+    `server-ca.pem` goes missing or changes, the observer refuses to
+    connect until the Connect machine command is run again.
+  - Pairing again at the same address with another fingerprint never sends
+    the stored key there: the computer pairs as a new machine, and the
+    earlier key and its undelivered activity are kept in
+    `retired-pairings`. A lost answer can be retried with the same code,
+    and a new code pairs with a new installation ID.
+  - Activity queued before a computer was paired again with the metadata
+    profile is sent without its content.
+  - Reconnect waits are spread over the whole backoff window, and the
+    backoff starts over only after the stream stayed up for 30 seconds.
+  - The Guardian runner is checked against the SHA-256 recorded at build
+    time (`dist/bin/guardian-runner.sha256.json`) before it first runs.
+  - Windows tools (icacls, whoami, PowerShell) start from
+    `%SystemRoot%\System32`, never from the current folder.
+  - A proxy password is masked in the output of administrators' commands.
+  - On Linux and macOS the machine key is made owner-only when it is read,
+    and refused if others can still read it or write to its folder.
+  - An unreadable stream cursor is copied aside once, and only three copies
+    are kept.
 - Background service and agent discovery fixes.
 - Guardian runner sandbox hardening.
 - CI and release hardening:

@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { StreamStateStore } from "../src/stream-state.js";
+import { maxCorruptStreamStateCopies, StreamStateStore } from "../src/stream-state.js";
 
 test("corrupt stream cursor recovers only from a verified delivery checkpoint", async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-cursor-recovery-"));
@@ -33,6 +33,33 @@ test("an unreadable cursor with an empty restored spool waits for server reconci
     const state = await new StreamStateStore(directory).load("paired-machine", 0n);
     assert.equal(state.recoveryPending, true);
     assert.equal(await readFile(path, "utf8"), "\u0000");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("an unreadable cursor is copied once while recovery waits, and only a few copies are kept", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-cursor-copies-"));
+  const copies = async () => (await readdir(directory)).filter((name) => name.endsWith(".corrupt")).sort();
+  try {
+    const path = join(directory, "stream-state.json");
+    await writeFile(path, "\u0000");
+    // Every reconnect reads the same unreadable cursor again.
+    for (let attempt = 0; attempt < 5; attempt++) {
+      assert.equal((await new StreamStateStore(directory).load("paired-machine", 0n)).recoveryPending, true);
+    }
+    assert.equal((await copies()).length, 1);
+    // Older copies, such as ones an earlier version named at random, count too.
+    await writeFile(join(directory, "stream-state.json.7f6b3c2a-1111-4222-8333-944445555666.corrupt"), "old");
+    for (let index = 0; index < 5; index++) {
+      await writeFile(path, `\u0000${index}`);
+      await new StreamStateStore(directory).load("paired-machine", 0n);
+    }
+    const kept = await copies();
+    assert.equal(kept.length, maxCorruptStreamStateCopies);
+    const contents = await Promise.all(kept.map((name) => readFile(join(directory, name), "utf8")));
+    assert.ok(contents.includes("\u00004"), "the newest copy is kept");
+    assert.ok(!contents.includes("old"));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

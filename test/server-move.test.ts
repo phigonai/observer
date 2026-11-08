@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:https";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -9,8 +9,13 @@ import test from "node:test";
 import { run } from "../src/cli.js";
 import { loadConfig } from "../src/config.js";
 import { FileCredentialStore, type StoredMachineCredential } from "../src/credential-store.js";
+import { loadOrCreatePendingInstallationID, pairingAttempt, promotePendingInstallationID } from "../src/installation.js";
 import { InstanceLock } from "../src/instance-lock.js";
-import { serverAuthorityPath, verifyServerAuthority } from "../src/server-authority.js";
+import { connectionEnvironment } from "../src/connection-config.js";
+import { pairMachine, serverPairingCode } from "../src/pair.js";
+import { pinnedAuthorityMissingMessage, serverAuthorityPath, verifyServerAuthority } from "../src/server-authority.js";
+import { serverFetch, trustServerAuthority } from "../src/server-fetch.js";
+import { streamTrust } from "../src/stream-client.js";
 import { onThisComputer, preparePairingAuthority } from "../src/server-move.js";
 import { moveServiceEndpoints, readServiceSettings, serviceSettingsPath, writeServiceSettings } from "../src/service.js";
 import { serverCertificate, testAuthority, type TestCertificate } from "./support/certificates.js";
@@ -25,7 +30,7 @@ const oldOrigin = "https://192.0.2.10:17080";
 let authorities = 0;
 const authority = (label: string) => testAuthority(`Phigon ${label} authority ${++authorities}`);
 
-type Exchange = Readonly<{ existing_credential?: string }>;
+type Exchange = Readonly<{ existing_credential?: string; installation_id?: string }>;
 
 /** A company server on this computer, presenting `leaf` and then `chain`. */
 async function startServer(
@@ -75,12 +80,12 @@ async function pairedComputer(pinned: TestCertificate): Promise<string> {
   return directory;
 }
 
-async function pair(directory: string, origin: string, fingerprint: string) {
+async function pair(directory: string, origin: string, fingerprint: string, code = "ABCDE-FGHIJ") {
   let stdout = "";
   let stderr = "";
   const exitCode = await run([
     "pair",
-    "--code", "ABCDE-FGHIJ",
+    "--code", code,
     "--consent-profile", "metadata",
     "--control-plane-url", origin,
     "--grpc-url", origin,
@@ -233,6 +238,271 @@ test("a server with another authority gets nothing, and the pinned authority sta
   }
 });
 
+test("a server at the same address with another authority never gets the stored key; the computer pairs as a new machine", async () => {
+  const pinned = authority("pinned");
+  const other = authority("replacement");
+  const directory = await pairedComputer(pinned);
+  const newMachine = "6a2c5db5-b88e-4e64-b077-208f295794a5";
+  // A new server answers a computer that brings no key with a machine of its own.
+  const company = await startServer(serverCertificate(other, ["127.0.0.1"]), other.certificate, (body) => body.existing_credential === undefined
+    ? { status: 200, body: { machine: { id: newMachine, tenant_id: tenantID, display_name: "Laptop", state: "online" }, credential: key("n") } }
+    : sameMachine(body));
+  try {
+    // Paired with the server at this very address, under the pinned authority.
+    const store = new FileCredentialStore(directory);
+    const before = await store.load();
+    assert.ok(before);
+    await store.save({ ...before, controlPlaneOrigin: company.origin, grpcOrigin: company.origin });
+
+    const result = await pair(directory, company.origin, other.fingerprint);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(company.requests.length, 1);
+    assert.equal(company.requests[0]?.existing_credential, undefined, "the stored key is never sent");
+    const paired = JSON.parse(result.stdout) as { machineId: string; replacedMachineId?: string; newServerAuthority?: boolean };
+    assert.equal(paired.machineId, newMachine);
+    assert.equal(paired.replacedMachineId, machineID);
+    assert.equal(paired.newServerAuthority, true);
+    const stored = await store.load();
+    assert.equal(stored?.credential, key("n"));
+    assert.equal((await readFile(serverAuthorityPath(directory), "utf8")).replace(/\s+/gu, ""), other.certificate.replace(/\s+/gu, ""));
+    // The earlier key and its queue were set aside, not sent.
+    assert.ok(existsSync(join(directory, "retired-pairings")));
+  } finally {
+    await stop(company.server);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a wrong code at a server with another authority leaves the earlier pairing as it was", async () => {
+  const pinned = authority("pinned");
+  const other = authority("replacement");
+  const directory = await pairedComputer(pinned);
+  const company = await startServer(serverCertificate(other, ["127.0.0.1"]), other.certificate, () => ({
+    status: 400,
+    body: { error: { code: "invalid_pairing_code", message: "The pairing code is invalid or has expired." } },
+  }));
+  try {
+    const store = new FileCredentialStore(directory);
+    const before = await store.load();
+    assert.ok(before);
+    await store.save({ ...before, controlPlaneOrigin: company.origin, grpcOrigin: company.origin });
+    const installationBefore = "0b7d5f0e-3c1a-4e7b-9a52-6f1d2c3b4a59\n";
+    await writeFile(join(directory, "installation-id"), installationBefore);
+
+    const result = await pair(directory, company.origin, other.fingerprint);
+    assert.notEqual(result.exitCode, 0);
+    assert.equal(company.requests.length, 1);
+    assert.equal(company.requests[0]?.existing_credential, undefined, "the stored key is never sent");
+    // Nothing moved: the key, its machine, its installation ID and its pin
+    // still work with the server they belong to.
+    const after = await store.load();
+    assert.equal(after?.credential, before.credential);
+    assert.equal(after?.machineId, machineID);
+    assert.equal(await readFile(join(directory, "installation-id"), "utf8"), installationBefore);
+    assert.equal(existsSync(join(directory, "retired-pairings")), false);
+    assert.equal(await readFile(serverAuthorityPath(directory), "utf8"), pinned.certificate);
+  } finally {
+    await stop(company.server);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a retry after a lost answer from a server with another authority uses the same new installation ID", async () => {
+  const pinned = authority("pinned");
+  const other = authority("replacement");
+  const directory = await pairedComputer(pinned);
+  const newMachine = "0f3c2b1a-9d8e-4f7a-8b6c-5d4e3f2a1b0c";
+  let answered = 0;
+  // The first answer is lost on the way back; the server made the machine.
+  const company = await startServer(serverCertificate(other, ["127.0.0.1"]), other.certificate, () => ++answered === 1
+    ? { status: 503, body: { error: { code: "unavailable", message: "Try again." } } }
+    : { status: 200, body: { machine: { id: newMachine, tenant_id: tenantID, display_name: "Laptop", state: "online" }, credential: key("r") } });
+  try {
+    const store = new FileCredentialStore(directory);
+    const before = await store.load();
+    assert.ok(before);
+    await store.save({ ...before, controlPlaneOrigin: company.origin, grpcOrigin: company.origin });
+    await writeFile(join(directory, "installation-id"), "0b7d5f0e-3c1a-4e7b-9a52-6f1d2c3b4a59\n");
+
+    assert.notEqual((await pair(directory, company.origin, other.fingerprint)).exitCode, 0);
+    assert.equal((await store.load())?.machineId, machineID, "the earlier pairing stays until one succeeds");
+    // Typed differently, the server still reads the same code.
+    const retried = await pair(directory, company.origin, other.fingerprint, "abcdefghij");
+    assert.equal(retried.exitCode, 0, retried.stderr);
+
+    const sent = company.requests.map((request) => request.installation_id);
+    assert.equal(sent.length, 2);
+    assert.equal(sent[0], sent[1], "the retry presents the installation ID the code was bound to");
+    assert.notEqual(sent[0], "0b7d5f0e-3c1a-4e7b-9a52-6f1d2c3b4a59");
+    assert.equal((await readFile(join(directory, "installation-id"), "utf8")).trim(), sent[0]);
+    assert.equal(existsSync(join(directory, "installation-id.pending")), false);
+    assert.equal((await store.load())?.machineId, newMachine);
+  } finally {
+    await stop(company.server);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a new code after a lost answer from a server with another authority pairs with a new installation ID", async () => {
+  const pinned = authority("pinned");
+  const other = authority("replacement");
+  const directory = await pairedComputer(pinned);
+  const newMachine = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+  const seen = new Set<string>();
+  let answered = 0;
+  // The first code made a machine under the ID it was sent with, but its
+  // answer was lost; that ID now belongs to that machine.
+  const company = await startServer(serverCertificate(other, ["127.0.0.1"]), other.certificate, (body) => {
+    answered++;
+    const id = body.installation_id ?? "";
+    if (answered === 1) {
+      seen.add(id);
+      return { status: 503, body: { error: { code: "unavailable", message: "Try again." } } };
+    }
+    return seen.has(id)
+      ? { status: 409, body: { error: { code: "installation_exists", message: "This computer is already paired." } } }
+      : { status: 200, body: { machine: { id: newMachine, tenant_id: tenantID, display_name: "Laptop", state: "online" }, credential: key("s") } };
+  });
+  try {
+    const store = new FileCredentialStore(directory);
+    const before = await store.load();
+    assert.ok(before);
+    await store.save({ ...before, controlPlaneOrigin: company.origin, grpcOrigin: company.origin });
+
+    assert.notEqual((await pair(directory, company.origin, other.fingerprint, "ABCDE-FGHIJ")).exitCode, 0);
+    // The first code expired; the administrator made another.
+    const second = await pair(directory, company.origin, other.fingerprint, "KLMNO-PQRST");
+    assert.equal(second.exitCode, 0, second.stderr);
+    const sent = company.requests.map((request) => request.installation_id);
+    assert.equal(sent.length, 2);
+    assert.notEqual(sent[0], sent[1], "another code pairs with another installation ID");
+    assert.equal((await store.load())?.machineId, newMachine);
+    assert.equal((await readFile(join(directory, "installation-id"), "utf8")).trim(), sent[1]);
+    // The pending file never holds the code itself.
+    assert.equal(existsSync(join(directory, "installation-id.pending")), false);
+  } finally {
+    await stop(company.server);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a retry after the new installation ID could not be made current gets the machine back", async () => {
+  const other = authority("replacement");
+  // The earlier pairing was set aside and the server paired the new ID,
+  // but making it current failed: no key, no current ID, only the pending one.
+  const directory = await mkdtemp(join(tmpdir(), "phigon-server-move-"));
+  const pendingID = await loadOrCreatePendingInstallationID(directory, pairingAttempt(serverPairingCode("ABCDE-FGHIJ")));
+  const company = await startServer(serverCertificate(other, ["127.0.0.1"]), other.certificate, (body) => body.installation_id === pendingID
+    ? { status: 200, body: { machine: { id: machineID, tenant_id: tenantID, display_name: "Laptop", state: "online" }, credential: key("p") } }
+    : { status: 409, body: { error: { code: "pairing_used", message: "This pairing code was already used." } } });
+  try {
+    const result = await pair(directory, company.origin, other.fingerprint, "ABCDE-FGHIJ");
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.deepEqual(company.requests.map((request) => request.installation_id), [pendingID]);
+    assert.equal((await readFile(join(directory, "installation-id"), "utf8")).trim(), pendingID);
+    assert.equal(existsSync(join(directory, "installation-id.pending")), false);
+  } finally {
+    await stop(company.server);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("making the new installation ID current waits out a file Windows briefly holds", { skip: process.platform !== "win32" }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-pending-promote-"));
+  try {
+    const pendingID = await loadOrCreatePendingInstallationID(directory, pairingAttempt(serverPairingCode("ABCDE-FGHIJ")));
+    let refusals = 2;
+    await promotePendingInstallationID(directory, async (from, to) => {
+      if (refusals-- > 0) throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+      await rename(from, to);
+    });
+    assert.equal((await readFile(join(directory, "installation-id"), "utf8")).trim(), pendingID);
+    assert.equal(existsSync(join(directory, "installation-id.pending")), false);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a pairing with another authority interrupted before the authority is saved refuses to connect", async () => {
+  const pinned = authority("pinned");
+  const other = authority("replacement");
+  const directory = await pairedComputer(pinned);
+  const newMachine = "2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e";
+  const company = await startServer(serverCertificate(other, ["127.0.0.1"]), other.certificate, () => ({
+    status: 200,
+    body: { machine: { id: newMachine, tenant_id: tenantID, display_name: "Laptop", state: "online" }, credential: key("i") },
+  }));
+  try {
+    const store = new FileCredentialStore(directory);
+    const before = await store.load();
+    assert.ok(before);
+    await store.save({ ...before, controlPlaneOrigin: company.origin, grpcOrigin: company.origin });
+    const config = loadConfig({ PHIGON_DATA_DIR: directory, PHIGON_CONTROL_PLANE_URL: company.origin, PHIGON_GRPC_URL: company.origin });
+    const authorityForPairing = await preparePairingAuthority({ config, fingerprint: other.fingerprint });
+    assert.equal(authorityForPairing.keyAuthority, other.fingerprint);
+    await pairMachine({
+      config,
+      code: "ABCDE-FGHIJ",
+      consentProfile: "metadata",
+      storedKeyAllowed: authorityForPairing.storedKeyAllowed,
+      serverAuthoritySha256: authorityForPairing.keyAuthority,
+    });
+    // The process stops here, before commit saves the new authority: the
+    // new key is stored with it, and the earlier authority is still saved.
+    const stored = await store.load();
+    assert.equal(stored?.machineId, newMachine);
+    assert.equal(stored?.serverAuthoritySha256, other.fingerprint);
+    assert.equal(await readFile(serverAuthorityPath(directory), "utf8"), pinned.certificate);
+    await connectionEnvironment({ PHIGON_DATA_DIR: directory });
+    await assert.rejects(serverFetch(`${company.origin}/healthz`), (error: Error) => error.message === pinnedAuthorityMissingMessage);
+    assert.throws(() => streamTrust(config, stored ?? {}), (error: Error) => error.message === pinnedAuthorityMissingMessage);
+    // Finishing the pairing brings everything in line.
+    await authorityForPairing.commit();
+    await connectionEnvironment({ PHIGON_DATA_DIR: directory });
+    assert.equal(streamTrust(config, stored ?? {}).roots?.toString("utf8").replace(/\s+/gu, ""), other.certificate.replace(/\s+/gu, ""));
+  } finally {
+    trustServerAuthority(undefined);
+    await stop(company.server);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("the pending installation ID keeps a digest of its code, never the code", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-pending-id-"));
+  try {
+    const first = await loadOrCreatePendingInstallationID(directory, pairingAttempt(serverPairingCode("ABCDE-FGHIJ")));
+    assert.equal(await loadOrCreatePendingInstallationID(directory, pairingAttempt(serverPairingCode("ABCDE-FGHIJ"))), first);
+    const text = await readFile(join(directory, "installation-id.pending"), "utf8");
+    assert.doesNotMatch(text, /ABCDE|FGHIJ/u);
+    assert.notEqual(await loadOrCreatePendingInstallationID(directory, pairingAttempt("KLMNO-PQRST")), first);
+    // A damaged file is replaced rather than trusted.
+    await writeFile(join(directory, "installation-id.pending"), "not an id\n");
+    assert.match(await loadOrCreatePendingInstallationID(directory, pairingAttempt("KLMNO-PQRST")), /^[0-9a-f-]{36}$/u);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("pairing again at the same address with the same authority keeps the machine and its key", async () => {
+  const pinned = authority("pinned");
+  const directory = await pairedComputer(pinned);
+  const company = await startServer(serverCertificate(pinned, ["127.0.0.1"]), pinned.certificate, sameMachine);
+  try {
+    const store = new FileCredentialStore(directory);
+    const before = await store.load();
+    assert.ok(before);
+    await store.save({ ...before, controlPlaneOrigin: company.origin, grpcOrigin: company.origin });
+    const result = await pair(directory, company.origin, pinned.fingerprint);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(company.requests[0]?.existing_credential, key("k"));
+    assert.equal((await store.load())?.machineId, machineID);
+    assert.equal((await store.load())?.serverAuthoritySha256, pinned.fingerprint);
+  } finally {
+    await stop(company.server);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("only a server holding a certificate from the pinned authority is trusted with the key", async () => {
   const pinned = authority("pinned");
   const impostor = authority("impostor");
@@ -290,6 +560,9 @@ test("a first pairing saves the authority the command named", async () => {
     assert.equal(result.exitCode, 0, result.stderr);
     const saved = await readFile(serverAuthorityPath(directory), "utf8");
     assert.equal(saved.replace(/\s+/gu, ""), first.certificate.replace(/\s+/gu, ""));
+    // The key is stored with the authority it was issued under, so it is
+    // never sent under the system's authorities if server-ca.pem goes.
+    assert.equal((await new FileCredentialStore(directory).load())?.serverAuthoritySha256, first.fingerprint);
   } finally {
     await stop(company.server);
     await rm(directory, { recursive: true, force: true });

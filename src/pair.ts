@@ -8,7 +8,14 @@ import {
   type StoredMachineCredential,
 } from "./credential-store.js";
 import { retirePairingState } from "./event-spool.js";
-import { installationFileName, loadOrCreateInstallationID } from "./installation.js";
+import {
+  adoptPendingInstallationID,
+  installationFileName,
+  loadOrCreateInstallationID,
+  loadOrCreatePendingInstallationID,
+  pairingAttempt,
+  promotePendingInstallationID,
+} from "./installation.js";
 import { InstanceLock } from "./instance-lock.js";
 import { serverFetch } from "./server-fetch.js";
 
@@ -41,6 +48,12 @@ export type PairResult = Readonly<{
   replacedMachineId?: string;
   /** Where this computer reached its server before, when it moved. */
   previousControlPlaneOrigin?: string;
+  /**
+   * The earlier machine was replaced because the server proves another
+   * certificate authority than the one its key was issued under, so the
+   * key was not sent.
+   */
+  newServerAuthority?: true;
 }>;
 
 /**
@@ -75,7 +88,19 @@ export type PairOptions = Readonly<{
   fetcher?: typeof fetch;
   /** See `ConnectOptions.serverMoved`. */
   serverMoved?: boolean;
+  /** See `ConnectOptions.storedKeyAllowed`. */
+  storedKeyAllowed?: boolean;
+  /** See `ConnectOptions.serverAuthoritySha256`. */
+  serverAuthoritySha256?: string | undefined;
 }>;
+
+/**
+ * A one-time pairing code as the server compares it: upper case, without
+ * spaces or hyphens (normalizePairingCode in the control plane).
+ */
+export function serverPairingCode(code: string): string {
+  return code.trim().toUpperCase().replace(/[- ]/gu, "");
+}
 
 export async function pairMachine(options: PairOptions): Promise<PairResult> {
   const code = options.code.trim();
@@ -101,6 +126,11 @@ export async function pairMachine(options: PairOptions): Promise<PairResult> {
     fetcher,
     ...(options.credentialStore === undefined ? {} : { credentialStore: options.credentialStore }),
     ...(options.serverMoved === true ? { serverMoved: true } : {}),
+    ...(options.storedKeyAllowed === false ? { storedKeyAllowed: false } : {}),
+    // The server reads ABCDE-FGHIJ and abcdefghij as one code, so a retry
+    // spelled differently is still the same attempt.
+    attempt: pairingAttempt(serverPairingCode(code)),
+    serverAuthoritySha256: options.serverAuthoritySha256,
     exchange: (installationID, existingCredential) => exchangePairing(fetcher, endpoint, {
       code,
       installation_id: installationID,
@@ -139,6 +169,19 @@ export type ConnectOptions<T extends ConnectedMachine> = Readonly<{
    * before anything is sent.
    */
   serverMoved?: boolean;
+  /**
+   * False when the server proves another certificate authority than the
+   * one the stored key was issued under: the key is never sent there, and
+   * the computer connects as a new machine. Allowed unless said otherwise.
+   */
+  storedKeyAllowed?: boolean;
+  /** The code this connection uses, as `pairingAttempt` identifies it. */
+  attempt: string;
+  /**
+   * The authority the server proved, stored with the key in the same
+   * write (`PairingAuthority.keyAuthority`); undefined for the system's.
+   */
+  serverAuthoritySha256?: string | undefined;
   /** Exchanges a code for this installation, with the stored key if any. */
   exchange: (installationID: string, existingCredential?: string) => Promise<ExchangeOutcome<T>>;
   /** The consent evidence to store with the credential `paired` returned. */
@@ -156,16 +199,18 @@ export async function connectMachine<T extends ConnectedMachine>(
   options: ConnectOptions<T>,
 ): Promise<Readonly<{ paired: T; result: PairResult }>> {
   const dataDirectory = options.config.dataDirectory;
-  const installationID = await loadOrCreateInstallationID(dataDirectory);
   const credentialStore = options.credentialStore ??
     new FileCredentialStore(dataDirectory);
   const previous = await credentialStore.load();
+  if (previous === null) await adoptPendingInstallationID(dataDirectory, options.attempt);
+  const installationID = await loadOrCreateInstallationID(dataDirectory);
   const moved = previous !== null && previous.controlPlaneOrigin !== options.endpoint.origin;
   if (previous !== null && moved && options.serverMoved !== true) {
     throw new Error(otherServerMessage(previous.controlPlaneOrigin, options.endpoint.origin));
   }
   let paired: T | undefined;
-  if (previous !== null) {
+  const newAuthority = previous !== null && options.storedKeyAllowed === false;
+  if (previous !== null && !newAuthority) {
     const renewal = await options.exchange(installationID, previous.credential);
     if ("paired" in renewal) {
       paired = renewal.paired;
@@ -189,6 +234,20 @@ export async function connectMachine<T extends ConnectedMachine>(
       // A new machine. Its queue, stream cursor and credential start empty;
       // the observer must not be using the old ones while they move.
       lock = await InstanceLock.acquire(dataDirectory);
+      if (newAuthority) {
+        // The stored key still works at the server it was issued under, so
+        // nothing moves until this server has paired the computer: a wrong
+        // or expired code leaves the earlier pairing, its key and its queue
+        // as they were. The new machine gets a new installation ID, kept
+        // pending on disk so a retry after a lost response uses the same
+        // one, and made current once the exchange succeeded.
+        const pendingInstallationID = await loadOrCreatePendingInstallationID(dataDirectory, options.attempt);
+        const fresh = await options.exchange(pendingInstallationID);
+        if (!("paired" in fresh)) throw fresh.error;
+        paired = fresh.paired;
+        retirePairingState(dataDirectory, previous?.machineId, [credentialFileName, installationFileName]);
+        await promotePendingInstallationID(dataDirectory);
+      }
       // The old credential goes with its queue: it is the only key that can
       // decrypt it. Once it is gone, a retry after a lost response pairs
       // without it, and the server answers with the same new machine.
@@ -198,10 +257,12 @@ export async function connectMachine<T extends ConnectedMachine>(
       // built-in SQLite server refuses to pair it again. A new ID pairs
       // cleanly everywhere.
       const replacing = paired === undefined && previous !== null;
-      retirePairingState(dataDirectory, previous?.machineId, [
-        credentialFileName,
-        ...(replacing ? [installationFileName] : []),
-      ]);
+      if (!newAuthority) {
+        retirePairingState(dataDirectory, previous?.machineId, [
+          credentialFileName,
+          ...(replacing ? [installationFileName] : []),
+        ]);
+      }
       if (paired === undefined) {
         const freshInstallationID = replacing
           ? await loadOrCreateInstallationID(dataDirectory)
@@ -220,6 +281,7 @@ export async function connectMachine<T extends ConnectedMachine>(
       grpcOrigin: options.config.grpcUrl.origin,
       createdAt: pairedAt,
       ...options.evidence(paired, pairedAt),
+      ...(options.serverAuthoritySha256 === undefined ? {} : { serverAuthoritySha256: options.serverAuthoritySha256 }),
     });
   } finally {
     await lock?.release();
@@ -235,6 +297,7 @@ export async function connectMachine<T extends ConnectedMachine>(
       controlPlaneOrigin: options.config.controlPlaneUrl.origin,
       credentialStored: true,
       ...(replaced ? { replacedMachineId: previous.machineId } : {}),
+      ...(replaced && newAuthority ? { newServerAuthority: true as const } : {}),
       ...(previous !== null && moved ? { previousControlPlaneOrigin: previous.controlPlaneOrigin } : {}),
     }),
   });
