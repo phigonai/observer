@@ -94,7 +94,7 @@ installs the [background service](#service) with the same profile.
 | `--code` | The one-time code from **Connect machine**. Codes expire after a few minutes and work once. |
 | `--consent-profile metadata` | Share which agents run and the kind of work they do. No prompts, replies, code or terminal output. |
 | `--consent-profile full` | Also share supported conversations, commands, outputs and past history. Secrets are still removed on the computer first. |
-| `--control-plane-url`, `--grpc-url` | Your company's own Phigon server, as **Connect machine** gives them. Leave both out for Phigon's hosted service. |
+| `--control-plane-url`, `--grpc-url` | Your company's Phigon server, as **Connect machine** gives them. Pass both: Phigon's own servers only check keys and cannot pair a computer. |
 | `--server-ca-sha256` | The fingerprint of your server's own certificate authority. The observer pins it and trusts nothing else for that server. See [Networks and the relay](#networks-and-the-relay). |
 | `--name` | The name this computer has in the workspace. Defaults to the computer's name. |
 | `--accept-consent` | The owner accepts the scope without the prompt. Only for an owner pairing their own computer from a script. |

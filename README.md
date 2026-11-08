@@ -390,7 +390,7 @@ Settings are environment variables. The most common ones:
 | Variable | Purpose |
 | --- | --- |
 | `PHIGON_DATA_DIR` | Where the credential, checkpoints and encrypted queue live. Use a separate directory per workspace. |
-| `PHIGON_CONTROL_PLANE_URL`, `PHIGON_GRPC_URL` | Endpoints for a self-hosted workspace. Pairing saves them; the stream refuses to send credentials anywhere else. |
+| `PHIGON_CONTROL_PLANE_URL`, `PHIGON_GRPC_URL` | Your company's Phigon server. Pairing saves them; the stream refuses to send credentials anywhere else. |
 | `PHIGON_TLS_CA_FILE` | A private certificate authority for gRPC. Use `NODE_EXTRA_CA_CERTS` for HTTPS. Pairing with `--server-ca-sha256` sets up both for you, and then only the pinned authority is trusted for that server: this setting is not used for it, and addresses on Phigon's relay are never trusted without the pin. |
 | `PHIGON_TLS_CLIENT_CERT_FILE`, `PHIGON_TLS_CLIENT_KEY_FILE` | Client certificate, when the workspace requires mutual TLS. |
 | `PHIGON_COLLECT_*` | Turns individual content categories off. Content can be turned on only under `--profile full` on a computer whose owner consented to full activity. Under `--profile metadata`, `run` refuses to start with one turned on; when the consent alone covers metadata only, they stay off. |
