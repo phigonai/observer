@@ -76,9 +76,11 @@ exactly what runs on your computers and what leaves them.
 | | Any other agent | [Register it](#custom-agents) | Bridge |
 
 *Built in* means the observer reads the agent's own records. *Bridge* means the
-agent (or a small wrapper) pipes NDJSON to `phigon-observer ingest`. The
-observer deletes each bridge file once the workspace has received it, and any
-bridge file after seven days.
+agent (or a small wrapper) pipes NDJSON to `phigon-observer ingest`. Before a
+bridge record is written to disk its secrets are masked, and without
+full-activity consent only its metadata is kept. The observer deletes each
+bridge file once the workspace has received it, and any bridge file after
+seven days.
 
 ## How it works
 
