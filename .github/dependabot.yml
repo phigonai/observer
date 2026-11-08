@@ -1,0 +1,37 @@
+# This repository is a mirror of observer/ in Phigon's main repository, and
+# its main branch changes only through the sync. Dependabot's pull requests
+# here are not merged: a maintainer applies an accepted update in the main
+# repository, and it comes back through the mirror.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      runtime:
+        dependency-type: production
+      development:
+        dependency-type: development
+
+  - package-ecosystem: gomod
+    directory: /go
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      go:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]

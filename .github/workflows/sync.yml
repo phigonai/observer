@@ -1,7 +1,13 @@
 name: Sync from Phigon
 
-# Publishes new changes to observer/ in Phigon's main repository. Pushes use a
-# deploy key so that CI and releases run for the mirrored commits and tags.
+# Publishes new changes to observer/ in Phigon's main repository.
+#
+# The sync job mirrors the commits and tests them. It holds no push
+# credentials, because the tests run the mirrored tree's dependencies. It
+# hands the mirrored history to the publish job as a git bundle before any of
+# that code runs. The publish job runs on a fresh runner, runs none of the
+# mirrored code, and pushes with a deploy key so that CI and releases run for
+# the mirrored commits and tags.
 on:
   schedule:
     - cron: "*/15 * * * *"
@@ -19,15 +25,18 @@ jobs:
     if: github.repository == 'phigonai/observer'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    outputs:
+      mirrored: ${{ steps.mirror.outputs.mirrored }}
+      tagged: ${{ steps.mirror.outputs.tagged }}
     steps:
       - name: Check out this repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           fetch-depth: 0
-          ssh-key: ${{ secrets.MIRROR_DEPLOY_KEY }}
+          persist-credentials: false
       - name: Check out Phigon's main repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ vars.UPSTREAM_REPOSITORY }}
           ref: ${{ vars.UPSTREAM_BRANCH || 'imp' }}
@@ -43,15 +52,45 @@ jobs:
         run: |
           git config user.name "Phigon Sync"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Where this mirror stood, so every new commit can be scanned.
+          echo "before=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
           # Run a copy: the mirror replaces this script while it runs.
           cp scripts/sync-from-upstream.sh "$RUNNER_TEMP/sync.sh"
           bash "$RUNNER_TEMP/sync.sh"
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+          # The mirrored code runs next. It never sees the private repository.
+          rm -rf .upstream
+      # Runs before the bundle is uploaded: artifacts of a public repository
+      # are public, even when the push never happens. The bundle holds every
+      # new commit, so each one is scanned, not only the final tree: a secret
+      # added in one commit and removed in the next would still be in it.
+      - name: No secrets in the mirrored tree or any new commit
+        if: steps.mirror.outputs.mirrored != '0'
+        env:
+          BEFORE: ${{ steps.mirror.outputs.before }}
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/gitleaks.tar.gz" \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP" gitleaks
+          mkdir -p "$RUNNER_TEMP/tree"
+          git archive --format=tar HEAD | tar -x -C "$RUNNER_TEMP/tree"
+          "$RUNNER_TEMP/gitleaks" dir "$RUNNER_TEMP/tree" --redact=100 --no-banner
+          "$RUNNER_TEMP/gitleaks" git . --log-opts="$BEFORE..HEAD" --redact=100 --no-banner
+      - name: Bundle the mirrored history before any of its code runs
+        if: steps.mirror.outputs.mirrored != '0' || steps.mirror.outputs.tagged != '0'
+        run: git bundle create "$RUNNER_TEMP/mirror.bundle" refs/heads/main --tags
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.mirror.outputs.mirrored != '0' || steps.mirror.outputs.tagged != '0'
+        with:
+          name: mirror
+          path: ${{ runner.temp }}/mirror.bundle
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         if: steps.mirror.outputs.mirrored != '0'
         with:
           node-version: 24
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         if: steps.mirror.outputs.mirrored != '0'
         with:
           go-version: "1.26.x"
@@ -63,18 +102,32 @@ jobs:
           npm run check
           (cd go && go vet ./... && go test ./...)
           sh scripts/check-generated.sh
-      - name: No secrets in the mirrored tree
-        if: steps.mirror.outputs.mirrored != '0'
+
+  publish:
+    needs: sync
+    if: needs.sync.outputs.mirrored != '0' || needs.sync.outputs.tagged != '0'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: mirror
+          path: ${{ runner.temp }}/mirror
+      - name: Push main and the release tags
+        env:
+          MIRROR_DEPLOY_KEY: ${{ secrets.MIRROR_DEPLOY_KEY }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          curl -fsSL -o "$RUNNER_TEMP/gitleaks.tar.gz" \
-            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
-          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum -c -
-          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP" gitleaks
-          mkdir -p "$RUNNER_TEMP/tree"
-          git archive --format=tar HEAD | tar -x -C "$RUNNER_TEMP/tree"
-          "$RUNNER_TEMP/gitleaks" dir "$RUNNER_TEMP/tree" --redact=100 --no-banner
-      - name: Publish
-        if: steps.mirror.outputs.mirrored != '0' || steps.mirror.outputs.tagged != '0'
-        run: |
-          git push origin HEAD:main
-          git push origin --tags
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          git init -q --bare "$work/mirror.git"
+          git -C "$work/mirror.git" fetch -q "$RUNNER_TEMP/mirror/mirror.bundle" \
+            "refs/heads/main:refs/heads/main" "refs/tags/*:refs/tags/*"
+          # The deploy key exists only for these two pushes. It is written the
+          # way actions/checkout writes it: trimmed, with one final newline.
+          (umask 077 && python3 -c 'import os, sys; sys.stdout.write(os.environ["MIRROR_DEPLOY_KEY"].strip() + "\n")' >"$work/key")
+          gh api meta --jq '.ssh_keys[] | "github.com " + .' >"$work/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $work/key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$work/known_hosts"
+          remote="git@github.com:$GITHUB_REPOSITORY.git"
+          git -C "$work/mirror.git" push "$remote" refs/heads/main:refs/heads/main
+          git -C "$work/mirror.git" push "$remote" --tags

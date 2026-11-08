@@ -80,8 +80,33 @@ redaction before it is queued.
 - Keep each pull request focused on one change, with tests.
 - Write commit messages in the imperative mood ("Add", "Fix"), and explain why
   in the body when it is not obvious.
-- Run `npm run check` and the Go tests before pushing; CI runs them on Linux,
-  macOS and Windows.
+- Run `npm run check` and the Go tests before pushing.
+- Add a line to the Unreleased section of [CHANGELOG.md](CHANGELOG.md) when
+  the change is visible to people who run the observer.
+
+## What CI checks
+
+On Linux, macOS and Windows, for every pull request and every push to
+`main`:
+
+- `npm run lint` and `npm run typecheck` (including the scripts in
+  `scripts/`), and the tests. On Linux the tests run through
+  `npm run test:coverage`, which fails below 80% lines, 75% branches or 80%
+  functions.
+- `go vet` and `go test` for the Go module.
+- The verify scripts for the managed service, Windows application control
+  and the standalone installer; on Linux also the Guardian runner's cgroup
+  containment, sandbox and resource checks.
+- The packed package, installed with `npm install --global`, runs
+  `phigon-observer --version` and `phigon-observer doctor --json`.
+
+On Linux only: the Guardian runner builds for every released platform,
+the generated protocol code matches `proto/`, `buf lint` passes, and
+`buf breaking` finds no incompatible change since the last release. Also
+govulncheck, CodeQL and the sign-off check on pull requests.
+
+A release tag runs all of this again on the tagged commit before anything
+is published.
 
 ## License
 

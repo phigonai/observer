@@ -1,0 +1,22 @@
+{
+  // Type-checks the plain JavaScript in scripts/, which ships in the npm
+  // package (install, managed service, Windows application control) or runs
+  // in CI. The scripts carry no type annotations, so untyped parameters and
+  // catch variables are allowed; everything else is checked strictly.
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2023"],
+    "types": ["node"],
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": true,
+    "noImplicitAny": false,
+    "useUnknownInCatchVariables": false,
+    "noFallthroughCasesInSwitch": true,
+    "skipLibCheck": true
+  },
+  "include": ["scripts/*.mjs", "eslint.config.mjs"]
+}

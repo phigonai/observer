@@ -73,4 +73,11 @@ the observer, marked redacted, and never emitted as an unbounded field.
 - Removed fields are reserved.
 - Unknown fields must survive decode/re-encode boundaries.
 - Semantic schema revisions increment `EventEnvelope.schema_version`.
-- Changes are add-only: `buf breaking` protects the released contract.
+- Changes are add-only. CI runs `buf lint` and `buf breaking` (buf v1.72.0)
+  on every push and pull request, comparing `proto/` with the newest release
+  tag before the commit, so a change that would break released observers
+  fails the build. To check your working tree against the last release:
+
+  ```sh
+  buf breaking --against ".git#ref=$(git describe --tags --abbrev=0 --match 'v[0-9]*')"
+  ```

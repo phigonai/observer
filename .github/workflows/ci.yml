@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # The release workflow runs this whole suite on the tagged commit first.
+  workflow_call:
 
 permissions:
   contents: read
@@ -21,52 +23,130 @@ jobs:
       matrix:
         os: [ubuntu-24.04, windows-2025, macos-15]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: npm
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.26.x"
           cache-dependency-path: go/go.sum
       - run: npm ci --ignore-scripts --no-audit --no-fund
-      - run: npm run check
+      # npm run check, with the tests split so Linux also enforces coverage.
+      - run: npm run lint
+      - run: npm run typecheck
+      - name: Test
+        if: runner.os != 'Linux'
+        run: npm test
+      - name: Test and enforce coverage (80% lines, 75% branches, 80% functions)
+        if: runner.os == 'Linux'
+        run: npm run test:coverage
       - name: Audit runtime dependencies
         if: runner.os == 'Linux'
         run: npm audit --omit=dev --audit-level=high
+      - name: Managed service files render for every system
+        run: node scripts/verify-managed-service.mjs
+      # On Windows this also parses the generated PowerShell scripts.
+      - name: Windows application control files are valid
+        run: node scripts/verify-windows-app-control.mjs
+      - name: The standalone installer installs, upgrades and rolls back
+        run: npm run verify:installer
+      - name: The packed package installs globally and runs unpaired
+        shell: bash
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          npm pack --pack-destination "$RUNNER_TEMP"
+          npm install --global --no-audit --no-fund "$RUNNER_TEMP/phigon-observer-$version.tgz"
+          node scripts/verify-global-install.mjs
+      # The Guardian runner the test step built, against the real kernel.
+      - name: Linux cgroup containment
+        if: runner.os == 'Linux'
+        run: sudo python3 scripts/verify-linux-containment.py dist/bin/guardian-runner-linux-amd64
+      - name: Linux filesystem and network sandbox
+        if: runner.os == 'Linux'
+        run: python3 scripts/verify-linux-sandbox.py dist/bin/guardian-runner-linux-amd64 --require-landlock
+      - name: Linux workload identities and kernel quotas
+        if: runner.os == 'Linux'
+        run: sudo python3 scripts/verify-linux-resources.py dist/bin/guardian-runner-linux-amd64
 
   go:
+    # The Guardian runner has code that builds only on Windows, only on macOS
+    # or only on Linux, and Windows-only tests.
+    name: Go (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+        working-directory: go
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.x"
+          cache-dependency-path: go/go.sum
+      - run: go vet ./...
+      - run: go test ./...
+
+  protocol:
     name: Guardian runner and protocol
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # buf breaking compares with the last release tag.
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.26.x"
           cache-dependency-path: go/go.sum
-      - name: Vet and test
-        working-directory: go
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      # The same build and check the release runs before it publishes.
+      - name: Build and verify the runner for every released platform
         run: |
-          go vet ./...
-          go test ./...
-      - name: Build the runner for every released platform
-        working-directory: go
-        run: |
-          for os in linux darwin windows; do
-            for arch in amd64 arm64; do
-              CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -o /dev/null ./cmd/guardian-runner
-            done
-          done
+          npm run build:platforms
+          npm run verify:release
       - name: Generated protocol code matches proto/
         run: sh scripts/check-generated.sh
+      - name: Install buf
+        run: go install github.com/bufbuild/buf/cmd/buf@v1.72.0
       - name: Lint the protocol
+        run: '"$(go env GOPATH)/bin/buf" lint'
+      - name: The protocol stays compatible with the last release
         run: |
-          go install github.com/bufbuild/buf/cmd/buf@v1.72.0
-          "$(go env GOPATH)/bin/buf" lint
+          # The newest release tag before this commit; on a release tag that
+          # is the previous release. Without one, compare with the parent.
+          against=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD^ 2>/dev/null || git rev-parse HEAD^)
+          echo "Comparing proto/ with $against"
+          "$(go env GOPATH)/bin/buf" breaking --against ".git#ref=$against"
+
+  govulncheck:
+    name: Go vulnerabilities
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.x"
+          # The newest Go patch release, as the release build uses.
+          check-latest: true
+          cache-dependency-path: go/go.sum
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+      - name: No known vulnerability is reachable from the Go code
+        working-directory: go
+        run: '"$(go env GOPATH)/bin/govulncheck" ./...'
 
   dco:
     name: Commits are signed off
@@ -74,7 +154,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Check Signed-off-by on every commit

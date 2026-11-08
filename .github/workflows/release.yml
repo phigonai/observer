@@ -2,32 +2,51 @@ name: Release
 
 # A version tag (vX.Y.Z) is pushed by the sync workflow when Phigon tags
 # observer-vX.Y.Z upstream. This publishes that exact commit to npm.
+#
+# 1. ci: the full CI suite on Linux, macOS and Windows for the tagged commit.
+# 2. build: packs the npm tarball with every Guardian runner and records
+#    their SHA-256 checksums. Read-only: it runs the dev dependencies.
+# 3. publish: the only job that can publish to npm. It runs none of the
+#    repository's code or dependencies; it checks the checksums and
+#    publishes the tarball that build packed.
+# 4. github-release: creates the GitHub release with the checksums attached.
 on:
   push:
     tags: ["v*"]
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 concurrency:
   group: release
   cancel-in-progress: false
 
 jobs:
-  publish:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  build:
+    name: Build the release
+    needs: ci
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    environment: npm
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.26.x"
+          # Ship the runners built with the newest Go patch release.
+          check-latest: true
           cache-dependency-path: go/go.sum
       - name: Tag matches package.json
         run: |
@@ -36,15 +55,77 @@ jobs:
             echo "::error::Tag $GITHUB_REF_NAME does not match package.json version $version"
             exit 1
           }
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Build the observer and the Guardian runners for every platform
+        run: |
+          npm run build
+          npm run build:platforms
+          npm run verify:release
+      - name: Pack the release and record its checksums
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          mkdir -p "$RUNNER_TEMP/release"
+          npm pack --pack-destination "$RUNNER_TEMP/release"
+          cp dist/bin/guardian-runner-* "$RUNNER_TEMP/release/"
+          cd "$RUNNER_TEMP/release"
+          sha256sum -- "phigon-observer-$version.tgz" guardian-runner-* >SHA256SUMS
+          cat SHA256SUMS
+      - name: The release tarball installs globally and runs unpaired
+        run: |
+          npm install --global --no-audit --no-fund "$RUNNER_TEMP/release/phigon-observer-${GITHUB_REF_NAME#v}.tgz"
+          node scripts/verify-global-install.mjs
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: ${{ runner.temp }}/release/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish to npm
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: ${{ runner.temp }}/release
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
       - name: Install npm with trusted publishing
         run: npm install --global npm@11.18.0
-      - run: npm ci --ignore-scripts --no-audit --no-fund
-      - run: npm run check
-      - name: Build Guardian runners for every platform
-        run: npm run build:platforms
-      - name: Publish to npm with provenance
-        run: npm publish --provenance --access public
-      - name: Create the GitHub release
+      # A tarball publish runs no package scripts; build ran verify:release.
+      - name: Publish the packed tarball to npm with provenance
+        working-directory: ${{ runner.temp }}/release
+        run: |
+          sha256sum -c SHA256SUMS
+          npm publish "./phigon-observer-${GITHUB_REF_NAME#v}.tgz" --provenance --access public
+
+  github-release:
+    name: Create the GitHub release
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: ${{ runner.temp }}/release
+      - name: Create the release with the tarball, the runners and SHA256SUMS
+        working-directory: ${{ runner.temp }}/release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+          GH_REPO: ${{ github.repository }}
+        run: |
+          sha256sum -c SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "$GITHUB_REF_NAME" \
+            SHA256SUMS "phigon-observer-${GITHUB_REF_NAME#v}.tgz" guardian-runner-*

@@ -18,7 +18,11 @@ prefix=observer
 branch=${UPSTREAM_BRANCH:-imp}
 head=$(git -C "$upstream" rev-parse "origin/$branch")
 
-last=$(git log --format=%B -n 500 | sed -n 's/^Upstream-Commit: \([0-9a-f]\{40\}\)$/\1/p' | head -n 1)
+# Every command in these pipelines reads all of its input. With pipefail, a
+# reader that stops early (head, sed q) kills the writer with SIGPIPE once the
+# output passes the pipe's buffer, and the sync fails.
+trailers=$(git log --format=%B -n 500 | sed -n 's/^Upstream-Commit: \([0-9a-f]\{40\}\)$/\1/p')
+last=${trailers%%$'\n'*}
 if [ -z "$last" ]; then
   echo "No Upstream-Commit trailer found; import the first commit by hand." >&2
   exit 1
@@ -76,7 +80,8 @@ for commit in $(git -C "$upstream" rev-list --reverse --first-parent "$last..$he
   body=$(git -C "$upstream" log -1 --format=%b "$commit")
   if [[ $subject =~ $merge_pattern ]]; then
     # A merged pull request: use its title and keep private branch names out.
-    subject=$(printf '%s\n' "$body" | sed -n '/[^[:space:]]/{p;q;}')
+    subject=$(printf '%s\n' "$body" | sed -n '/[^[:space:]]/p')
+    subject=${subject%%$'\n'*}
     body=""
   fi
   [ -n "$subject" ] || subject="Update the observer"
