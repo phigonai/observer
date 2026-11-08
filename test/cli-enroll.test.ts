@@ -102,6 +102,39 @@ test("pair enrolls with PHIGON_ENROLLMENT_CODE without a prompt and never shows 
   }
 });
 
+test("an enrollment code lets administrators stop agents and run commands, unless the script says less", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-cli-enroll-actions-"));
+  const server = await controlPlane((_body, response) => reply(response, 201, enrolledBody));
+  const endpoints = ["--control-plane-url", server.url, "--grpc-url", "http://127.0.0.1:9"];
+  try {
+    // The company's policy is the consent: the default stays all, and the result says so.
+    const company = await pair(endpoints, { PHIGON_DATA_DIR: directory, PHIGON_ENROLLMENT_CODE: newCode() });
+    assert.equal(company.exitCode, 0, company.stderr);
+    assert.match(company.stdout, /Your company's Phigon administrators can stop AI agents on this computer and run the commands they approve\. You see a notification each time\./u);
+    assert.equal((await new FileCredentialStore(directory).load())?.remoteActions, "all");
+
+    for (const [flags, consent] of [
+      [["--remote-actions", "stop-agents"], "stop_agents"],
+      [["--remote-actions=none"], "none"],
+      [["--no-remote-commands"], "stop_agents"],
+    ] as const) {
+      const narrowed = await pair([...endpoints, ...flags, "--json"], { PHIGON_DATA_DIR: directory, PHIGON_ENROLLMENT_CODE: newCode() });
+      assert.equal(narrowed.exitCode, 0, narrowed.stderr);
+      assert.equal((JSON.parse(narrowed.stdout) as { remoteActions: string }).remoteActions, consent);
+      assert.equal((await new FileCredentialStore(directory).load())?.remoteActions, consent);
+    }
+
+    const sent = server.bodies.length;
+    const contradiction = await pair([...endpoints, "--remote-actions", "all", "--no-remote-actions"], { PHIGON_DATA_DIR: directory, PHIGON_ENROLLMENT_CODE: newCode() });
+    assert.equal(contradiction.exitCode, 2);
+    assert.match(contradiction.stderr, /--remote-actions all contradicts --no-remote-actions\./u);
+    assert.equal(server.bodies.length, sent);
+  } finally {
+    await server.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("pair --enrollment-code prints what the company consented to, in plain words", async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-cli-enroll-text-"));
   const server = await controlPlane((_body, response) => reply(response, 201, enrolledBody));
@@ -157,7 +190,8 @@ test("an enrollment code cannot be mixed with an owner's pairing options, and a 
     for (const [args, environment, exitCode, pattern] of [
       [["--consent-profile", "full", "--accept-consent"], { PHIGON_ENROLLMENT_CODE: code }, 1, /Remove --consent-profile and --accept-consent/u],
       [["--code", "ABCDE-FGHIJ"], { PHIGON_ENROLLMENT_CODE: code }, 1, /either --code .* not both/u],
-      [["--enrollment-code", "--json"], {}, 1, /--enrollment-code needs the code.*PHIGON_ENROLLMENT_CODE/u],
+      [["--enrollment-code", "--json"], {}, 2, /--enrollment-code needs the code.*PHIGON_ENROLLMENT_CODE/u],
+      [["--enrollment-code="], {}, 2, /--enrollment-code needs the code/u],
       [["--enrollment-code", "ABCDE-FGHIJ"], {}, enrollmentExitCodes.invalidCode, /start with phe_/u],
       [[], { PHIGON_ENROLLMENT_CODE: code.slice(0, 12) }, enrollmentExitCodes.invalidCode, /copied in full/u],
     ] as const) {

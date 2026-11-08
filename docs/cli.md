@@ -27,7 +27,29 @@ phigon-observer help                    # the short form of this page
 | [`remove-machine`](#remove-machine) | Disconnect this computer. |
 
 Commands that take `--json` print one JSON object and never ask anything,
-which suits scripts and device management tools.
+which suits scripts and device management tools. Where a command would ask,
+add `--yes` (or, for `pair`, `--accept-consent`) instead.
+
+## Options and exit codes
+
+Options come after the command, as `--name value` or `--name=value`. A
+command refuses an option it doesn't take, an option without its value, the
+same option twice, and a value without an option (put a value with spaces in
+quotes). It names the option you probably meant, such as
+`Did you mean --json?`, and does nothing else. Everything after `--` belongs
+to the program that [`guardian exec` or `launch`](#guardian) runs, never to
+the observer.
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Done. |
+| `1` | The command failed. The message says why and what to do. |
+| `2` | The command line is wrong: an unknown command or option, a missing value, or options that contradict each other. Nothing was done. |
+
+Some commands have codes of their own: [`doctor --check`](#doctor) (3 to 7),
+[`pair` with an enrollment code](#pair-with-an-enrollment-code) (20 to 24),
+[`run`](#run) (75), and [`guardian`](#guardian) and
+[`authorize-action`](#authorize-action) (77).
 
 ## Getting started
 
@@ -57,12 +79,13 @@ computer keeps reporting after the terminal closes and after restarts.
 phigon-observer pair --code <one-time-code> --consent-profile <metadata|full>
   [--control-plane-url <url> --grpc-url <url> [--server-ca-sha256 <fingerprint>]]
   [--name <machine-name>] [--accept-consent] [--no-service]
-  [--no-remote-commands | --no-remote-actions] [--json]
+  [--remote-actions <all|stop-agents|none>] [--json]
 ```
 
 Connects this computer to a workspace. It shows the computer's owner exactly
-what will be collected and asks them to accept. The acceptance is stored with
-the computer's key, which is saved with owner-only file permissions. Then it
+what will be collected, and what the company's administrators may do on the
+computer, and asks them to accept. The acceptance is stored with the
+computer's key, which is saved with owner-only file permissions. Then it
 installs the [background service](#service) with the same profile.
 
 | Option | Meaning |
@@ -75,9 +98,19 @@ installs the [background service](#service) with the same profile.
 | `--name` | The name this computer has in the workspace. Defaults to the computer's name. |
 | `--accept-consent` | The owner accepts the scope without the prompt. Only for an owner pairing their own computer from a script. |
 | `--no-service` | Pair only; don't install the background service. Run [`run`](#run) yourself. |
-| `--no-remote-commands` | Administrators may stop this computer's agents, but not run commands on it, inspect it or restart it. |
-| `--no-remote-actions` | Administrators may do neither on this computer, even if the workspace allows it. |
-| `--json` | Print the result as JSON. |
+| `--remote-actions all` | Administrators may stop this computer's AI agents and run the commands they approve, inspect it and restart it. |
+| `--remote-actions stop-agents` | Administrators may stop this computer's agents, but not run commands on it, inspect it or restart it. |
+| `--remote-actions none` | Administrators may do neither on this computer, even if the workspace allows it. |
+| `--json` | Print the result as JSON. Needs `--accept-consent`. |
+
+The prompt tells the owner that administrators may stop agents and run the
+commands they approve, and how to allow less, so its default is
+`--remote-actions all`. With `--accept-consent` the owner sees no prompt, so
+the default is `none`: add `--remote-actions` to allow more. The person at
+the computer gets a notification each time an administrator stops an agent
+or runs a command there. `--no-remote-commands` (the same as `stop-agents`)
+and `--no-remote-actions` (the same as `none`) from earlier releases still
+work; options that contradict each other are refused.
 
 Pairing again replaces the previous pairing at once. A running observer stops
 within a second and its background service starts it again under the new
@@ -86,15 +119,20 @@ consent. If the new pairing shares less, collection narrows immediately.
 ## pair with an enrollment code
 
 ```sh
-PHIGON_ENROLLMENT_CODE=phe_... phigon-observer pair [--control-plane-url <url> --grpc-url <url> [--server-ca-sha256 <fingerprint>]] [--name <machine-name>] [--json]
+PHIGON_ENROLLMENT_CODE=phe_... phigon-observer pair [--control-plane-url <url> --grpc-url <url> [--server-ca-sha256 <fingerprint>]]
+  [--name <machine-name>] [--remote-actions <all|stop-agents|none>] [--json]
 phigon-observer pair --enrollment-code <code> [same options]
 phigon-observer service install
 ```
 
 For rolling Phigon out to many computers from Intune, Jamf or another device
 management tool. The company gives consent and chooses the profile when it
-creates the code in the Phigon app, so this asks nothing. The observer stores
-the company's choice and never collects more than it allows.
+creates the code in the Phigon app, so this asks nothing, and
+`--consent-profile` and `--accept-consent` are refused. The observer stores
+the company's choice and never collects more than it allows. Under the
+company's consent, administrators may stop agents and run the commands they
+approve, and the result says so; add `--remote-actions stop-agents` or
+`none` to allow less.
 
 Prefer `PHIGON_ENROLLMENT_CODE` over `--enrollment-code`: command-line options
 show in process lists. The code is never printed or saved. A busy server is
@@ -103,16 +141,21 @@ retried a few times.
 | Exit code | Meaning |
 | --- | --- |
 | `0` | Enrolled. |
+| `1` | Anything else, such as a bad setting. |
+| `2` | The command line is wrong, for example an unknown option. |
 | `20` | The server is busy or unreachable. Try again later. |
 | `21` | The code expired, was revoked, is used up, or is outdated. Ask for a new one. |
 | `22` | This is not a valid enrollment code. |
 | `23` | This computer already used this code. |
 | `24` | This computer is already connected to this workspace. |
 
+With `--json`, a failed enrollment with one of the codes 20 to 24 also
+prints `{"enrolled": false, "error": {"code": …, "message": …}, "exitCode": …}`.
+
 ## run
 
 ```sh
-phigon-observer run [--profile <metadata|full>]
+phigon-observer run [--profile <metadata|full>] [--control-plane-url <url> --grpc-url <url>]
 ```
 
 Finds the AI agents on this computer, reads their activity within the
@@ -125,9 +168,18 @@ metadata`, `run` refuses to start if a setting turns content on. If the owner
 consented to metadata only, `--profile full` collects metadata only and says
 so.
 
-You rarely run this by hand: the [background service](#service) runs it. It
-prints a short status and writes the same lines to `logs/observer.log` in the
-data directory.
+`--control-plane-url` and `--grpc-url` name the server for a computer whose
+pairing did not save them; pairing saves them, so you rarely need them.
+
+You rarely run this by hand: the [background service](#service) runs it, as
+`run --service-settings <file>`. It prints a short status and writes the same
+lines to `logs/observer.log` in the data directory.
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Stopped when asked to. A background service also exits `0` on a computer the workspace removed, so it stays stopped. |
+| `1` | It could not start or keep running, for example because the computer isn't paired, or the workspace removed it (when run by hand). |
+| `75` | The computer was paired again while it ran. The background service starts it again under the new pairing; run it again yourself otherwise. |
 
 ## service
 
@@ -149,19 +201,22 @@ sign-in and again if it stops.
 `install` needs a paired computer whose owner consented. It saves the current
 settings (the `PHIGON_*` ones, never a key or password, plus proxy and
 certificate settings and `PATH`) in `service-settings.json` in the data
-directory, so the service runs with them. Use it after pairing
-with `--no-service`, or to change the profile. `status` says whether the
-service is installed and running. `uninstall` removes it; the pairing stays.
+directory, so the service runs with them. Without `--profile` (or
+`PHIGON_OBSERVABILITY_PROFILE`), the service collects what the computer's
+consent covers. Use it after pairing with `--no-service`, or to change the
+profile. `status` says whether the service is installed and running.
+`uninstall` removes it; the pairing stays.
 
 ## doctor
 
 ```sh
-phigon-observer doctor [--profile <metadata|full>] [--json]
+phigon-observer doctor [--profile <metadata|full>] [--control-plane-url <url> --grpc-url <url>] [--json]
 phigon-observer doctor --check [--max-delivery-age <minutes>] [--json]
 ```
 
-Plain `doctor` checks the local setup without sending anything, and always
-exits `0`.
+Plain `doctor` checks the local setup without sending anything, and exits
+`0` unless a setting is invalid. It reports what the background service
+collects; `--profile` shows what that profile would collect instead.
 
 `doctor --check` also asks the server whether it answers, through the same
 proxy and pinned certificate authority the observer uses. It sends no
@@ -199,6 +254,8 @@ delivered are kept.
 | `--yes` | Update without asking. Needed when nobody is at the keyboard. |
 | `--json` | Report as JSON. With `--json`, `update` only checks, even with `--yes`. |
 
+It exits `1` when it could not reach npm to check.
+
 Interactive `pair` and `run` sessions also check for a release at most once a
 day and ask before updating. Background services and `--json` commands never
 update on their own. `PHIGON_UPDATE_CHECK=false` turns the daily check off.
@@ -222,7 +279,8 @@ phigon-observer agent remove --id <id> [--yes] [--json]
 ```
 
 Teaches the observer about an AI agent it has no built-in support for, without
-changing its code. Each option can be given more than once.
+changing its code. Each option except `--id` and `--name` can be given more
+than once.
 
 | Option | Meaning |
 | --- | --- |
@@ -246,6 +304,7 @@ Reads activity as NDJSON (one JSON object per line) from standard input and
 queues it like any other activity: within the consent profile, with secrets
 removed. Bridges and scripts use it. For an agent the observer doesn't know,
 use `--agent custom --name <agent-name>`. `--quiet` prints nothing on success.
+It exits `1` when it accepted no record.
 
 ## guardian
 
@@ -270,9 +329,17 @@ closed: when it can't get an answer, the action does not run.
   `anthropic:claude-opus-5-5`) and running commands. The native supervisor
   stops the whole process tree if the grant is revoked or can't be renewed.
 
+`guardian` on its own is `guardian status`. Everything after `--` is the
+program and its arguments, passed on untouched: `guardian exec -- git --help`
+runs `git --help`. `exec` and `launch` print the program's own output, so
+they take no `--json`. They exit with the program's exit code, or `77` when
+Guardian blocks it or can't give a verified answer, in which case nothing
+runs.
+
 `--context-file` gives Guardian more to judge by: a JSON file with any of
-`task_id`, `user_prompt`, `agent_plan`, `justification` and `recent_activity`.
-Each is cut to a bounded length.
+`task_id`, `proposal_id`, `plan_step_id`, `user_prompt`, `agent_plan`,
+`justification`, `expected_effect` and `recent_activity`. Each is cut to a
+bounded length.
 
 ## authorize-action
 
@@ -291,20 +358,24 @@ that asks it.
 | `--action` | One of `file.read`, `file.write`, `file.delete`, `command.execute`, `process.launch`, `network.connect`, `browser.navigate`, `credential.access`, `agent.start` or `model.use`. |
 | `--resource` | What the action is about, such as a file path, a command line or a host. |
 | `--agent` | Which agent asks. |
-| `--process-id`, `--process-started-at` | The exact process, so an administrator's stop applies to it and nothing else. |
+| `--process-id`, `--process-started-at` | The exact process, so an administrator's stop applies to it and nothing else. Give both or neither. |
 | `--context-file` | As for [`guardian`](#guardian). |
 
-It exits `0` when the action is allowed and `77` when it is not.
+`--action` and `--resource` are required. It needs a paired computer. It
+exits `0` when the action is allowed and `77` when it is not, including when
+Guardian can't give a verified answer.
 
 ## remove-machine
 
 ```sh
 phigon-observer remove-machine [--purge] [--yes] [--json]
+phigon-observer unpair [--purge] [--yes] [--json]
 ```
 
-Disconnects this computer: collection stops and its key is revoked. Activity
-already collected stays with the company until an administrator deletes the
-computer or it expires.
+Disconnects this computer: collection stops and its key is revoked, and the
+background service is removed. Activity already collected stays with the
+company until an administrator deletes the computer or it expires. `unpair`
+is another name for the same command.
 
 It asks first unless you add `--yes` (and with `--json`, `--yes` is
 required). `--purge` also removes the background service and every file the
@@ -354,7 +425,8 @@ effect when it was installed.
 
 | Variable | Meaning |
 | --- | --- |
-| `PHIGON_COLLECT_*` | Turn individual content categories off. Content can be on only under `--profile full` with the owner's full consent. |
+| `PHIGON_OBSERVABILITY_PROFILE` | `metadata` (default) or `full`, as `--profile` does. Never more than the computer's consent covers. |
+| `PHIGON_COLLECT_*` | Turn individual content categories off. Content can be on only under `--profile full` with full-activity consent, the owner's or the company's. |
 | `PHIGON_REDACT_PATH_PATTERNS` | More file path patterns to redact. |
 | `PHIGON_<AGENT>_ACTIVITY_DIRS` | More folders where an agent writes its records, such as `PHIGON_CLAUDE_ACTIVITY_DIRS`. |
 | `PHIGON_ACTIVITY_REPLAY_ON_FIRST_START` | `true` reads agents' past history on the first start (full profile only). Off by default. |
@@ -363,9 +435,9 @@ effect when it was installed.
 
 | Variable | Meaning |
 | --- | --- |
-| `PHIGON_REMOTE_ACTIONS_ENABLED` | `true` or `false` overrides whether administrators may stop and force-stop agents. Unset, the consent given at pairing decides. |
-| `PHIGON_REMOTE_COMMANDS_ENABLED` | `true` or `false` overrides whether administrators may run reviewed commands, inspect the system and restart it. |
-| `PHIGON_USER_NOTICES` | `false` stops the notices that tell the person at the computer when Phigon stops an agent, runs a command or restarts it. On by default. |
+| `PHIGON_REMOTE_ACTIONS_ENABLED` | Whether administrators may stop and force-stop agents. Unset, the consent given at pairing decides; `false` takes it back, and `true` never allows more than that consent. On a computer paired by an observer older than 8.8.0, `true` allows it. |
+| `PHIGON_REMOTE_COMMANDS_ENABLED` | The same for running reviewed commands, inspecting the system and restarting it. |
+| `PHIGON_USER_NOTICES` | `false` stops the notices that tell the person at the computer when Phigon stops an agent, starts and finishes a command or restarts it, and, on an enrolled computer, that collection started. On by default. |
 
 ### Other
 
@@ -374,6 +446,7 @@ effect when it was installed.
 | `PHIGON_UPDATE_CHECK` | `false` turns off the once-a-day update check. |
 | `PHIGON_LOG_LEVEL` | `debug`, `info` (default), `warn` or `error`. |
 | `PHIGON_DISCOVERY_INTERVAL_MS`, `PHIGON_HEARTBEAT_INTERVAL_MS` | How often agents are looked for and the server is told the computer is alive. |
+| `PHIGON_GUARDIAN_DECISION_TIMEOUT_MS` | How long Guardian may take to answer before the action is blocked. Default 65000. |
 | `PHIGON_ENROLLMENT_CODE` | A company's enrollment code, for [pairing without questions](#pair-with-an-enrollment-code). |
 
 Logs and terminal output never contain activity content, keys or secrets.

@@ -7,7 +7,7 @@
 <h1 align="center">Phigon Observer</h1>
 
 <p align="center">
-  See what AI coding agents do on a computer, with the owner's consent.
+  See what AI coding agents do on a computer, with the owner's or the company's consent.
 </p>
 
 <p align="center">
@@ -27,23 +27,26 @@
 
 The Phigon Observer runs on a computer where people use AI coding agents such as
 Claude Code, Codex, Cursor and GitHub Copilot. It finds the agents, records what
-they do within the scope the computer's owner approves, removes secrets on the
-machine, and streams the activity to a [Phigon](https://phigon.online)
+they do within the scope that was agreed for that computer, removes secrets on
+the machine, and streams the activity to a [Phigon](https://phigon.online)
 workspace. It can also check your company's Guardian rules before an agent runs
 a risky action.
 
 It is open source under the [Apache License 2.0](LICENSE), so you can read
 exactly what runs on your computers and what leaves them.
 
-- **Consent first.** Nothing is collected until the computer's owner approves
-  the exact scope on that machine.
+- **Consent first.** A computer is connected in one of two ways. When its
+  owner pairs it, nothing is collected until the owner approves the exact
+  scope on that computer. When the company enrolls it with a code, the
+  company's consent covers it and nobody at the computer is asked; the person
+  using it gets a notification when collection starts, and each time Phigon
+  stops an agent or runs a command there.
 - **Metadata by default.** The default profile shares which agents run and the
   kind of work they do, not prompts, replies, code or terminal output.
 - **Secrets stay on the machine.** Passwords, tokens and API keys are redacted
   before anything is sent. Local settings can only narrow what is shared.
 - **Survives disconnects.** Activity waits in an encrypted local queue and is
   delivered, in order and without duplicates, when the connection returns.
-
 
 ## Supported agents
 
@@ -220,6 +223,10 @@ phigon-observer service install
 - `--enrollment-code <code>` works too, but anyone on the computer can see a
   command line. `--server-ca-sha256 <fingerprint>` and `--name <name>` work
   as with pairing; `--consent-profile` and `--accept-consent` are refused.
+- Administrators may stop AI agents and run the commands they approve on the
+  computer, under the company's consent, and the result says so. Add
+  `--remote-actions stop-agents` or `--remote-actions none` to allow less; see
+  [Agent actions](#agent-actions).
 - The code is never printed, logged or saved, and `service install` never
   copies `PHIGON_ENROLLMENT_CODE` into its settings.
 - A computer already paired with the same server keeps its machine and key,
@@ -254,7 +261,8 @@ object):
 ## What is collected
 
 What the observer sends is always the overlap of your workspace's policy and
-the profile the computer's owner accepted.
+the profile the computer's owner accepted, or, for a computer enrolled with a
+code, the profile the company chose.
 
 | | Metadata (default) | Full activity |
 | --- | --- | --- |
@@ -375,9 +383,9 @@ Settings are environment variables. The most common ones:
 | `PHIGON_COLLECT_*` | Turns individual content categories off. Content can be turned on only under `--profile full` on a computer whose owner consented to full activity. Under `--profile metadata`, `run` refuses to start with one turned on; when the consent alone covers metadata only, they stay off. |
 | `PHIGON_REDACT_PATH_PATTERNS` | Extra file path patterns to redact. |
 | `PHIGON_<AGENT>_ACTIVITY_DIRS` | Extra record folders for an agent, e.g. `PHIGON_CLAUDE_ACTIVITY_DIRS`. |
-| `PHIGON_REMOTE_ACTIONS_ENABLED` | `true` or `false` overrides whether administrators may stop and force-stop agents. Unset, the consent given when the computer paired decides. |
-| `PHIGON_REMOTE_COMMANDS_ENABLED` | `true` or `false` overrides whether administrators may run reviewed commands, inspect the system and restart it. Unset, the consent given when the computer paired decides. |
-| `PHIGON_USER_NOTICES` | Set to `false` to stop telling the person at the computer when Phigon stops an agent, runs a command or restarts it, and, on a computer enrolled with a company's code, that collection started. On by default. |
+| `PHIGON_REMOTE_ACTIONS_ENABLED` | Whether administrators may stop and force-stop agents. Unset, the consent given when the computer paired decides; `false` takes it back, and `true` never allows more than that consent. On a computer paired by an observer older than 8.8.0, `true` allows it. |
+| `PHIGON_REMOTE_COMMANDS_ENABLED` | The same for running reviewed commands, inspecting the system and restarting it. |
+| `PHIGON_USER_NOTICES` | Set to `false` to stop telling the person at the computer when Phigon stops an agent, starts and finishes a command or restarts it, and, on a computer enrolled with a company's code, that collection started. On by default. |
 | `PHIGON_UPDATE_CHECK` | Set to `false` to turn off the once-a-day update check. |
 | `PHIGON_LOG_LEVEL` | What `run` prints and writes to its log: `debug`, `info` (default), `warn` or `error`. |
 
@@ -438,14 +446,25 @@ match.
 
 ## Agent actions
 
-From observer 8.8.0, the owner agrees at pairing (or the company, with an
-enrollment code) that administrators may stop AI agents and run the commands
-they approve; the consent prompt says so, and the pairing stores the answer.
-`--no-remote-commands` allows only stopping agents, and `--no-remote-actions`
-allows neither. A computer paired by an earlier observer allows neither until
-it pairs again. `PHIGON_REMOTE_ACTIONS_ENABLED` and
-`PHIGON_REMOTE_COMMANDS_ENABLED` set to `true` or `false` override the
-stored answer.
+Whoever connects the computer also decides what the company's administrators
+may do on it, and the pairing stores the answer:
+
+- **An owner at the consent prompt** is told that administrators may stop AI
+  agents and run the commands they approve, and agrees to that by typing
+  `yes`. To allow less, pair with `--remote-actions stop-agents` (only
+  stopping agents) or `--remote-actions none` (neither).
+- **An owner who pairs with `--accept-consent`** (needed for `--json`) sees no
+  prompt, so administrators may do neither unless `--remote-actions all` or
+  `--remote-actions stop-agents` says otherwise.
+- **A company's enrollment code** allows both, under the company's consent,
+  unless the script adds `--remote-actions stop-agents` or `none`.
+
+`--no-remote-commands` (only stopping agents) and `--no-remote-actions`
+(neither) from earlier releases still work. A computer paired by an observer
+older than 8.8.0 allows neither until it pairs again, unless
+`PHIGON_REMOTE_ACTIONS_ENABLED` or `PHIGON_REMOTE_COMMANDS_ENABLED` is `true`.
+On a computer paired since, those settings set to `false` can take back what
+was allowed; they never allow more.
 
 - **Stopping agents** lets administrators stop or force-stop
   one exact running agent process. Each stop needs an operator proposal and a
@@ -472,8 +491,11 @@ stored answer.
 
 Whenever Phigon stops an agent on a computer, whether someone asked, Phigon AI
 decided or the agent is blocked, the person at that computer sees a system
-notification such as "Claude Code was stopped by Phigon", with the reason. The
-same goes for commands Phigon runs and a scheduled restart or shutdown. It uses
+notification such as "Claude Code was stopped by Phigon", with the reason. A
+command an administrator runs is announced as it starts ("Phigon is running
+git on this computer") and again when it ends, each time with the program's
+name and the administrator's reason only; the command does not wait for the
+notification. A scheduled restart or shutdown is announced a minute ahead. It uses
 the system's own notifications (a Windows toast, macOS Notification Center, or
 `notify-send` on Linux) and shows nothing when the observer runs without a
 desktop session, for example as a Windows service. `PHIGON_USER_NOTICES=false`
@@ -622,9 +644,8 @@ sh scripts/check-generated.sh
 
 ## Contributing
 
-Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first, and
-see [About this repository](#about-this-repository) for how a pull request
-reaches the code.
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first; it
+also explains how a pull request reaches the code.
 
 ## Getting help
 

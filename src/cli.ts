@@ -37,7 +37,8 @@ import {
   type ObserverConfig,
 } from "./config.js";
 import { FileCredentialStore, type RemoteActionConsent, type StoredMachineCredential } from "./credential-store.js";
-import { containmentAllowed, remoteActionConsent, remoteActionSentence, remoteActionsAllowed } from "./remote-actions.js";
+import { containmentAllowed, remoteActionConsent, remoteActionSentence, remoteActionsAllowed, statedRemoteActions } from "./remote-actions.js";
+import { checkCommandLine, isCommand, UsageError, usageExitCode } from "./command-options.js";
 import {
   CustomAgentRegistry,
   customAgentRegistration,
@@ -155,15 +156,14 @@ export async function run(
   input: Readable = process.stdin,
   dependencies: ServiceDependencies = {},
 ): Promise<number> {
-  const [command, ...flags] = argv;
+  const [command, ...rest] = argv;
+  // Everything after "--" belongs to the program that guardian exec or
+  // launch runs, never to the observer: `guardian exec -- git --help` runs
+  // git with --help.
+  const separator = rest.indexOf("--");
+  const flags = separator < 0 ? rest : rest.slice(0, separator);
+  const operands = separator < 0 ? undefined : rest.slice(separator + 1);
   let logged: LevelledOutput | undefined;
-  // A background service runs `run --service-settings <file>`; the file
-  // sits in the data directory and holds the settings it was installed with.
-  const serviceSettingsFile = command === "run" ? flagValue(flags, "--service-settings") : undefined;
-  const ownEnvironment = environment === process.env;
-  if (serviceSettingsFile !== undefined) {
-    environment = { ...environment, PHIGON_DATA_DIR: dirname(resolve(serviceSettingsFile)) };
-  }
 
   if (command === "--version" || command === "-v" || command === "version") {
     output.stdout(`${await readVersion()}\n`);
@@ -175,22 +175,26 @@ export async function run(
     return 0;
   }
 
-  if (
-    command !== "doctor" &&
-    command !== "update" &&
-    command !== "agent" &&
-    command !== "authorize-action" &&
-    command !== "guardian" &&
-    command !== "discover" &&
-    command !== "ingest" &&
-    command !== "pair" &&
-    command !== "remove-machine" &&
-    command !== "unpair" &&
-    command !== "service" &&
-    command !== "run"
-  ) {
+  if (!isCommand(command)) {
     output.stderr(`Unknown command: ${command}\n\n${helpText()}`);
-    return 2;
+    return usageExitCode;
+  }
+
+  // Before anything runs: a misspelled option must not be ignored.
+  try {
+    checkCommandLine(command, flags, operands);
+  } catch (error) {
+    if (!(error instanceof UsageError)) throw error;
+    output.stderr(`Observer command failed: ${error.message}\n`);
+    return error.exitCode;
+  }
+
+  // A background service runs `run --service-settings <file>`; the file
+  // sits in the data directory and holds the settings it was installed with.
+  const serviceSettingsFile = command === "run" ? flagValue(flags, "--service-settings") : undefined;
+  const ownEnvironment = environment === process.env;
+  if (serviceSettingsFile !== undefined) {
+    environment = { ...environment, PHIGON_DATA_DIR: dirname(resolve(serviceSettingsFile)) };
   }
 
   if (command === "run") {
@@ -273,10 +277,12 @@ export async function run(
     }
 
     if (command === "guardian") {
-      const subcommand = flags[0] ?? "status";
+      // `guardian --json` is `guardian status --json`.
+      const subcommand = flags[0] === undefined || flags[0].startsWith("-") ? "status" : flags[0];
       if (subcommand === "exec") {
         return await runGuardianExec(
           flags.slice(1),
+          operands,
           environment,
           output,
           input,
@@ -286,6 +292,7 @@ export async function run(
       if (subcommand === "launch") {
         return await runGuardianLaunch(
           flags.slice(1),
+          operands,
           environment,
           output,
           input,
@@ -1188,14 +1195,18 @@ export async function run(
       // Pairing also keeps the observer running in the background, unless
       // whoever runs it keeps it running another way.
       const background = !flags.includes("--no-service");
-      // The owner also agrees to what the company's administrators may do here.
-      const remoteActions = remoteActionConsent(flags);
-      if (json && !flags.includes("--accept-consent")) {
+      // The owner also agrees to what the company's administrators may do
+      // here. An owner who accepts without the prompt never read that
+      // sentence, so administrators may do nothing unless the owner says so.
+      const accepted = flags.includes("--accept-consent");
+      const remoteActions = remoteActionConsent(flags, accepted ? "accepted" : "prompt");
+      const remoteActionsUnstated = accepted && statedRemoteActions(flags) === undefined;
+      if (json && !accepted) {
         throw new Error(
           "JSON pairing requires --accept-consent after reviewing the selected profile.",
         );
       }
-      if (!flags.includes("--accept-consent")) {
+      if (!accepted) {
         output.stdout(consentPrompt(consentProfile, background, remoteActions));
         const confirmed = await readConfirmation(input);
         if (confirmed !== "yes") {
@@ -1237,7 +1248,7 @@ export async function run(
             ...(restarts ? { runningObserverRestarts: true } : {}),
             ...(service === undefined ? {} : { backgroundService: service }),
           }, null, 2)}\n`
-          : formatPairResult(result, restarts, service, consentProfile, remoteActions),
+          : formatPairResult(result, restarts, service, consentProfile, remoteActions, remoteActionsUnstated),
       );
       return 0;
     }
@@ -1299,6 +1310,7 @@ export async function run(
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error.";
     (logged?.error ?? output.stderr)(`Observer command failed: ${message}\n`);
+    if (error instanceof UsageError) return error.exitCode;
     if (error instanceof EnrollmentError) {
       if (flags.includes("--json")) {
         output.stdout(`${JSON.stringify({
@@ -1351,7 +1363,10 @@ async function enrollWithCode(
   version: string,
   output: Output,
 ): Promise<number> {
-  // Checked before anything is pinned or sent.
+  // Checked before anything is pinned or sent. The company's policy is the
+  // consent, so administrators may stop agents and run the commands they
+  // approve unless the script says less; the result says which.
+  const remoteActions = remoteActionConsent(flags, "enrollment");
   const enrollmentCode = checkedEnrollmentCode(code);
   const displayName = flagValue(flags, "--name");
   const authorityFlag = flagValue(flags, "--server-ca-sha256");
@@ -1366,7 +1381,7 @@ async function enrollWithCode(
     config,
     code: enrollmentCode,
     observerVersion: version,
-    remoteActions: remoteActionConsent(flags),
+    remoteActions,
     serverMoved: pairingAuthority.serverMoved,
     ...(displayName === undefined ? {} : { displayName }),
     onRetry: (waitMs) => output.stderr(
@@ -1379,7 +1394,6 @@ async function enrollWithCode(
     ? "Your company's code covers the metadata profile only, so the observer collects metadata even with PHIGON_OBSERVABILITY_PROFILE=full. Ask your company for a full-activity code to change it."
     : undefined;
   if (warning !== undefined) output.stderr(`${warning}\n`);
-  const remoteActions = remoteActionConsent(flags);
   output.stdout(json ? `${JSON.stringify({ enrolled: true, ...result, remoteActions }, null, 2)}\n` : formatEnrollResult(result, remoteActions));
   return 0;
 }
@@ -1477,23 +1491,18 @@ function guardianAgentMessage(
 }
 
 async function runGuardianExec(
-  flags: readonly string[],
+  gatewayFlags: readonly string[],
+  operands: readonly string[] | undefined,
   environment: NodeJS.ProcessEnv,
   output: Output,
   input: Readable,
   dataDirectory: string,
 ): Promise<number> {
-  const separator = flags.indexOf("--");
-  if (separator < 0 || separator === flags.length - 1) {
+  if (operands === undefined || operands.length === 0) {
     throw new Error("guardian exec requires -- <executable> [arguments...].");
   }
-  const gatewayFlags = flags.slice(0, separator);
-  validateGuardianExecFlags(gatewayFlags);
-  if (gatewayFlags.includes("--json")) {
-    throw new Error("guardian exec does not support --json because command output is streamed directly.");
-  }
-  const executable = flags[separator + 1] as string;
-  const commandArguments = flags.slice(separator + 2);
+  // The options themselves were checked against the command's table.
+  const [executable, ...commandArguments] = operands as [string, ...string[]];
   if (executable.trim() === "" || /[\u0000\r\n]/u.test(executable) ||
     commandArguments.some((argument) => /[\u0000]/u.test(argument))) {
     throw new Error("guardian exec executable or arguments are invalid.");
@@ -1502,20 +1511,15 @@ async function runGuardianExec(
 }
 
 async function runGuardianLaunch(
-  flags: readonly string[],
+  gatewayFlags: readonly string[],
+  operands: readonly string[] | undefined,
   environment: NodeJS.ProcessEnv,
   output: Output,
   input: Readable,
   dataDirectory: string,
 ): Promise<number> {
-  const separator = flags.indexOf("--");
-  if (separator < 0 || separator === flags.length - 1) {
+  if (operands === undefined || operands.length === 0) {
     throw new Error("guardian launch requires -- <executable> [arguments...].");
-  }
-  const gatewayFlags = flags.slice(0, separator);
-  validateGuardianLaunchFlags(gatewayFlags);
-  if (gatewayFlags.includes("--json")) {
-    throw new Error("guardian launch does not support --json because agent output is streamed directly.");
   }
   const agentID = flagValue(gatewayFlags, "--agent");
   if (agentID === undefined) {
@@ -1523,8 +1527,7 @@ async function runGuardianLaunch(
   }
   validatedAgentID(agentID);
   const model = validatedModelResource(flagValue(gatewayFlags, "--model"));
-  const executable = flags[separator + 1] as string;
-  const commandArguments = flags.slice(separator + 2);
+  const [executable, ...commandArguments] = operands as [string, ...string[]];
   if (executable.trim() === "" || /[\u0000\r\n]/u.test(executable) ||
     commandArguments.some((argument) => /[\u0000]/u.test(argument))) {
     throw new Error("guardian launch executable or arguments are invalid.");
@@ -1539,37 +1542,6 @@ function validatedAgentID(value: string): string {
     throw new Error("--agent must be 1-128 letters, numbers, dots, underscores, colons or hyphens.");
   }
   return value;
-}
-
-function validateGuardianExecFlags(flags: readonly string[]): void {
-  const valued = new Set([
-    "--agent",
-    "--context-file",
-  ]);
-  for (let index = 0; index < flags.length; index += 1) {
-    const flag = flags[index] as string;
-    if (flag === "--json") continue;
-    if (!valued.has(flag) || index + 1 >= flags.length) {
-      throw new Error(`guardian exec does not support ${flag}.`);
-    }
-    index += 1;
-  }
-}
-
-function validateGuardianLaunchFlags(flags: readonly string[]): void {
-  const valued = new Set([
-    "--agent",
-    "--model",
-    "--context-file",
-  ]);
-  for (let index = 0; index < flags.length; index += 1) {
-    const flag = flags[index] as string;
-    if (flag === "--json") continue;
-    if (!valued.has(flag) || index + 1 >= flags.length) {
-      throw new Error(`guardian launch does not support ${flag}.`);
-    }
-    index += 1;
-  }
 }
 
 function validatedModelResource(value: string | undefined): string {
@@ -1814,17 +1786,18 @@ function helpText(): string {
     "  phigon-observer agent add --id <id> --name <name> [--executable <name>] [--process <name>] [--config-path <path>] [--activity-dir <path>] [--capability <name>] [--json]",
     "  phigon-observer agent list [--json]",
     "  phigon-observer agent remove --id <id> [--yes] [--json]",
-    "  phigon-observer doctor [--profile <metadata|full>] [--json]",
+    "  phigon-observer doctor [--profile <metadata|full>] [--control-plane-url <url> --grpc-url <url>] [--json]",
     "  phigon-observer doctor --check [--max-delivery-age <minutes>] [--json]",
     "  phigon-observer update [--check] [--yes] [--json]",
     "  phigon-observer --version",
     "  phigon-observer discover [--json]",
     "  phigon-observer ingest --agent <agent-id|custom> [--name <agent-name>] [--quiet] [--json]",
-    "  phigon-observer pair --code <one-time-code> --consent-profile <metadata|full> [--control-plane-url <url> --grpc-url <url> [--server-ca-sha256 <fingerprint>]] [--name <machine-name>] [--accept-consent] [--no-service] [--no-remote-commands | --no-remote-actions] [--json]",
-    "  PHIGON_ENROLLMENT_CODE=<code> phigon-observer pair [--control-plane-url <url> --grpc-url <url> [--server-ca-sha256 <fingerprint>]] [--name <machine-name>] [--json]",
+    "  phigon-observer pair --code <one-time-code> --consent-profile <metadata|full> [--control-plane-url <url> --grpc-url <url> [--server-ca-sha256 <fingerprint>]] [--name <machine-name>] [--accept-consent] [--no-service] [--remote-actions <all|stop-agents|none>] [--json]",
+    "  PHIGON_ENROLLMENT_CODE=<code> phigon-observer pair [--control-plane-url <url> --grpc-url <url> [--server-ca-sha256 <fingerprint>]] [--name <machine-name>] [--remote-actions <all|stop-agents|none>] [--json]",
     "  phigon-observer pair --enrollment-code <code> [same options]",
     "  phigon-observer remove-machine [--purge] [--yes] [--json]",
-    "  phigon-observer run [--profile <metadata|full>]",
+    "  phigon-observer unpair [--purge] [--yes] [--json]",
+    "  phigon-observer run [--profile <metadata|full>] [--control-plane-url <url> --grpc-url <url>]",
     "  phigon-observer service install [--profile <metadata|full>] [--json]",
     "  phigon-observer service uninstall [--json]",
     "  phigon-observer service status [--json]",
@@ -1840,10 +1813,12 @@ function helpText(): string {
     "The discover command reports a sanitized one-time local inventory.",
     "The ingest command accepts NDJSON on stdin for every supported bridge; use --agent custom --name <agent-name> for any other agent.",
     "The pair command shows the selected collection scope, requires machine-owner acceptance, and stores that evidence with the mode-0600 credential.",
-    "With a company's enrollment code (phe_...), pair asks nothing: the company has given consent and chosen the profile, which the observer stores and keeps collection within. Prefer PHIGON_ENROLLMENT_CODE to --enrollment-code, which shows in process lists. The code is never printed or stored. A busy server is retried a few times. Exit codes: 20 try again later, 21 the code expired, was revoked, is used up or outdated, 22 not a valid code, 23 this computer already used this code, 24 already connected to this workspace. Then run phigon-observer service install.",
-    "The remove-machine command stops collection on this paired machine and revokes its credential; activity already collected stays until an administrator deletes the machine or it expires. It requires local confirmation. With --purge it also removes the background service and every file the observer keeps in the data directory.",
+    "The owner also decides what the company's administrators may do on the computer: --remote-actions all (stop agents and run the commands they approve), stop-agents or none. At the prompt the default is all, and the prompt says so. With --accept-consent there is no prompt, so the default is none. --no-remote-commands (stop-agents) and --no-remote-actions (none) still work.",
+    "With a company's enrollment code (phe_...), pair asks nothing: the company has given consent and chosen the profile, which the observer stores and keeps collection within. Administrators may stop agents and run the commands they approve unless --remote-actions says less. Prefer PHIGON_ENROLLMENT_CODE to --enrollment-code, which shows in process lists. The code is never printed or stored. A busy server is retried a few times. Exit codes: 20 try again later, 21 the code expired, was revoked, is used up or outdated, 22 not a valid code, 23 this computer already used this code, 24 already connected to this workspace. Then run phigon-observer service install.",
+    "The remove-machine command stops collection on this paired machine and revokes its credential; activity already collected stays until an administrator deletes the machine or it expires. It requires local confirmation. With --purge it also removes the background service and every file the observer keeps in the data directory. unpair is another name for it.",
     "The run command maintains an authenticated, resumable telemetry stream; --profile applies the same portable local collection profile on Windows, macOS, and Linux.",
     "The service commands run the observer in the background for the signed-in user (a Task Scheduler task, a LaunchAgent or a systemd user unit) with this data directory and these settings, starting it at sign-in and again if it stops. Install needs a paired computer with the owner's consent.",
+    "A command, option or value the observer does not know stops the command before it does anything, with exit code 2. Options go before --; everything after -- belongs to the program guardian exec or launch runs.",
     "",
   ].join("\n");
 }
@@ -1910,12 +1885,16 @@ function formatPairResult(
   service: PairingService | undefined,
   profile: ConsentProfile,
   remoteActions: RemoteActionConsent,
+  remoteActionsUnstated = false,
 ): string {
   return [
     "Machine paired successfully.",
     `Machine: ${result.displayName} (${result.machineId})`,
     `Control plane: ${result.controlPlaneOrigin}`,
     remoteActionSentence(remoteActions),
+    ...(remoteActionsUnstated
+      ? ["To let them stop agents, or also run the commands they approve, pair again with --remote-actions stop-agents or --remote-actions all."]
+      : []),
     "Machine credential: stored securely",
     ...(result.previousControlPlaneOrigin === undefined || result.replacedMachineId !== undefined
       ? []
@@ -2301,7 +2280,7 @@ function consentPrompt(profile: ConsentProfile, background: boolean, remoteActio
       : []),
     remoteActionSentence(remoteActions),
     ...(remoteActions === "all"
-      ? ["To allow only stopping agents, add --no-remote-commands; to allow neither, add --no-remote-actions."]
+      ? ["To allow only stopping agents, run pair again with --remote-actions stop-agents; to allow neither, use --remote-actions none."]
       : []),
     `The machine owner can stop the observer at any time${background ? " (phigon-observer service uninstall)" : ""}.`,
     'Type "yes" to grant this scope and pair the machine: ',

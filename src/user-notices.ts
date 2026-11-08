@@ -19,6 +19,9 @@ export class UserNotices {
   readonly #send: NoticeSender | undefined;
   readonly #now: () => number;
   readonly #recent = new Map<string, number>();
+  // Start-of-command notices still being handed over, by action. Each is
+  // removed once handed over, so the map holds only commands under way.
+  readonly #starting = new Map<string, Promise<void>>();
 
   constructor(options: Readonly<{ enabled: boolean; send?: NoticeSender; now?: () => number }>) {
     this.#send = options.enabled ? options.send ?? platformNoticeSender() : undefined;
@@ -41,11 +44,42 @@ export class UserNotices {
     });
   }
 
+  /**
+   * An administrator's command about to start. The command never waits for
+   * the notice; the one said when it ends follows this one. It names only
+   * what that one names: the program and the administrator's reason.
+   */
+  commandStarting(input: Readonly<{ key: string; program: string; reason: string }>): void {
+    const shown = this.#show(`${input.key}:start`, {
+      title: `Phigon is running ${input.program} on this computer`,
+      body: input.reason.trim() || "Your workspace administrator asked for it.",
+    });
+    if (shown === undefined) return;
+    this.#starting.set(input.key, shown);
+    void shown.then(() => {
+      if (this.#starting.get(input.key) === shown) this.#starting.delete(input.key);
+    });
+  }
+
   commandRan(input: Readonly<{ key: string; program: string; reason: string }>): void {
     this.#show(input.key, {
       title: `Phigon ran ${input.program} on this computer`,
       body: input.reason.trim() || "Your workspace administrator asked for it.",
-    });
+    }, this.#startedNotice(input.key));
+  }
+
+  /** A command announced as starting that the system could not start. */
+  commandNotStarted(input: Readonly<{ key: string; program: string }>): void {
+    this.#show(input.key, {
+      title: `Phigon could not run ${input.program} on this computer`,
+      body: "Nothing ran.",
+    }, this.#startedNotice(input.key));
+  }
+
+  #startedNotice(key: string): Promise<void> | undefined {
+    const started = this.#starting.get(key);
+    this.#starting.delete(key);
+    return started;
   }
 
   powerChange(input: Readonly<{ key: string; restart: boolean; reason: string }>): void {
@@ -81,15 +115,22 @@ export class UserNotices {
     }
   }
 
-  #show(key: string, notice: UserNotice): void {
-    if (this.#send === undefined) return;
+  /**
+   * Hands the notice to the system, after `after` when given, so a notice
+   * that a command ended never shows before the one that it started.
+   * Resolves once it was handed over or failed; it never rejects.
+   */
+  #show(key: string, notice: UserNotice, after?: Promise<void>): Promise<void> | undefined {
+    const send = this.#send;
+    if (send === undefined) return undefined;
     const now = this.#now();
     for (const [seen, at] of this.#recent) if (now - at > repeatWindowMs) this.#recent.delete(seen);
     // A retried action or a review that sees the same process again is
     // announced once.
-    if (this.#recent.has(key)) return;
+    if (this.#recent.has(key)) return undefined;
     this.#recent.set(key, now);
-    void this.#send({ title: plainText(notice.title, 120), body: plainText(notice.body, textLimit) }).catch(() => undefined);
+    const bounded = { title: plainText(notice.title, 120), body: plainText(notice.body, textLimit) };
+    return (after === undefined ? send(bounded) : after.then(() => send(bounded))).catch(() => undefined);
   }
 }
 

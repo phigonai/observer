@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { StoredMachineCredential } from "../src/credential-store.js";
-import { containmentAllowed, remoteActionConsent, remoteActionSentence, remoteActionsAllowed } from "../src/remote-actions.js";
+import { UsageError } from "../src/command-options.js";
+import { containmentAllowed, remoteActionConsent, remoteActionSentence, remoteActionsAllowed, statedRemoteActions } from "../src/remote-actions.js";
 
 // Machine keys are built at run time, so no key-shaped text is stored.
 const paired: StoredMachineCredential = {
@@ -14,10 +15,44 @@ const paired: StoredMachineCredential = {
 const off = { remoteActionsEnabled: false, remoteCommandsEnabled: false };
 
 test("pairing lets administrators stop agents and run approved commands unless the owner leaves them out", () => {
-  assert.equal(remoteActionConsent([]), "all");
-  assert.equal(remoteActionConsent(["--no-remote-commands"]), "stop_agents");
-  assert.equal(remoteActionConsent(["--no-remote-actions"]), "none");
-  assert.equal(remoteActionConsent(["--no-remote-commands", "--no-remote-actions"]), "none");
+  for (const consent of ["prompt", "accepted", "enrollment"] as const) {
+    assert.equal(remoteActionConsent(["--no-remote-commands"], consent), "stop_agents");
+    assert.equal(remoteActionConsent(["--no-remote-actions"], consent), "none");
+    assert.equal(remoteActionConsent(["--no-remote-commands", "--no-remote-actions"], consent), "none");
+    assert.equal(remoteActionConsent(["--remote-actions", "all"], consent), "all");
+    assert.equal(remoteActionConsent(["--remote-actions=stop-agents"], consent), "stop_agents");
+    assert.equal(remoteActionConsent(["--remote-actions", "none"], consent), "none");
+    // Saying the same thing twice is no contradiction.
+    assert.equal(remoteActionConsent(["--remote-actions", "stop-agents", "--no-remote-commands"], consent), "stop_agents");
+    assert.equal(remoteActionConsent(["--remote-actions", "none", "--no-remote-actions", "--no-remote-commands"], consent), "none");
+  }
+});
+
+test("without a choice, only an owner who read the consent prompt, or a company's code, allows both", () => {
+  // The prompt says administrators may stop agents and run commands, and how to allow less.
+  assert.equal(remoteActionConsent([], "prompt"), "all");
+  // --accept-consent (and so --json) skips the prompt: the owner never read that sentence.
+  assert.equal(remoteActionConsent(["--accept-consent", "--json"], "accepted"), "none");
+  // The company's enrollment policy is the consent.
+  assert.equal(remoteActionConsent(["--json"], "enrollment"), "all");
+  assert.equal(statedRemoteActions(["--accept-consent"]), undefined);
+});
+
+test("contradictory or unknown remote action choices are refused as usage errors", () => {
+  for (const [flags, message] of [
+    [["--remote-actions", "all", "--no-remote-commands"], "--remote-actions all contradicts --no-remote-commands. Use --remote-actions alone."],
+    [["--remote-actions", "all", "--no-remote-actions"], "--remote-actions all contradicts --no-remote-actions. Use --remote-actions alone."],
+    [["--remote-actions", "stop-agents", "--no-remote-actions"], "--remote-actions stop-agents contradicts --no-remote-actions. Use --remote-actions alone."],
+    [["--remote-actions", "stop_agents"], "--remote-actions must be all, stop-agents or none."],
+    [["--remote-actions=everything"], "--remote-actions must be all, stop-agents or none."],
+    // Names every object has are not choices either.
+    [["--remote-actions", "constructor"], "--remote-actions must be all, stop-agents or none."],
+    [["--remote-actions=toString"], "--remote-actions must be all, stop-agents or none."],
+    [["--remote-actions", "__proto__"], "--remote-actions must be all, stop-agents or none."],
+  ] as const) {
+    assert.throws(() => remoteActionConsent(flags, "prompt"), (error: unknown) =>
+      error instanceof UsageError && error.exitCode === 2 && error.message === message, flags.join(" "));
+  }
 });
 
 test("a computer allows what was consented to when it paired", () => {

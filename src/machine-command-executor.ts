@@ -125,6 +125,11 @@ export class MachineCommandExecutor {
     } else {
       const power = command.action === Action.SHUTDOWN_MACHINE || command.action === Action.RESTART_MACHINE;
       const operation = power ? powerCommand(command.action === Action.RESTART_MACHINE) : spec!;
+      // The person at the computer hears of an administrator's command before
+      // it starts, not only after. The notice never holds the command up.
+      if (command.action === Action.RUN_COMMAND) {
+        this.#options.notices?.commandStarting({ key: command.actionId, program: programName(spec!.executable), reason: command.reason });
+      }
       const execution = await runCommand(operation);
       const succeeded = execution.exitCode === 0 && !execution.timedOut;
       result = !execution.launched
@@ -134,7 +139,9 @@ export class MachineCommandExecutor {
           execution.timedOut ? "Command exceeded its time limit; termination was requested." : power && succeeded ? "Operating system accepted the power change scheduled for one minute from now." : succeeded ? "Command completed." : "Command did not complete successfully.",
           { output: execution.output, outputTruncated: execution.truncated, ...(execution.exitCode === null ? {} : { exitCode: execution.exitCode }) });
     }
-    if (command.action === Action.RUN_COMMAND && result.resultCode !== "command_not_started") {
+    if (command.action === Action.RUN_COMMAND && result.resultCode === "command_not_started") {
+      this.#options.notices?.commandNotStarted({ key: command.actionId, program: programName(spec!.executable) });
+    } else if (command.action === Action.RUN_COMMAND) {
       this.#options.notices?.commandRan({ key: command.actionId, program: programName(spec!.executable), reason: command.reason });
     } else if (result.resultCode === "power_change_scheduled") {
       this.#options.notices?.powerChange({ key: command.actionId, restart: command.action === Action.RESTART_MACHINE, reason: command.reason });

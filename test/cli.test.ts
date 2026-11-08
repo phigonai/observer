@@ -132,8 +132,8 @@ test("portable profile flags fail closed outside doctor and run", async () => {
     },
   );
 
-  assert.equal(exitCode, 1);
-  assert.match(stderr, /supported only by doctor, run and service install/u);
+  assert.equal(exitCode, 2);
+  assert.match(stderr, /--profile is supported only by doctor, run and service install\./u);
 });
 
 test("run collects no content on a computer whose owner consented to metadata only", { timeout: 10_000 }, async () => {
@@ -543,6 +543,58 @@ test("managed agent launcher checks model policy before creating a process", asy
     await new Promise<void>((resolve, reject) => {
       server.close((error) => error ? reject(error) : resolve());
     });
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("everything after -- goes to the program guardian runs, never to the observer", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-cli-guardian-operands-"));
+  const machineId = "5f1b4cb4-a77d-4f53-af66-197e184683f4";
+  const policyDigest = "c".repeat(64);
+  const manifests: Array<{ arguments: string[] }> = [];
+  const server = createServer((request, response) => {
+    void (async () => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk as Buffer));
+      response.setHeader("Content-Type", "application/json");
+      if (request.url?.endsWith("/execution-profile")) {
+        response.end(JSON.stringify({ sandbox: "", policy_digest: policyDigest }));
+        return;
+      }
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { manifest: string };
+      manifests.push(JSON.parse(body.manifest) as { arguments: string[] });
+      response.end(JSON.stringify({ action: "command.execute", decision: {
+        decision: "deny", reason: "Not on this computer.", risk: "low", confidence: 0.9,
+        intervention: "block_action", model: "policy-gateway", cached: false, latency_ms: 1,
+      } }));
+    })();
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    assert.ok(address !== null && typeof address === "object");
+    const origin = `http://127.0.0.1:${address.port}`;
+    await new FileCredentialStore(directory).save({
+      machineId,
+      tenantId: "7d1b4cb4-a77d-4f53-af66-197e184683f4",
+      credential: ["phg", "m", "o".repeat(43)].join("_"),
+      controlPlaneOrigin: origin,
+      createdAt: "2026-11-08T00:00:00.000Z",
+    });
+    await new FileActionPolicyStore(directory).save(machineId, create(ActionGuardrailPolicySchema, { policyDigest, defaultEffect: "allow", rules: [] }));
+    let stdout = "";
+    const exitCode = await run(
+      ["guardian", "exec", "--agent", "codex:worker-1", "--", process.execPath, "--help", "--json", "--version", "--", "-h"],
+      { PHIGON_CONTROL_PLANE_URL: origin, PHIGON_DATA_DIR: directory },
+      { stdout: (value) => { stdout += value; }, stderr: (value) => { stdout += value; } },
+    );
+    // Guardian decided on exactly what was asked; the observer printed no help.
+    assert.equal(exitCode, 77, stdout);
+    assert.doesNotMatch(stdout, /Usage:/u);
+    assert.doesNotMatch(stdout, /does not support --json/u);
+    assert.deepEqual(manifests.map((manifest) => manifest.arguments), [["--help", "--json", "--version", "--", "-h"]]);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -1238,8 +1290,8 @@ test("a flag followed by another flag has no value instead of consuming it", asy
       { PHIGON_DATA_DIR: directory },
       { stdout: () => undefined, stderr: (value) => { stderr += value; } },
     );
-    assert.notEqual(exitCode, 0);
-    assert.match(stderr, /pair requires --code/u);
+    assert.equal(exitCode, 2);
+    assert.match(stderr, /--code needs a value: --code <one-time-code>\./u);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

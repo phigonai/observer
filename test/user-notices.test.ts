@@ -24,6 +24,37 @@ test("notices say what Phigon did in plain words, once per action", async () => 
   ]);
 });
 
+test("an administrator's command is announced before it starts, and its end never shows first", async () => {
+  const sent: string[] = [];
+  let release: () => void = () => undefined;
+  const notices = new UserNotices({ enabled: true, send: (notice) => {
+    sent.push(notice.title);
+    // The first notice takes a while to show; the command does not wait for it.
+    return sent.length === 1 ? new Promise<void>((resolve) => { release = resolve; }) : Promise.resolve();
+  } });
+  notices.commandStarting({ key: "c1", program: "git", reason: " " });
+  assert.deepEqual(sent, ["Phigon is running git on this computer"], "said at once, before the command starts");
+  notices.commandRan({ key: "c1", program: "git", reason: "Check the repository" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(sent, ["Phigon is running git on this computer"], "the end waits for the start to be shown");
+  release();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(sent, ["Phigon is running git on this computer", "Phigon ran git on this computer"]);
+
+  // A failed start notice does not hold the next one back; a second command is told on its own.
+  const failing = new UserNotices({ enabled: true, send: async (notice) => {
+    sent.push(notice.title);
+    if (notice.title.startsWith("Phigon is running")) throw new Error("no desktop session");
+  } });
+  failing.commandStarting({ key: "c2", program: "node", reason: "x" });
+  failing.commandNotStarted({ key: "c2", program: "node" });
+  failing.commandStarting({ key: "c3", program: "npm", reason: "x" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const later = sent.slice(2);
+  assert.deepEqual([...later].sort(), ["Phigon could not run node on this computer", "Phigon is running node on this computer", "Phigon is running npm on this computer"]);
+  assert.ok(later.indexOf("Phigon is running node on this computer") < later.indexOf("Phigon could not run node on this computer"));
+});
+
 test("turned off, or failing, a notice never affects anything", async () => {
   let sent = 0;
   new UserNotices({ enabled: false, send: async () => { sent++; } }).agentStopped({ key: "a", agent: "Codex", forced: false, reason: "x" });
