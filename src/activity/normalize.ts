@@ -23,6 +23,11 @@ import {
   ToolPhase,
   VendorEventSchema,
 } from "../generated/phigon/v1/telemetry_pb.js";
+import {
+  executableFromCommand,
+  gitCommandPattern,
+  pullRequestCommandPattern,
+} from "./command-line.js";
 import type { ActivityDraft, ParseContext } from "./types.js";
 
 export function vendorDraft(
@@ -429,13 +434,8 @@ function gitDraft(
   rawOutput: unknown,
 ): ActivityDraft | null {
   const command = commandFromArguments(rawArguments);
-  const match = /(?:^|\s)git(?:\s+-C\s+\S+)?\s+(status|diff|commit|branch|switch|checkout|push|pull)\b/iu.exec(
-    command,
-  );
-  const pullRequest =
-    /(?:^|\s)gh\s+pr\s+(?:create|view|list|checks|merge|close|reopen)\b/iu.test(
-      command,
-    );
+  const match = gitCommandPattern.exec(command);
+  const pullRequest = pullRequestCommandPattern.test(command);
   if (match === null && !pullRequest) return null;
   const operationName = match?.[1]?.toLowerCase();
   const operation = pullRequest
@@ -454,7 +454,7 @@ function gitDraft(
       case: "git",
       value: create(GitEventSchema, {
         operation,
-        repositoryDigest: digest(
+        repositoryDigest: context.policy.digestIdentifier(
           stringProperty(rawArguments, ["workdir", "cwd"]) ||
             context.sessionId,
         ),
@@ -601,11 +601,6 @@ function stringArray(value: unknown): readonly string[] {
       value.every((item) => typeof item === "string")
     ? value as string[]
     : [];
-}
-
-function executableFromCommand(command: string): string {
-  const first = command.trim().split(/\s+/u)[0] ?? "";
-  return first.split(/[\\/]/u).pop() ?? "";
 }
 
 function pathFromArguments(value: unknown): string {

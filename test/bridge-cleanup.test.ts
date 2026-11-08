@@ -108,7 +108,8 @@ test("the Guardian journal starts a new segment when full and keeps about its bo
       segmentBytes: 1_000,
       maxBytes: 2_500,
     });
-    const record = JSON.stringify({ value: "x".repeat(180) });
+    // An ID is kept whole under every profile, so each record has this size.
+    const record = JSON.stringify({ id: "x".repeat(180) });
     await journal.append(record);
     assert.deepEqual(await readdir(directory), ["guardian-decisions.jsonl"]);
     for (let index = 1; index < 40; index++) await journal.append(record);

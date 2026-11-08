@@ -6,6 +6,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { FileCredentialStore } from "../src/credential-store.js";
 import { executeManagedCommand } from "../src/guardian-managed-exec.js";
 import { createExecutionManifest, executionEnvironment } from "../src/guardian-execution-manifest.js";
 
@@ -90,6 +91,17 @@ test("native lease revocation stops the process tree without an observer stop si
 test("managed command executes directly and journals input, output, and exit", async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-managed-exec-"));
   try {
+    // Output is journaled as it came only where full activity was consented.
+    await new FileCredentialStore(directory).save({
+      machineId: "5f1b4cb4-a77d-4f53-af66-197e184683f4",
+      tenantId: "7d1b4cb4-a77d-4f53-af66-197e184683f4",
+      credential: `phg_m_${"0".repeat(43)}`,
+      controlPlaneOrigin: "http://127.0.0.1:8080",
+      createdAt: "2026-11-08T00:00:00.000Z",
+      consentProfile: "full",
+      consentPolicyVersion: "observer-policy-v1",
+      consentedAt: "2026-11-08T00:00:00.000Z",
+    });
     const environment = executionEnvironment(process.env);
     const manifest = await createExecutionManifest({ executable: process.execPath, arguments: ["-e", "process.stdout.write('managed-output')"], agentId: "codex:test", environment });
     const result = await executeManagedCommand({

@@ -131,6 +131,121 @@ test("ordinary text and code keep their values", () => {
   }
 });
 
+test("redaction covers connection strings, signed URLs, command-line passwords and every cookie", () => {
+  const secret = filler("s", 14);
+  for (const source of [
+    `Server=db.internal;User Id=sa;Pwd=${secret};Database=app`,
+    `Server=db.internal; User Id=sa; Pwd=${secret}`,
+    `Pwd=${secret};Server=db.internal`,
+    `Data Source=db;Password=correct horse ${secret};`,
+    `jdbc:sqlserver://db:1433;user=sa;password=${secret};`,
+    `postgres://admin:p@ss/${secret}@db.internal:5432/app`,
+    `mongodb+srv://admin:${secret}@cluster0.example.net/app?retryWrites=true`,
+    `password: correct horse ${secret}`,
+    `  db_password: "correct horse ${secret}"`,
+    `- secret: two words ${secret}`,
+    `https://acct.blob.core.windows.net/c/f.txt?sv=2022-11-02&se=2026&sig=${secret}%2B%3D`,
+    `https://bucket.s3.amazonaws.com/k?X-Amz-Signature=${secret}&X-Amz-Date=1`,
+    `mysql -h db -u root -p${secret} app`,
+    `mysqldump --single-transaction -p'${secret}' app`,
+    `sshpass -p ${secret} ssh deploy@host`,
+    `redis-cli -h cache -a ${secret} ping`,
+    `deploy --password ${secret} --verbose`,
+    `gh auth login --token ${secret}`,
+    `curl -u admin:${secret} https://api.example`,
+    `curl --user "admin:${secret}" https://api.example`,
+    `Cookie: theme=dark; lang=en; session=${secret}`,
+    `Set-Cookie: a=b; sessionid=${secret}; Path=/; HttpOnly`,
+    `curl -H 'Cookie: a=b; sid=${secret}' https://api.example`,
+  ]) {
+    const safe = redactSecrets(source);
+    assert.match(safe, /REDACTED/u, source);
+    assert.ok(!safe.includes(secret), `${source} -> ${safe}`);
+  }
+  // An "@" in the query or fragment does not decide where the password ends.
+  const slashed = `${filler("p", 10)}/${filler("q", 10)}`;
+  for (const source of [
+    `postgres://admin:${slashed}@db.internal/app?owner=me@example.com`,
+    `https://admin:${slashed}@db.internal:8080/#me@example.com`,
+  ]) {
+    const safe = redactSecrets(source);
+    assert.ok(!safe.includes(filler("p", 10)) && !safe.includes(filler("q", 10)), `${source} -> ${safe}`);
+    assert.match(safe, /\[REDACTED_SECRET\]@db\.internal/u);
+    assert.match(safe, /me@example\.com$/u);
+  }
+  // Separate pieces of a password that has spaces are hidden too.
+  assert.equal(redactSecrets(`password: correct horse battery`), "password: [REDACTED_SECRET]");
+  assert.equal(redactSecrets(`Server=db;Pwd=correct horse;Database=app`), "Server=db;Pwd=[REDACTED_SECRET];Database=app");
+});
+
+test("escaped JSON text, quoted names and values that are themselves assignments are redacted", () => {
+  const secret = filler("s", 14);
+  for (const source of [
+    // JSON inside JSON, as agents report command output.
+    JSON.stringify({ output: `first\nAuthorization: Basic ${secret}\nlast` }),
+    JSON.stringify({ output: JSON.stringify({ token: secret }) }),
+    JSON.stringify({ output: `ok\nDB_PASS=${secret}\n` }),
+    `echo 'OPENAI_KEY=${secret}'`,
+    `run <API_TOKEN=${secret}>`,
+    `error: OPENAI_KEY=${secret}`,
+    `über: \`MYSQL_PWD=${secret}\``,
+  ]) {
+    const safe = redactSecrets(source);
+    assert.match(safe, /REDACTED/u, source);
+    assert.ok(!safe.includes(secret), `${source} -> ${safe}`);
+  }
+  // Escaped text that also holds line separators, or any other character,
+  // is redacted the same way, and keeps every character outside a secret.
+  const lineSeparator = String.fromCharCode(0x2028);
+  const paragraphSeparator = String.fromCharCode(0x2029);
+  const privateUse = String.fromCharCode(0xe000);
+  for (const [source, expected] of [
+    [`x\\nTOKEN=${secret}${lineSeparator}tail`, `x\\nTOKEN=[REDACTED_SECRET]${lineSeparator}tail`],
+    [`line\\npassword: correct horse ${secret}${lineSeparator}tail`, `line\\npassword: [REDACTED_SECRET]${lineSeparator}tail`],
+    [`a${paragraphSeparator}b\\nDB_PASS=${secret}${lineSeparator}tail`, `a${paragraphSeparator}b\\nDB_PASS=[REDACTED_SECRET]${lineSeparator}tail`],
+    [`${lineSeparator}x\\nAuthorization: Basic ${secret}${paragraphSeparator}y`, `${lineSeparator}x\\nAuthorization: [REDACTED_SECRET]${paragraphSeparator}y`],
+    // Both separators, with a private key across escaped lines.
+    [
+      `${lineSeparator}${paragraphSeparator}-----BEGIN RSA ${"PRIVATE KEY"}-----\\n${secret}\\n-----END RSA ${"PRIVATE KEY"}-----\\nDB_PASS=${secret}`,
+      `${lineSeparator}${paragraphSeparator}[REDACTED_SECRET]\\nDB_PASS=[REDACTED_SECRET]`,
+    ],
+    [`x\\nDB_PASS=${secret}${privateUse} tail`, `x\\nDB_PASS=[REDACTED_SECRET] tail`],
+  ] as const) {
+    assert.equal(redactSecrets(source), expected);
+  }
+  // A character that is not a boundary belongs to the value it follows, in
+  // escaped text as in plain text.
+  const glued = `TOKEN=${secret}${privateUse}tail`;
+  assert.equal(redactSecrets(`x\\n${glued}`), `x\\n${redactSecrets(glued)}`);
+  // Where nothing is redacted every character stays where it was.
+  for (const ordinary of [
+    `a\\nb${lineSeparator}c${privateUse}d`,
+    `${privateUse}\\t${lineSeparator}${paragraphSeparator}${lineSeparator}`,
+  ]) {
+    assert.equal(redactSecrets(ordinary), ordinary);
+  }
+  // The line breaks used while redacting escaped text are taken out again.
+  const escaped = JSON.stringify({ output: `first\nDB_PASS=${secret}\nlast` });
+  assert.deepEqual(JSON.parse(redactSecrets(escaped)), { output: "first\nDB_PASS=[REDACTED_SECRET]\nlast" });
+  assert.equal(redactSecrets(JSON.stringify({ a: "line\nnext" })), JSON.stringify({ a: "line\nnext" }));
+});
+
+test("password-like options and addresses that hold no credential stay readable", () => {
+  for (const ordinary of [
+    "PWD=/home/example",
+    "docker run -u 1000:1000 image",
+    "git push -u origin main",
+    "mysql -P 3306 -p app",
+    "https://example.com:8080/?email=me@example.com",
+    "ssh://git@github.com:22/org/repo.git",
+    "https://example.com/a:b/c",
+    "see the cookies: three of them",
+    "deploy --password-file ./secret.txt",
+  ]) {
+    assert.equal(redactSecrets(ordinary), ordinary);
+  }
+});
+
 test("redaction stays linear on large single-token and dotted inputs", () => {
   // Compare n with 4n characters instead of a time budget, which a busy
   // machine can miss: linear work grows about 4 times (up to 7 with garbage
@@ -152,7 +267,16 @@ test("redaction stays linear on large single-token and dotted inputs", () => {
     }
     return [smallBest, largeBest];
   };
-  for (const [unit, count] of [["a", 500_000], ["a.", 250_000], ["ab_", 200_000], ["a://", 100_000], ["a-", 250_000], ["x_key=", 80_000], ["a://:", 80_000], ["phe_", 100_000]] as const) {
+  for (const [unit, count] of [
+    ["a", 500_000], ["a.", 250_000], ["ab_", 200_000], ["a://", 100_000], ["a-", 250_000], ["x_key=", 80_000], ["a://:", 80_000], ["phe_", 100_000],
+    // Connection strings, command-line passwords, cookies, YAML lines and
+    // addresses whose password holds "@" or "/".
+    ["pwd=", 100_000], [";pwd=", 80_000], ["mysql -p", 60_000], ["-u a:", 80_000], ["cookie:", 60_000],
+    ["password: a b\n", 30_000], ["--token ", 60_000], ["&sig=", 80_000], ["x://a/@", 60_000], ["x://a:b@c/", 40_000], ["x://a:b/c@d?e@", 30_000],
+    // Escaped line breaks next to line separators, one or both kinds.
+    [`k=\\n${String.fromCharCode(0x2028, 0xe000)}`, 60_000],
+    [`k=\\n${String.fromCharCode(0x2028, 0x2029)}`, 40_000],
+  ] as const) {
     const [small, large] = fastest(unit.repeat(count / 4), unit.repeat(count));
     // Under 50 ms for the large input cannot be quadratic at this size
     // (minutes), and keeps timer noise on tiny durations from deciding.

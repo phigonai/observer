@@ -211,7 +211,12 @@ class ClineTaskActivityAdapter implements VendorActivityAdapter {
     const request = parseObject(text);
     if (request === null) return [];
     const server = stringField(request, "serverName");
-    const tool = stringField(request, "toolName") || stringField(request, "uri");
+    const uri = stringField(request, "uri");
+    // A resource's address can hold a path, a host or credentials, which are
+    // collected only as consented addresses; its name says only what kind
+    // of resource was read.
+    const tool = stringField(request, "toolName") ||
+      (uri === "" ? "" : resourceToolName(uri));
     return toolDrafts(this.agentKind, context, {
       invocationId: invocationId(message, "mcp"),
       toolName: [server, tool].filter(Boolean).join("__") || "mcp",
@@ -228,6 +233,12 @@ class ClineTaskActivityAdapter implements VendorActivityAdapter {
       if (oldest !== undefined) this.#commands.delete(oldest);
     }
   }
+}
+
+/** `mcp-resource`, with the address's scheme when it has one: mcp-resource:postgres. */
+function resourceToolName(uri: string): string {
+  const scheme = /^([A-Za-z][A-Za-z0-9+.-]{0,31}):/u.exec(uri)?.[1];
+  return scheme === undefined ? "mcp-resource" : `mcp-resource:${scheme.toLowerCase()}`;
 }
 
 /** A stable invocation id from the message's own timestamp. */

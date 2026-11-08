@@ -374,7 +374,10 @@ test("blocked managed action tells the agent the exact administrator contract", 
       "utf8",
     );
     assert.match(journal, /phigon_guardian_decision/u);
-    assert.match(journal, /Do not delete any file/u);
+    // Without full consent the journal keeps the decision's metadata only:
+    // the agent was told the contract, but the file it named is a digest.
+    assert.match(journal, /"outcome":"denied"/u);
+    assert.doesNotMatch(journal, /important\.txt/u);
   } finally {
     await new Promise<void>((resolve, reject) => {
       server.close((error) => error ? reject(error) : resolve());

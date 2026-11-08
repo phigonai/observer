@@ -11,7 +11,9 @@ import {
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import type { Readable } from "node:stream";
+import { bridgeStorageOptions } from "./bridge-privacy.js";
 import { activityBridgeAgent, activityBridgeAgents } from "./bridges.js";
+import { compactJSON, isRawJSONNumber, parseLosslessJSON, storableRecord } from "./policy.js";
 
 const maxLineBytes = 1 << 20;
 // Bridge files wait for the collector, which deletes them once delivered.
@@ -45,6 +47,8 @@ export async function ingestActivityJSONL(options: Readonly<{
   dataDirectory: string;
   input: Readable;
   limits?: IngestLimits;
+  /** The caller's environment, whose collection settings narrow what is kept. */
+  environment?: NodeJS.ProcessEnv;
 }>): Promise<ActivityIngestResult> {
   const requestedAgent = options.agent.trim().toLowerCase();
   const customAgentName = requestedAgent === "custom"
@@ -67,6 +71,9 @@ export async function ingestActivityJSONL(options: Readonly<{
   await makeDirectoryPrivate(options.dataDirectory);
   await chmod(bridgeRoot, 0o700);
   await chmod(agentRoot, 0o700);
+  // Records wait here until the collector reads them, so nothing the
+  // profile would not collect, and no secret, is written as it came.
+  const storage = await bridgeStorageOptions(options.dataDirectory, options.environment);
   const target = join(
     agentRoot,
     `${Date.now()}-${randomUUID()}.jsonl`,
@@ -97,14 +104,19 @@ export async function ingestActivityJSONL(options: Readonly<{
         oversized++;
         continue;
       }
-      let serialized = line;
+      let serialized: string;
       try {
-        const value: unknown = JSON.parse(line);
+        // Numbers keep their exact text, and a line storage leaves alone is
+        // written as it came.
+        const value = parseLosslessJSON(line);
+        const stored = JSON.stringify(storableRecord(value, storage));
+        serialized = stored === compactJSON(line) ? line : stored;
         if (customAgentName !== undefined) {
           if (
             typeof value !== "object" ||
             value === null ||
-            Array.isArray(value)
+            Array.isArray(value) ||
+            isRawJSONNumber(value)
           ) {
             malformed++;
             continue;
@@ -119,10 +131,10 @@ export async function ingestActivityJSONL(options: Readonly<{
             malformed++;
             continue;
           }
-          serialized = JSON.stringify({
+          serialized = JSON.stringify(storableRecord({
             ...value,
             phigon_agent_name: customAgentName,
-          });
+          }, storage));
         }
       } catch {
         malformed++;

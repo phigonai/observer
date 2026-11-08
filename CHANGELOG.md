@@ -17,7 +17,37 @@ from the matching `vX.Y.Z` tag in this repository.
 - The person at the computer is told before an administrator's command
   starts.
 - Everything after `--` goes to the program that `guardian` runs.
-- Redaction fixes.
+- Bridge files written by `ingest` and Guardian's journals never keep a
+  secret, and keep only metadata unless the computer consented to full
+  activity: types, roles, IDs, names, times, a command's program and Git
+  operation, and digests in place of paths and addresses. With full consent
+  they still keep nothing in a category the policy leaves off, such as
+  environment values. A narrowed consent applies to the next record. The
+  ingesting program's own `PHIGON_COLLECT_*` settings narrow what is kept,
+  and `PHIGON_REDACT_PATH_PATTERNS` paths are replaced before writing.
+- The digests sent in place of withheld paths, addresses, repository
+  folders and vendor records are keyed with a secret kept in the data
+  directory (`identifier-key`), so they cannot be matched by hashing
+  guesses. They no longer match the digests sent before, or another
+  computer's.
+- A command's program name skips leading `NAME=value` assignments and
+  wrappers such as `env`, `sudo` and `timeout`, and tool names, program
+  names and IDs that held a secret, a private path or an address are
+  replaced, as is a folder path where file paths are not collected.
+- Tool arguments and output are redacted value by value before they are
+  serialized, so a `.env` file printed by a tool is hidden in the tool event
+  as in the terminal event, and the result is always valid JSON. Values
+  under credential names such as `accessToken`, `clientSecret` and
+  `x-api-key` are masked whatever their type.
+- More secrets are redacted: connection-string passwords, URL passwords
+  holding `@` or `/`, YAML passwords with spaces, Azure SAS and S3
+  signatures, `mysql -p…`, `sshpass`, `redis-cli -a`, `--password value`,
+  `curl -u user:password`, every cookie in a `Cookie` or `Set-Cookie`
+  header, and secrets in escaped JSON text.
+- Text is redacted before it is cut to its limit, and a result the size
+  limits shortened is marked as truncated.
+- An MCP resource read is named `mcp-resource:<scheme>`, never by its
+  address.
 - Safer consent defaults.
 - Lower CPU use while the observer is idle, and less while agents work:
   - Agent session folders are kept between scans instead of listed and

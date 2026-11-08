@@ -46,6 +46,7 @@ import { zedActivityAdapter } from "./adapters/zed.js";
 import { createOpenAICompatibleAdapter } from "./adapters/openai-compatible.js";
 import { activityBridgeAgents } from "./bridges.js";
 import { genericActivityAdapter } from "./adapters/generic.js";
+import { loadIdentifierKey } from "./identifier-key.js";
 import { LocalPolicyEngine } from "./policy.js";
 import { vendorDraft } from "./normalize.js";
 import {
@@ -246,6 +247,7 @@ export class ActivityCollector {
   #deliveryRefused = false;
   #refusedDeliveries = 0;
   #policy: LocalPolicyEngine;
+  readonly #identifierKey: Buffer;
   readonly #limiter: MinuteRateLimiter;
   readonly #agentsByKind = new Map<AgentKind, AgentIdentity[]>();
   readonly #sourceIdentities = new Map<string, AgentIdentity>();
@@ -308,9 +310,12 @@ export class ActivityCollector {
     this.#onSourceIdentity = options.onSourceIdentity ?? (() => undefined);
     this.#onDeliveryRefused = options.onDeliveryRefused ?? (() => undefined);
     this.#onSourceFailure = options.onSourceFailure ?? (() => undefined);
+    this.#identifierKey = loadIdentifierKey(options.config.dataDirectory);
     this.#policy = new LocalPolicyEngine(
       options.policy ?? options.config.policy,
       options.config.redactionPathPatterns,
+      undefined,
+      this.#identifierKey,
     );
     this.#limiter = new MinuteRateLimiter(
       options.config.activityRateLimitPerMinute,
@@ -339,6 +344,8 @@ export class ActivityCollector {
     this.#policy = new LocalPolicyEngine(
       policy,
       this.#config.redactionPathPatterns,
+      undefined,
+      this.#identifierKey,
     );
   }
 

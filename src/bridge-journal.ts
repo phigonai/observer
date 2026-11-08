@@ -1,6 +1,8 @@
 import { makeDirectoryPrivate } from "./private-directory.js";
 import { chmod, mkdir, open, readdir, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
+import { bridgePolicyFingerprint, bridgeStorageOptions } from "./activity/bridge-privacy.js";
+import { parseLosslessJSON, storableRecord, type StorableRecordOptions } from "./activity/policy.js";
 
 /** Journals the observer writes into the generic activity bridge. */
 export const guardianDecisionJournal = "guardian-decisions";
@@ -39,6 +41,8 @@ export class SegmentedJournal {
   readonly #journal: JournalName;
   readonly #segmentBytes: number;
   readonly #maxBytes: number;
+  #storageOptions: StorableRecordOptions | undefined;
+  #storageFingerprint = "";
 
   constructor(
     dataDirectory: string,
@@ -51,7 +55,11 @@ export class SegmentedJournal {
     this.#maxBytes = limits.maxBytes ?? maxJournalBytes;
   }
 
-  /** Appends one record, `encoded` without its newline. */
+  /**
+   * Appends one record, `encoded` JSON without its newline. Like an ingested
+   * record it waits on disk for the collector, so its secrets are redacted
+   * and, unless content may be collected, only its metadata is kept.
+   */
   async append(encoded: string, options: Readonly<{ sync?: boolean }> = {}): Promise<void> {
     const bridges = join(this.#dataDirectory, "bridges");
     const directory = join(bridges, "generic");
@@ -59,7 +67,8 @@ export class SegmentedJournal {
     await makeDirectoryPrivate(this.#dataDirectory);
     await chmod(bridges, 0o700);
     await chmod(directory, 0o700);
-    const line = `${encoded}\n`;
+    const stored = storableRecord(parseLosslessJSON(encoded), await this.#storage());
+    const line = `${JSON.stringify(stored)}\n`;
     const path = join(directory, await this.#segmentFor(directory, Buffer.byteLength(line)));
     const handle = await open(path, "a", 0o600);
     try {
@@ -69,6 +78,22 @@ export class SegmentedJournal {
       await handle.close();
     }
     await chmod(path, 0o600);
+  }
+
+  /**
+   * How records are stored. The policy is read again as soon as the consent
+   * or the service settings change, so a narrowed consent applies to the
+   * very next record; the check is a stat of each file. The fingerprint is
+   * taken before the policy is read, so a change during the read is caught
+   * by the next record.
+   */
+  async #storage(): Promise<StorableRecordOptions> {
+    const fingerprint = await bridgePolicyFingerprint(this.#dataDirectory);
+    if (this.#storageOptions === undefined || fingerprint !== this.#storageFingerprint) {
+      this.#storageOptions = await bridgeStorageOptions(this.#dataDirectory, process.env);
+      this.#storageFingerprint = fingerprint;
+    }
+    return this.#storageOptions;
   }
 
   /** The segment that takes the next `bytes`, started when the last is full. */

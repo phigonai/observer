@@ -13,6 +13,7 @@ const observerFiles = new Set([
   "collection-notice.json",
   "custom-agents.json",
   "historical-agent-identities.json",
+  "identifier-key",
   "installation-id",
   "installation-id.pending",
   "machine-credential.json",

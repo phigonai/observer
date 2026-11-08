@@ -574,6 +574,7 @@ export async function run(
         ...(agentName === undefined ? {} : { agentName }),
         dataDirectory: config.dataDirectory,
         input,
+        environment: callerEnvironment,
       });
       if (!flags.includes("--quiet")) {
         output.stdout(

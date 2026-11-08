@@ -44,7 +44,11 @@ test("activity bridge stores only valid bounded source records", async () => {
     const files = await readdir(root);
     assert.equal(files.length, 1);
     const target = join(root, files[0] ?? "");
-    assert.equal(await readFile(target, "utf8"), `${valid}\n`);
+    // Without full consent only the record's metadata is kept.
+    assert.equal(
+      await readFile(target, "utf8"),
+      `${JSON.stringify({ type: "assistant", message: { role: "assistant", content: "[REDACTED_POLICY]" } })}\n`,
+    );
     if (process.platform !== "win32") {
       assert.equal((await stat(target)).mode & 0o777, 0o600);
       assert.equal((await stat(root)).mode & 0o777, 0o700);
@@ -73,7 +77,8 @@ test("ingest deletes the oldest bridge files once they pass the byte or file lim
     const unrelated = join(bridges, "generic", "guardian-decisions.jsonl");
     await writeFile(unrelated, `${"x".repeat(999)}\n`);
 
-    const record = `${JSON.stringify({ role: "user", content: "x" })}\n`;
+    // Stored as it came under every profile, so the sizes below hold.
+    const record = `${JSON.stringify({ role: "user", type: "abcd" })}\n`;
     const ingest = (limits: Readonly<{ maxBytes?: number; maxFiles?: number }>) =>
       ingestActivityJSONL({
         agent: "cursor",
@@ -143,9 +148,10 @@ test("generic activity bridge accepts records from an unlisted agent", async () 
     const root = join(directory, "bridges", "generic");
     const files = await readdir(root);
     assert.equal(files.length, 1);
+    // The agent's name stays; without full consent its reply does not.
     assert.equal(
       await readFile(join(root, files[0] ?? ""), "utf8"),
-      `${record}\n`,
+      `${record.replace("Task complete.", "[REDACTED_POLICY]")}\n`,
     );
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -184,7 +190,8 @@ test("custom activity bridge rejects a conflicting configured agent label", asyn
     const files = await readdir(root);
     const stored = await readFile(join(root, files[0] ?? ""), "utf8");
     assert.doesNotMatch(stored, /Different Bot/u);
-    assert.match(stored, /consistent evidence/u);
+    assert.equal(stored.trim().split("\n").length, 1);
+    assert.equal(JSON.parse(stored).phigon_agent_name, "Release Bot");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
