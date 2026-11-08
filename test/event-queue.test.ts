@@ -23,7 +23,9 @@ test("bounded queue drops oldest events and never exceeds capacity", () => {
   queue.enqueue("three", 3n);
 
   assert.deepEqual(queue.pending(), ["two", "three"]);
-  assert.deepEqual(queue.metrics(), {
+  const { oldestQueuedAt, ...metrics } = queue.metrics();
+  assert.ok(oldestQueuedAt !== undefined && Math.abs(Date.now() - oldestQueuedAt) < 60_000);
+  assert.deepEqual(metrics, {
     capacity: 2,
     depth: 2,
     utilization: 1,

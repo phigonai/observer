@@ -18,6 +18,7 @@ import {
   type AgentInventory,
 } from "../generated/phigon/v1/identity_pb.js";
 import { mergeInventoryWithHistoricalIdentities } from "../historical-identity-store.js";
+import { rememberEncoding } from "../event-queue.js";
 import {
   EventEnvelopeSchema,
   type EventEnvelope,
@@ -74,6 +75,14 @@ const bridgeFileRetentionMs = 7 * 86_400_000;
 const closedSegmentQuietMs = 60_000;
 // Saved live checkpoints remembered while their events await acknowledgement.
 const retainedLiveCheckpoints = 8;
+// The live reader writes its cursors at most this often while an agent is
+// active; see JSONLSourceReader. Written again when collection stops.
+const liveCheckpointSaveIntervalMs = 5_000;
+// After this long without a record, live collection scans every
+// `idleScanIntervalMs` instead of every scan interval, until a record
+// arrives or a watched folder reports a change.
+const defaultIdleAfterMs = 2 * 60_000;
+const defaultIdleScanIntervalMs = 5_000;
 export const historySyncQueueHeadroom = 1_024;
 const maxDraftsPerRecord = 32;
 
@@ -172,6 +181,10 @@ export type ActivityCollectorOptions = Readonly<{
    * skipped for a while and retried; every other source keeps collecting.
    */
   onSourceFailure?: (failure: SourceFailure) => void;
+  /** How long without records before scanning slows down; tests shorten it. */
+  idleAfterMs?: number;
+  /** The scan interval while idle. */
+  idleScanIntervalMs?: number;
 }>;
 
 /**
@@ -258,6 +271,12 @@ export class ActivityCollector {
   readonly #sourceIdentitySaves: Promise<void>[] = [];
   #backpressuredScans = 0;
   #scanWork: Promise<void> = Promise.resolve();
+  readonly #idleAfterMs: number;
+  readonly #idleScanIntervalMs: number;
+  // When the last live scan finished, for health output.
+  #lastScanAt: Date | undefined;
+  #lastScanDurationMs = 0;
+  #idle = false;
 
   constructor(options: ActivityCollectorOptions) {
     this.#config = options.config;
@@ -272,6 +291,9 @@ export class ActivityCollector {
         options.config.activityReplayOnFirstStart,
         options.config.activityInitialReplayBytes,
         options.config.activityInitialReplaySessions,
+        "live",
+        undefined,
+        liveCheckpointSaveIntervalMs,
       );
     this.#historyReader = new JSONLSourceReader(
       join(options.config.dataDirectory, "history-sync"),
@@ -304,6 +326,8 @@ export class ActivityCollector {
     }
     this.#durableDelivery = options.durableDelivery ?? false;
     this.#flushDelivery = options.flushDelivery ?? (() => undefined);
+    this.#idleAfterMs = options.idleAfterMs ?? defaultIdleAfterMs;
+    this.#idleScanIntervalMs = options.idleScanIntervalMs ?? defaultIdleScanIntervalMs;
   }
 
   updateInventory(inventory: AgentInventory): void {
@@ -593,13 +617,13 @@ export class ActivityCollector {
           .digest("hex"),
         payload: draft.payload,
       });
-      if (
-        toBinary(EventEnvelopeSchema, event).byteLength >
-        maxEnvelopeBytes
-      ) {
+      const encoded = toBinary(EventEnvelopeSchema, event);
+      if (encoded.byteLength > maxEnvelopeBytes) {
         oversized++;
         continue;
       }
+      // The spool stores this encoding rather than making it again.
+      rememberEncoding(event, encoded);
       events.push(event);
     }
     return { events, drafts: permittedDrafts.length, oversized };
@@ -624,10 +648,22 @@ export class ActivityCollector {
     }));
   }
 
+  /**
+   * Scans every scan interval (a second) while agents are active. After
+   * two minutes without a record it scans every five seconds instead, and
+   * goes back to every second at once when a record arrives or a watched
+   * agent folder reports a change (Windows and macOS; elsewhere the next
+   * five-second scan finds it). Whether the computer runs on battery is not
+   * used: no system reports it cheaply and reliably without starting a
+   * process.
+   */
   async run(signal: AbortSignal): Promise<void> {
     let prunedAt = 0;
+    let activeAt = this.#clock().getTime();
     try {
       while (!signal.aborted) {
+        const recordsBefore = this.#sourceRecords;
+        const started = performance.now();
         try {
           await this.scanOnce();
         } catch (error) {
@@ -635,19 +671,59 @@ export class ActivityCollector {
           // other backpressure; the refused records are read again.
           if (!(error instanceof DeliveryRefusedError)) throw error;
         }
-        if (this.#clock().getTime() - prunedAt >= bridgePruneIntervalMs) {
-          prunedAt = this.#clock().getTime();
+        this.#lastScanDurationMs = performance.now() - started;
+        this.#lastScanAt = this.#clock();
+        const now = this.#lastScanAt.getTime();
+        if (this.#reader.takeActivityHint() || this.#sourceRecords !== recordsBefore || now < activeAt) {
+          activeAt = now;
+        }
+        if (now - prunedAt >= bridgePruneIntervalMs) {
+          prunedAt = now;
           // Cleanup only frees disk space; it retries on the next pass.
           await this.pruneBridgeFiles().catch(() => undefined);
         }
-        await abortableDelay(
-          this.#config.activityScanIntervalMs,
-          signal,
-        );
+        const interval = this.#config.activityScanIntervalMs;
+        this.#idle = now - activeAt >= this.#idleAfterMs && this.#idleScanIntervalMs > interval;
+        await abortableDelay(interval, signal);
+        if (this.#idle) await this.#restUntilHint(this.#idleScanIntervalMs - interval, signal);
       }
     } finally {
+      // Write the cursors a commit kept back; losing them only reads a few
+      // seconds of records again.
+      try {
+        await this.#checkpointSave;
+        await this.#reader.flushCheckpoint();
+      } catch {
+        // Read again on the next start.
+      }
       this.close();
     }
+  }
+
+  /** Waits `milliseconds`, or less once a watched folder reports a change. */
+  async #restUntilHint(milliseconds: number, signal: AbortSignal): Promise<void> {
+    if (signal.aborted || this.#reader.activityHinted()) return;
+    await new Promise<void>((resolve) => {
+      let stopListening: () => void = () => undefined;
+      const done = () => {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", done);
+        stopListening();
+        resolve();
+      };
+      const timer = setTimeout(done, milliseconds);
+      signal.addEventListener("abort", done, { once: true });
+      stopListening = this.#reader.onActivityHint(done);
+    });
+  }
+
+  /** When the last live scan finished and how long it took, and whether collection is resting. */
+  scanHealth(): Readonly<{ lastScanAt?: Date; lastScanDurationMs: number; idle: boolean }> {
+    return Object.freeze({
+      ...(this.#lastScanAt === undefined ? {} : { lastScanAt: this.#lastScanAt }),
+      lastScanDurationMs: this.#lastScanDurationMs,
+      idle: this.#idle,
+    });
   }
 
   /**

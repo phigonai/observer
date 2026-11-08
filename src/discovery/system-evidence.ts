@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { constants } from "node:fs";
-import { access, realpath, stat } from "node:fs/promises";
+import { access, readFile, readdir, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, delimiter, join, posix, win32 } from "node:path";
+import { basename, delimiter, dirname, join, posix, resolve, win32 } from "node:path";
 import { promisify } from "node:util";
 import type {
   ConfigurationEvidence,
@@ -37,38 +37,77 @@ const maxInterpreterProcesses = 256;
 const maxBinLinkResolutions = 32;
 const scriptPackageDeadlineMs = 3_000;
 
+// A PATH folder with more entries than this is not kept in memory; its
+// candidates are checked one by one instead.
+const maxListedPathEntries = 20_000;
+const maxCachedPathFolders = 256;
+// PATH folders are looked at once for all the probes of a discovery pass.
+const pathFolderTrustMs = 5_000;
+// A folder changed this recently is listed again: a coarse clock could hide
+// a second change.
+const pathFolderSettleMs = 2_000;
+const maxShimBytes = 64 << 10;
+const versionProbeTimeoutMs = 15_000;
+const maxPackageJsonBytes = 256 << 10;
+const packageVersionPattern = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/u;
+
+type CachedFile = Readonly<{ path: string; size: number; modifiedMs: number }>;
+
 type CachedExecutableProbe = Readonly<{
   checkedAt: number;
   ttlMs: number;
   value: ExecutableEvidence | null;
-  executablePath?: string;
-  size?: number;
-  modifiedMs?: number;
+  /** The executable, and the package.json its version came from. */
+  files: readonly CachedFile[];
+}>;
+
+type PathFolder = Readonly<{
+  modifiedMs: number;
+  listedAt: number;
+  checkedAt: number;
+  /** null: missing or unreadable; undefined: too large to keep. */
+  names: ReadonlySet<string> | null | undefined;
 }>;
 
 /**
  * Remembers which agent CLIs are installed between discovery passes.
- * Finding one walks PATH and runs its `--version`, which starts the agent's
- * own runtime; discovery runs every few seconds, while installs change
- * rarely. A found CLI is probed again when its file changes or after
- * `foundTtlMs` (npm shims stay unchanged across upgrades); an absent one, or
- * one whose version could not be read, is probed again after `missingTtlMs`.
+ * Discovery runs every ten seconds, while installs change rarely.
+ *
+ * - An npm-installed CLI's version comes from its package's package.json,
+ *   found from the executable or its npm shim, with no process started.
+ *   It is read again when the executable or package.json changes (an
+ *   upgrade rewrites package.json; npm shims stay unchanged).
+ * - Otherwise the CLI's `--version` runs, which starts its runtime (for
+ *   an npm `.cmd` shim, PowerShell): again when the executable changes, or
+ *   after `foundTtlMs` (an hour).
+ * - A version that could not be read is tried again after
+ *   `unreadableTtlMs` (ten minutes), and a CLI not found after
+ *   `missingTtlMs` (a minute).
+ *
+ * PATH folders are listed and kept while their modified time stays the
+ * same, so looking for absent CLIs no longer checks every folder and
+ * extension one by one (thousands of checks a minute on Windows).
  */
 export class ExecutableProbeCache {
   readonly #entries = new Map<string, CachedExecutableProbe>();
+  readonly #folders = new Map<string, PathFolder>();
+  readonly #folderChecks = new Map<string, Promise<ReadonlySet<string> | null | undefined>>();
   readonly #foundTtlMs: number;
   readonly #missingTtlMs: number;
+  readonly #unreadableTtlMs: number;
   readonly #clock: () => number;
 
   constructor(
     options: Readonly<{
       foundTtlMs?: number;
       missingTtlMs?: number;
+      unreadableTtlMs?: number;
       clock?: () => number;
     }> = {},
   ) {
-    this.#foundTtlMs = options.foundTtlMs ?? 5 * 60_000;
+    this.#foundTtlMs = options.foundTtlMs ?? 60 * 60_000;
     this.#missingTtlMs = options.missingTtlMs ?? 60_000;
+    this.#unreadableTtlMs = options.unreadableTtlMs ?? 10 * 60_000;
     this.#clock = options.clock ?? Date.now;
   }
 
@@ -79,17 +118,13 @@ export class ExecutableProbeCache {
     if (cached === undefined) return undefined;
     const age = this.#clock() - cached.checkedAt;
     if (age < 0 || age >= cached.ttlMs) return undefined;
-    if (cached.executablePath === undefined) return { value: cached.value };
-    try {
-      const metadata = await stat(cached.executablePath);
-      if (
-        metadata.size !== cached.size ||
-        metadata.mtimeMs !== cached.modifiedMs
-      ) {
+    for (const file of cached.files) {
+      try {
+        const metadata = await stat(file.path);
+        if (metadata.size !== file.size || metadata.mtimeMs !== file.modifiedMs) return undefined;
+      } catch {
         return undefined;
       }
-    } catch {
-      return undefined;
     }
     return { value: cached.value };
   }
@@ -98,31 +133,98 @@ export class ExecutableProbeCache {
     key: string,
     value: ExecutableEvidence | null,
     executablePath: string | null,
+    versionFile: string | null = null,
   ): Promise<void> {
     const checkedAt = this.#clock();
-    const ttlMs = value === null || value.version === ""
+    const ttlMs = value === null
       ? this.#missingTtlMs
-      : this.#foundTtlMs;
-    let entry: CachedExecutableProbe = { checkedAt, ttlMs, value };
-    if (executablePath !== null) {
+      : value.version === "" ? this.#unreadableTtlMs : this.#foundTtlMs;
+    const files: CachedFile[] = [];
+    for (const path of [executablePath, versionFile]) {
+      if (path === null) continue;
       try {
-        const metadata = await stat(executablePath);
-        entry = {
-          ...entry,
-          executablePath,
-          size: metadata.size,
-          modifiedMs: metadata.mtimeMs,
-        };
+        const metadata = await stat(path);
+        files.push({ path, size: metadata.size, modifiedMs: metadata.mtimeMs });
       } catch {
         return;
       }
     }
     this.#entries.delete(key);
-    this.#entries.set(key, entry);
+    this.#entries.set(key, { checkedAt, ttlMs, value, files });
     if (this.#entries.size > maxCachedExecutableProbes) {
       const oldest = this.#entries.keys().next().value;
       if (oldest !== undefined) this.#entries.delete(oldest);
     }
+  }
+
+  /**
+   * The entry names of a PATH folder (lower-cased when `caseInsensitive`),
+   * null when it is missing or unreadable, or undefined when it should be
+   * checked name by name instead.
+   */
+  async pathFolderNames(
+    directory: string,
+    caseInsensitive: boolean,
+  ): Promise<ReadonlySet<string> | null | undefined> {
+    const key = `${caseInsensitive ? "i" : "s"}\u0000${directory}`;
+    const now = this.#clock();
+    const cached = this.#folders.get(key);
+    if (cached !== undefined && now >= cached.checkedAt && now - cached.checkedAt < pathFolderTrustMs) {
+      return cached.names;
+    }
+    const pending = this.#folderChecks.get(key);
+    if (pending !== undefined) return pending;
+    const check = this.#checkPathFolder(key, directory, caseInsensitive, now, cached)
+      .finally(() => this.#folderChecks.delete(key));
+    this.#folderChecks.set(key, check);
+    return check;
+  }
+
+  async #checkPathFolder(
+    key: string,
+    directory: string,
+    caseInsensitive: boolean,
+    now: number,
+    cached: PathFolder | undefined,
+  ): Promise<ReadonlySet<string> | null | undefined> {
+    const keep = (folder: PathFolder) => {
+      this.#folders.delete(key);
+      this.#folders.set(key, folder);
+      if (this.#folders.size > maxCachedPathFolders) {
+        const oldest = this.#folders.keys().next().value;
+        if (oldest !== undefined) this.#folders.delete(oldest);
+      }
+      return folder.names;
+    };
+    let modifiedMs: number;
+    try {
+      const metadata = await stat(directory);
+      if (!metadata.isDirectory()) {
+        return keep({ modifiedMs: Number.NaN, listedAt: now, checkedAt: now, names: null });
+      }
+      modifiedMs = metadata.mtimeMs;
+    } catch (error) {
+      if (isNodeError(error) && ["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(String(error.code))) {
+        return keep({ modifiedMs: Number.NaN, listedAt: now, checkedAt: now, names: null });
+      }
+      return undefined;
+    }
+    if (
+      cached !== undefined && cached.names !== null && cached.modifiedMs === modifiedMs &&
+      cached.listedAt - modifiedMs >= pathFolderSettleMs
+    ) {
+      return keep({ ...cached, checkedAt: now });
+    }
+    let entries: string[];
+    try {
+      entries = await readdir(directory);
+    } catch {
+      return undefined;
+    }
+    const names = entries.length > maxListedPathEntries
+      ? undefined
+      : new Set(caseInsensitive ? entries.map((name) => name.toLowerCase()) : entries);
+    return keep({ modifiedMs, listedAt: now, checkedAt: now, names });
   }
 }
 
@@ -172,12 +274,13 @@ export class SystemEvidenceProvider implements HostEvidenceProvider {
       for (const candidate of candidates) {
         const executablePath = await this.#findExecutable(candidate);
         if (executablePath === null) continue;
+        const installed = await packageVersion(executablePath, this.#platform);
         const value = {
           executableName: normalizedExecutableName(candidate),
           executablePathDigest: digest(executablePath),
-          version: await readVersion(executablePath),
+          version: installed?.version ?? await readVersion(executablePath),
         };
-        await this.#executableCache?.remember(cacheKey, value, executablePath);
+        await this.#executableCache?.remember(cacheKey, value, executablePath, installed?.file ?? null);
         return { status: "ok", value };
       }
       await this.#executableCache?.remember(cacheKey, null, null);
@@ -343,10 +446,17 @@ export class SystemEvidenceProvider implements HostEvidenceProvider {
             .split(";")
             .filter(Boolean)
         : [""];
+    // Windows and macOS file systems ignore case, as access() does there.
+    const caseInsensitive = this.#platform === "win32" || this.#platform === "darwin";
     for (const directory of pathValue.split(delimiter)) {
       if (directory.length === 0) continue;
+      const names = await this.#executableCache?.pathFolderNames(directory, caseInsensitive);
+      if (names === null) continue;
       for (const extension of extensions) {
-        const executablePath = join(directory, `${candidate}${extension}`);
+        const name = `${candidate}${extension}`;
+        // A name the folder does not hold is not checked on disk.
+        if (names !== undefined && !names.has(caseInsensitive ? name.toLowerCase() : name)) continue;
+        const executablePath = join(directory, name);
         try {
           await access(
             executablePath,
@@ -488,6 +598,36 @@ function withinDeadline<T>(work: Promise<T>, milliseconds: number): Promise<T> {
 let nativeProcessListingMissing = false;
 
 /**
+ * How Windows process listing has been going, kept between discovery
+ * passes. When the native helper fails (blocked by application control,
+ * crashing), it is tried again after 10 s, then 20 s, 40 s... up to five
+ * minutes, and PowerShell lists the processes instead. PowerShell costs
+ * 0.3-1 s of CPU each time, so its listing is reused for a while too:
+ * after the first one, for 20 s, 40 s... up to five minutes. A stopped
+ * agent can then look running for that long; nothing acts on it without
+ * checking the process again (see process-tree.ts). All of this resets
+ * as soon as the helper works again.
+ */
+export type WindowsListingState = {
+  nativeFailures: number;
+  nativeRetryAt: number;
+  powerShellRuns: number;
+  powerShell: Readonly<{ processes: readonly ProcessEvidence[]; reuseUntil: number }> | undefined;
+};
+
+export function newWindowsListingState(): WindowsListingState {
+  return { nativeFailures: 0, nativeRetryAt: 0, powerShellRuns: 0, powerShell: undefined };
+}
+
+const windowsListingState = newWindowsListingState();
+const listingBackoffBaseMs = 10_000;
+const listingBackoffMaxMs = 5 * 60_000;
+
+function listingBackoff(attempt: number): number {
+  return Math.min(listingBackoffMaxMs, listingBackoffBaseMs * 2 ** Math.min(Math.max(0, attempt - 1), 16));
+}
+
+/**
  * Windows processes, listed by the bundled native helper in tens of
  * milliseconds. PowerShell's Win32_Process query, which costs 0.3-1 s (most
  * of it PowerShell start-up), is the fallback when the helper is missing or
@@ -503,22 +643,48 @@ async function readWindowsProcesses(): Promise<readonly ProcessEvidence[]> {
   return listWindowsProcesses(
     nativeProcessListingMissing ? undefined : runNativeProcessListing,
     runPowerShellProcessListing,
+    windowsListingState,
   );
 }
 
+/**
+ * The processes from the native helper, or else from PowerShell. With
+ * `state`, failures back off as WindowsListingState says; without it,
+ * every call tries both.
+ */
 export async function listWindowsProcesses(
   native: (() => Promise<string>) | undefined,
   powerShell: () => Promise<string>,
+  state?: WindowsListingState,
+  now: number = Date.now(),
 ): Promise<readonly ProcessEvidence[]> {
-  if (native !== undefined) {
+  if (native !== undefined && (state === undefined || now >= state.nativeRetryAt)) {
     try {
-      return windowsProcessEvidence(nativeProcessValues(await native()));
+      const processes = windowsProcessEvidence(nativeProcessValues(await native()));
+      if (state !== undefined) Object.assign(state, newWindowsListingState());
+      return processes;
     } catch {
-      // A crashed, timed-out or unreadable helper is retried next pass.
+      // A crashed, timed-out, blocked or unreadable helper is tried again
+      // later.
+      if (state !== undefined) {
+        state.nativeFailures++;
+        state.nativeRetryAt = now + listingBackoff(state.nativeFailures);
+      }
     }
   }
+  if (state?.powerShell !== undefined && now < state.powerShell.reuseUntil) {
+    return state.powerShell.processes;
+  }
   const parsed: unknown = JSON.parse(await powerShell());
-  return windowsProcessEvidence(Array.isArray(parsed) ? parsed : [parsed]);
+  const processes = windowsProcessEvidence(Array.isArray(parsed) ? parsed : [parsed]);
+  if (state !== undefined) {
+    state.powerShellRuns++;
+    state.powerShell = {
+      processes,
+      reuseUntil: state.powerShellRuns <= 1 ? now : now + listingBackoff(state.powerShellRuns),
+    };
+  }
+  return processes;
 }
 
 export async function runNativeProcessListing(): Promise<string> {
@@ -672,6 +838,78 @@ export function windowsPathIdentity(path: string): string {
   return win32.normalize(value).toLowerCase();
 }
 
+/**
+ * The version of the npm package an installed CLI runs, from its
+ * package.json, and that file. Found from the npm shim that starts it
+ * (`%dp0%\\node_modules\\<package>\\...` in a `.cmd`, `$basedir/...` in a
+ * PowerShell or shell shim), or from the executable's own path once links
+ * are resolved (`/usr/local/bin/codex` links into
+ * `lib/node_modules/@openai/codex`). Undefined when it is not an npm
+ * package, so `--version` is run instead.
+ */
+export async function packageVersion(
+  executablePath: string,
+  platform: NodeJS.Platform = process.platform,
+): Promise<Readonly<{ version: string; file: string }> | undefined> {
+  const candidates: string[] = [];
+  try {
+    const metadata = await stat(executablePath);
+    if (metadata.isFile() && metadata.size <= maxShimBytes) {
+      const shim = platform === "win32" && /\.(cmd|bat|ps1)$/iu.test(executablePath);
+      const text = await readFile(executablePath, "utf8");
+      if (shim || text.startsWith("#!")) {
+        const base = dirname(executablePath);
+        for (const match of text.matchAll(/(?:%~?dp0%?|\$\{?basedir\}?)[\\/]*([^"'\s*?<>|%$]+)/gu)) {
+          const relative = match[1];
+          if (relative !== undefined) candidates.push(resolve(base, relative));
+        }
+      }
+    }
+    candidates.push(await realpath(executablePath));
+  } catch {
+    // Unreadable: the version comes from running it, if anything.
+  }
+  for (const candidate of candidates) {
+    const installed = npmPackageOf(candidate);
+    if (installed === undefined) continue;
+    const file = join(installed.directory, "package.json");
+    try {
+      const metadata = await stat(file);
+      if (!metadata.isFile() || metadata.size > maxPackageJsonBytes) continue;
+      const manifest: unknown = JSON.parse(await readFile(file, "utf8"));
+      if (typeof manifest !== "object" || manifest === null) continue;
+      const { name, version } = manifest as Record<string, unknown>;
+      if (
+        name === installed.name && typeof version === "string" &&
+        version.length <= 64 && packageVersionPattern.test(version)
+      ) {
+        return { version, file };
+      }
+    } catch {
+      // Not this one.
+    }
+  }
+  return undefined;
+}
+
+/** The npm package folder and name a path lies in, from its last node_modules. */
+function npmPackageOf(path: string): Readonly<{ directory: string; name: string }> | undefined {
+  const parts = path.split(/[\\/]/u);
+  const at = parts.lastIndexOf("node_modules");
+  if (at < 0) return undefined;
+  const first = parts[at + 1];
+  if (first === undefined || first === "" || first.startsWith(".")) return undefined;
+  const scoped = first.startsWith("@");
+  const second = scoped ? parts[at + 2] : undefined;
+  if (scoped && (second === undefined || second === "" || second.startsWith("."))) return undefined;
+  const length = at + (scoped ? 3 : 2);
+  const separator = path.includes("\\") && !path.includes("/") ? "\\" : "/";
+  return {
+    directory: parts.slice(0, length).join(separator),
+    name: scoped ? `${first}/${second}` : first,
+  };
+}
+
 async function readVersion(executablePath: string): Promise<string> {
   try {
     // npm exposes .cmd shims on Windows, which execFile cannot launch.
@@ -686,9 +924,12 @@ async function readVersion(executablePath: string): Promise<string> {
       script === undefined ? ["--version"] : ["-NoProfile", "-NonInteractive", "-File", script, "--version"],
       {
         // Starting PowerShell alone can take several seconds on a busy or
-        // closely monitored computer, as for the PowerShell process listing.
-        // A probe result is cached, so a slow start is paid once per CLI.
-        timeout: script === undefined ? 5_000 : 15_000,
+        // closely monitored computer, as for the PowerShell process listing,
+        // and some native CLIs are as slow to answer (GitHub Copilot's
+        // copilot.exe from WinGet takes 6-10 s). A probe result is cached
+        // until the executable changes or for an hour, so a slow answer is
+        // paid that rarely.
+        timeout: versionProbeTimeoutMs,
         maxBuffer: 4_096,
         encoding: "utf8",
         windowsHide: true,

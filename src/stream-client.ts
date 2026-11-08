@@ -39,6 +39,7 @@ import {
 import type { BoundedEventQueue, QueueMetrics } from "./event-queue.js";
 import { FileBackedEventQueue, type SpoolRestoreNotice } from "./event-spool.js";
 import {
+  AgentInventorySchema,
   HeartbeatSchema,
   type AgentInventory,
 } from "./generated/phigon/v1/identity_pb.js";
@@ -99,6 +100,15 @@ const maxMessageBytes = 1 << 20;
 const policyReceiptRefreshMs = 5 * 60 * 1_000;
 /** How often an unchanged checkpoint is saved again while connected. */
 export const streamStateRefreshMs = 60 * 1_000;
+/**
+ * How often an agent inventory whose content did not change is sent again.
+ * Discovery offers one every ten seconds; a changed one is sent at once.
+ * The control plane accepts an agent's identity for Guardian only while its
+ * last observation in the stored inventory is under two minutes old, and
+ * marks a computer online from heartbeats (every five seconds), so this
+ * keeps a fourfold margin. Each one sent costs the server a database write.
+ */
+export const inventoryRefreshMs = 30 * 1_000;
 // The longest wait between reconnect attempts. A server that is off, such
 // as the Phigon app's computer overnight, is tried about once a minute, so
 // computers are back within a minute of it starting.
@@ -157,6 +167,8 @@ export type StreamClientOptions = Readonly<{
   healthyStreamMs?: number;
   /** Picks each reconnect wait (`reconnectDelay`); Math.random unless a test fixes it. */
   reconnectRandom?: () => number;
+  /** How often an unchanged inventory is sent again; tests shorten it. */
+  inventoryRefreshMs?: number;
 }>;
 
 export class ObserverStreamClient {
@@ -187,6 +199,10 @@ export class ObserverStreamClient {
   #pumpEvents: (() => void) | undefined;
   #latestInventory: AgentInventory | undefined;
   #sendInventory: ((inventory: AgentInventory) => void) | undefined;
+  // What the current connection last sent: the inventory without its
+  // observation times, and when.
+  #sentInventory: Readonly<{ content: Uint8Array; at: number }> | undefined;
+  readonly #inventoryRefreshMs: number;
   #readySequence: bigint | undefined;
   #establishedSinceConnect = false;
   /** When the current connection completed its handshake. */
@@ -212,6 +228,7 @@ export class ObserverStreamClient {
     this.#observerVersion = reportableVersion(options.observerVersion);
     this.#handshakeTimeoutMs = options.handshakeTimeoutMs ?? 20_000;
     this.#stateRefreshMs = options.stateRefreshMs ?? streamStateRefreshMs;
+    this.#inventoryRefreshMs = options.inventoryRefreshMs ?? inventoryRefreshMs;
     this.#responseTimeoutMs = options.responseTimeoutMs ?? Math.max(30_000, options.config.heartbeatIntervalMs * 3);
     this.#config = options.config;
     this.#credentialStore =
@@ -260,7 +277,24 @@ export class ObserverStreamClient {
 
   updateInventory(inventory: AgentInventory): void {
     this.#latestInventory = inventory;
-    this.#sendInventory?.(inventory);
+    this.#offerInventory(inventory);
+  }
+
+  /** Sends the inventory if its content changed or the last one is getting old. */
+  #offerInventory(inventory: AgentInventory): void {
+    const send = this.#sendInventory;
+    if (send === undefined) return;
+    const content = inventoryContent(inventory);
+    const now = Date.now();
+    const sent = this.#sentInventory;
+    if (
+      sent !== undefined && now >= sent.at && now - sent.at < this.#inventoryRefreshMs &&
+      Buffer.compare(sent.content, content) === 0
+    ) {
+      return;
+    }
+    send(inventory);
+    this.#sentInventory = { content, at: now };
   }
 
   async waitUntilReady(signal?: AbortSignal): Promise<bigint> {
@@ -422,8 +456,11 @@ export class ObserverStreamClient {
       StreamTelemetryResponse
     >(
       streamMethod,
-      (value) =>
-        Buffer.from(toBinary(StreamTelemetryRequestSchema, value)),
+      (value) => {
+        // Wrapped, not copied.
+        const encoded = toBinary(StreamTelemetryRequestSchema, value);
+        return Buffer.from(encoded.buffer, encoded.byteOffset, encoded.byteLength);
+      },
       (value) =>
         fromBinary(StreamTelemetryResponseSchema, value),
       metadata,
@@ -923,8 +960,10 @@ export class ObserverStreamClient {
         );
         sendActionCapabilities();
         this.#sendInventory = sendInventory;
+        // A new connection always starts with the latest inventory.
+        this.#sentInventory = undefined;
         if (this.#latestInventory !== undefined) {
-          sendInventory(this.#latestInventory);
+          this.#offerInventory(this.#latestInventory);
         }
         this.#pumpEvents = pumpEvents;
         heartbeat = setInterval(
@@ -976,6 +1015,14 @@ export class ObserverStreamClient {
     for (const ready of this.#readyWaiters) ready(sequence);
     this.#readyWaiters.clear();
   }
+}
+
+/** The inventory without its observation times, encoded for comparison. */
+function inventoryContent(inventory: AgentInventory): Uint8Array {
+  const content = clone(AgentInventorySchema, inventory);
+  delete content.observedAt;
+  for (const agent of content.agents) delete agent.lastObservedAt;
+  return toBinary(AgentInventorySchema, content);
 }
 
 function rejectedHistorySyncReceipt(

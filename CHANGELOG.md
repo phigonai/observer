@@ -19,7 +19,32 @@ from the matching `vX.Y.Z` tag in this repository.
 - Everything after `--` goes to the program that `guardian` runs.
 - Redaction fixes.
 - Safer consent defaults.
-- Lower CPU use while the observer is idle.
+- Lower CPU use while the observer is idle, and less while agents work:
+  - Agent session folders are kept between scans instead of listed and
+    checked every second. Recently changed folders and files are still
+    checked every second; the rest by a full pass every 10 s on Windows
+    and 3 s elsewhere, or once a minute while `fs.watch` (Windows and
+    macOS, used only as a hint) reports changes. Roots that do not exist
+    are looked for every 5 s.
+  - After two minutes without activity, scans run every 5 s, and every
+    second again as soon as anything changes.
+  - `activity-cursors.json` is written at most every 5 s while an agent
+    is active, and on shutdown.
+  - Discovery reads an npm-installed CLI's version from its package.json
+    instead of running it (through PowerShell for `.cmd` shims), and lists
+    each PATH folder once instead of checking every name and extension.
+    A CLI that has to be run gets 15 s to print its version.
+  - When the native process helper fails on Windows, it and the
+    PowerShell fallback back off up to five minutes.
+  - The agent inventory is sent when it changes and every 30 s otherwise,
+    instead of every 10 s.
+  - The event spool is not rewritten on every start and connection, keeps
+    stored records when it compacts, and each event is encoded once for
+    its size check and the spool.
+- A log that is emptied and written again in place gets new record IDs,
+  so its new records are no longer dropped as copies of the old ones.
+- `doctor` shows the running observer's CPU, memory, event-loop delay,
+  last scan and delivery backlog.
 - Trust and network fixes:
   - A server paired with `--server-ca-sha256` is trusted under that
     authority only. `PHIGON_TLS_CA_FILE` no longer replaces it for the

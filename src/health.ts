@@ -1,6 +1,7 @@
 import { arch, hostname, platform, release } from "node:os";
 import type { ObserverConfig } from "./config.js";
 import { consentSourceOf, type StoredMachineCredential } from "./credential-store.js";
+import type { ObserverRuntimeHealth } from "./self-report.js";
 
 const metadataOnlyCategories = new Set([
   "processMetadata",
@@ -75,6 +76,8 @@ export type ObserverHealth = Readonly<{
   streamCursorIssue?: string;
   /** How this computer consented, when it is paired. */
   consent?: ObserverConsentHealth;
+  /** What the running observer last reported about itself (see self-report.ts). */
+  runningObserver?: ObserverRuntimeHealth;
   checkedAt: string;
 }>;
 
@@ -85,6 +88,7 @@ export function createHealthSnapshot(
   streamCursor?: ObserverStreamCursorHealth,
   streamCursorIssue?: string,
   consent?: ObserverConsentHealth,
+  runningObserver?: ObserverRuntimeHealth,
 ): ObserverHealth {
   return Object.freeze({
     status: config.machineTokenConfigured ? "ready" : "needs-pairing",
@@ -120,6 +124,7 @@ export function createHealthSnapshot(
       : { streamCursor: Object.freeze(streamCursor) }),
     ...(streamCursorIssue === undefined ? {} : { streamCursorIssue }),
     ...(consent === undefined ? {} : { consent }),
+    ...(runningObserver === undefined ? {} : { runningObserver }),
     checkedAt: now.toISOString(),
   });
 }

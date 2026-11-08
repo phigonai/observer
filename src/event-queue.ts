@@ -1,3 +1,21 @@
+// Encodings made before an event is queued. The collector encodes each
+// event to check its size; the spool then stores that encoding instead of
+// encoding the event again. Taken once, so a queued event does not keep
+// its encoding in memory as well. Events are never changed once created.
+const madeEncodings = new WeakMap<object, Uint8Array>();
+
+/** Remembers the protobuf encoding of an event about to be queued. */
+export function rememberEncoding(value: object, encoded: Uint8Array): void {
+  madeEncodings.set(value, encoded);
+}
+
+/** The encoding remembered for `value`, once; undefined after that. */
+export function takeEncoding(value: object): Uint8Array | undefined {
+  const encoded = madeEncodings.get(value);
+  if (encoded !== undefined) madeEncodings.delete(value);
+  return encoded;
+}
+
 export type QueueMetrics = Readonly<{
   capacity: number;
   depth: number;
@@ -11,6 +29,11 @@ export type QueueMetrics = Readonly<{
   bytes?: number;
   /** The byte budget. A queue at its budget refuses new events. */
   byteCapacity?: number;
+  /**
+   * When the oldest queued event was queued, in epoch milliseconds (for
+   * events restored from the spool, when they were restored).
+   */
+  oldestQueuedAt?: number;
 }>;
 
 /**
@@ -36,6 +59,8 @@ export type QueuedEvent<T> = Readonly<{
   coalesceKey?: string;
   /** Stored size of the event, when the queue keeps a byte budget. */
   bytes?: number;
+  /** When it was queued, in epoch milliseconds. */
+  queuedAt?: number;
 }>;
 
 export class BoundedEventQueue<T> {
@@ -72,6 +97,7 @@ export class BoundedEventQueue<T> {
       sequence,
       ...(coalesceKey === undefined ? {} : { coalesceKey }),
       ...(bytes === 0 ? {} : { bytes }),
+      queuedAt: Date.now(),
     };
     if (coalesceKey === undefined && this.#size() < this.#capacity) {
       const last = this.#last();
@@ -188,6 +214,7 @@ export class BoundedEventQueue<T> {
         sequence: event.sequence,
         ...(event.coalesceKey === undefined ? {} : { coalesceKey: event.coalesceKey }),
         ...(size === 0 ? {} : { bytes: size }),
+        ...(event.queuedAt === undefined ? {} : { queuedAt: event.queuedAt }),
       };
     });
     this.#bytes = bytes.reduce((total, size) => total + size, 0);
@@ -212,9 +239,9 @@ export class BoundedEventQueue<T> {
 
   metrics(): QueueMetrics {
     const depth = this.#size();
-    const oldestSequence = depth === 0
-      ? undefined
-      : this.#events[this.#head]?.sequence;
+    const oldest = depth === 0 ? undefined : this.#events[this.#head];
+    const oldestSequence = oldest?.sequence;
+    const oldestQueuedAt = oldest?.queuedAt;
     const latestSequence = this.#last()?.sequence;
     return Object.freeze({
       capacity: this.#capacity,
@@ -225,6 +252,7 @@ export class BoundedEventQueue<T> {
       acknowledged: this.#acknowledged,
       ...(oldestSequence === undefined ? {} : { oldestSequence }),
       ...(latestSequence === undefined ? {} : { latestSequence }),
+      ...(oldestQueuedAt === undefined ? {} : { oldestQueuedAt }),
     });
   }
 

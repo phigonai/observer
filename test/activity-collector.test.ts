@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { zstdCompressSync } from "node:zlib";
-import { create, toJsonString } from "@bufbuild/protobuf";
+import { create, toBinary, toJsonString } from "@bufbuild/protobuf";
 import {
   timestampDate,
   timestampFromDate,
@@ -21,6 +21,7 @@ import {
 } from "../src/activity/collector.js";
 import { JSONLSourceReader, type SourceFailure } from "../src/activity/source-reader.js";
 import { loadConfig } from "../src/config.js";
+import { takeEncoding } from "../src/event-queue.js";
 import { loadContentConfig } from "./content-config.js";
 import {
   ActivityKind,
@@ -248,6 +249,10 @@ test("activity collector throttles without losing source records and resolves di
       emitted.map((event) => event.sequence),
       [11n, 12n],
     );
+    // Each event's size check left its encoding for the spool to store.
+    for (const event of emitted) {
+      assert.deepEqual(takeEncoding(event), toBinary(EventEnvelopeSchema, event));
+    }
     assert.ok(emitted.every((event) => event.agentId !== "agt_real_codex"));
     assert.equal(new Set(emitted.map((event) => event.agentId)).size, 1);
     assert.equal(surfacedSources.length, 1);
@@ -1735,6 +1740,91 @@ test("history sync waits out a refused delivery and skips no record", async () =
     );
     assert.equal(summary.throughSequence, BigInt(accepted.length));
   } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("live collection rests between scans after a quiet spell and wakes on a record or a watched change", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-collector-idle-"));
+  const sourceRoot = join(directory, "sessions");
+  const dataDirectory = join(directory, "data");
+  await mkdir(sourceRoot, { recursive: true });
+  const session = join(sourceRoot, "session.jsonl");
+  await writeFile(session, '{"type":"old"}\n', "utf8");
+  // Counts scans, and lets the test play a watched folder reporting a change.
+  class WatchedReader extends JSONLSourceReader {
+    scans = 0;
+    hinted = false;
+    readonly listeners = new Set<() => void>();
+    override async scan(...args: Parameters<JSONLSourceReader["scan"]>) {
+      this.scans++;
+      return super.scan(...args);
+    }
+    override takeActivityHint(): boolean {
+      const hinted = this.hinted;
+      this.hinted = false;
+      return hinted;
+    }
+    override activityHinted(): boolean {
+      return this.hinted;
+    }
+    override onActivityHint(listener: () => void): () => void {
+      this.listeners.add(listener);
+      return () => this.listeners.delete(listener);
+    }
+    report(): void {
+      this.hinted = true;
+      for (const listener of this.listeners) listener();
+    }
+  }
+  const reader = new WatchedReader(dataDirectory, false);
+  const config = { ...loadConfig({ PHIGON_DATA_DIR: dataDirectory }), activityScanIntervalMs: 50 };
+  const emitted: EventEnvelope[] = [];
+  const collector = new ActivityCollector({
+    config,
+    credential: {
+      machineId: "5f1b4cb4-a77d-4f53-af66-197e184683f4",
+      tenantId: "7d1b4cb4-a77d-4f53-af66-197e184683f4",
+      credential: `phg_m_${"0".repeat(43)}`,
+      controlPlaneOrigin: "http://127.0.0.1:8080",
+      createdAt: "2026-07-24T00:00:00.000Z",
+    },
+    initialSequence: 0n,
+    emit: (event) => emitted.push(event),
+    sources: [{ adapterId: "codex", roots: [sourceRoot] }],
+    reader,
+    idleAfterMs: 300,
+    idleScanIntervalMs: 60_000,
+  });
+  const controller = new AbortController();
+  const sleep = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+  const until = async (condition: () => boolean, label: string) => {
+    for (let waited = 0; !condition(); waited += 25) {
+      assert.ok(waited < 10_000, label);
+      await sleep(25);
+    }
+  };
+  const running = collector.run(controller.signal);
+  try {
+    // Quiet: after 300 ms it rests (here for a minute) instead of scanning.
+    await until(() => collector.scanHealth().idle, "collection never rested");
+    await sleep(100);
+    const resting = reader.scans;
+    await sleep(500);
+    assert.equal(reader.scans, resting, "no scans while resting");
+    assert.ok(collector.scanHealth().lastScanAt instanceof Date);
+    // A watched folder reports a change: scanned at once, and every
+    // interval again, which reads the new record.
+    await appendFile(session, '{"type":"new"}\n', "utf8");
+    reader.report();
+    await until(() => emitted.length > 0, "the new record was not read after the change was reported");
+    assert.equal(collector.scanHealth().idle, false);
+    const awake = reader.scans;
+    await sleep(200);
+    assert.ok(reader.scans > awake, "scanning every interval again");
+  } finally {
+    controller.abort();
+    await running;
     await rm(directory, { recursive: true, force: true });
   }
 });

@@ -550,6 +550,73 @@ test("observer renews the owner action capability manifest on heartbeats", async
   }
 });
 
+test("an inventory is sent when it changes, when it gets old, and on each new connection", async () => {
+  const dataDirectory = await mkdtemp(join(tmpdir(), "phigon-inventory-dedupe-"));
+  const machineId = "5f1b4cb4-a77d-4f53-af66-197e184683f4";
+  const server = new Server();
+  const controller = new AbortController();
+  const received: string[] = [];
+  let heartbeats = 0;
+  const connected: { client?: ObserverStreamClient } = {};
+  const inventory = (version: string) => create(AgentInventorySchema, {
+    machineId,
+    // Discovery stamps each pass; times alone are not a change.
+    observedAt: timestampFromDate(new Date()),
+    agents: [{
+      agentId: "agt_codex",
+      displayName: "OpenAI Codex",
+      version,
+      lastObservedAt: timestampFromDate(new Date()),
+    }],
+  });
+  const implementation: UntypedServiceImplementation = {
+    streamTelemetry(
+      call: ServerDuplexStream<StreamTelemetryRequest, StreamTelemetryResponse>,
+    ) {
+      call.on("data", (request: StreamTelemetryRequest) => {
+        if (request.payload.case === "resume") {
+          call.write(policySnapshot(machineId));
+          call.write(acknowledgement(machineId, 0n));
+        }
+        if (request.payload.case === "inventory") {
+          received.push(request.payload.value.agents[0]?.version ?? "");
+        }
+        if (request.payload.case === "heartbeat") {
+          heartbeats++;
+          call.write(acknowledgement(machineId, 0n));
+          // Discovery every heartbeat: the same, then a new version, then
+          // the same again until it is old enough to send once more.
+          connected.client?.updateInventory(inventory(heartbeats < 3 ? "1.0.0" : "1.1.0"));
+          if (heartbeats === 8) controller.abort();
+        }
+      });
+      call.on("end", () => call.end());
+    },
+  };
+  server.addService(observerServiceDefinition, implementation);
+  const port = await bindServer(server);
+  const client = new ObserverStreamClient({
+    config: streamConfig(dataDirectory, port),
+    credentialStore: testCredentialStore(machineId),
+    inventoryRefreshMs: 3_000,
+  });
+  connected.client = client;
+  client.updateInventory(inventory("1.0.0"));
+  try {
+    await client.run(controller.signal);
+    // On connecting, once on the change, and again after three seconds
+    // of the same content; not on each of the eight offers.
+    assert.equal(received[0], "1.0.0");
+    assert.equal(received[1], "1.1.0");
+    assert.ok(received.length >= 3 && received.length <= 5, `${received.length} inventories sent`);
+    assert.ok(received.slice(2).every((version) => version === "1.1.0"));
+  } finally {
+    controller.abort();
+    await shutdownServer(server);
+    await rm(dataDirectory, { recursive: true, force: true });
+  }
+});
+
 test("every heartbeat says which observer version sent it, and an unusable version is left out", async () => {
   for (const [observerVersion, expected] of [
     ["8.4.0", "8.4.0"],

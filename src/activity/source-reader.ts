@@ -5,14 +5,13 @@ import {
   mkdir,
   open,
   readFile,
-  readdir,
   realpath,
   stat,
   unlink,
   writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, join, relative, resolve, sep } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 import { atomicReplace } from "../atomic-replace.js";
 import {
   DirectoryListingCache,
@@ -20,12 +19,18 @@ import {
   scanJSONDocumentSource,
   startedAfter,
 } from "./json-document-source.js";
+import {
+  type FileIdentity,
+  type ListedFile,
+  listJSONLFiles,
+  LiveFileListing,
+  recentFileFirst,
+} from "./live-listing.js";
 import { type CompletedHistory, SQLiteConnections } from "./sqlite-connections.js";
 
 const maxSourceFiles = 256;
 const historicalFilesPerScan = 16;
 const historicalRecordsPerScan = 4;
-const maxDirectoryDepth = 8;
 const maxReadBytesPerFile = 8 << 20;
 const defaultInitialReplayBytes = 256 << 10;
 // Normal read window. A longer complete record widens the read up to the line
@@ -122,13 +127,6 @@ export type SourceReaderPosition = Readonly<{
   unbaselinedSources: ReadonlySet<string>;
 }>;
 
-type FileIdentity = Readonly<{
-  size: number;
-  dev: number;
-  ino: number;
-  birthtimeMs: number;
-}>;
-
 type SourceFile = Readonly<{
   adapterId: string;
   sourceDisplayName?: string;
@@ -156,6 +154,8 @@ class RecentCursors extends Map<string, number> {
   readonly #used = new Set<string>();
   // Values from before `track`, for each cursor changed since.
   #journal: Map<string, number | undefined> | undefined;
+  // Whether a value changed since `takeChanged` last asked.
+  #changed = false;
 
   override get(key: string): number | undefined {
     const value = super.get(key);
@@ -165,13 +165,23 @@ class RecentCursors extends Map<string, number> {
 
   override set(key: string, value: number): this {
     this.#remember(key);
+    if (super.get(key) !== value) this.#changed = true;
     super.delete(key);
     return super.set(key, value);
   }
 
   override delete(key: string): boolean {
     this.#remember(key);
-    return super.delete(key);
+    const deleted = super.delete(key);
+    if (deleted) this.#changed = true;
+    return deleted;
+  }
+
+  /** Whether any value changed since the last call. Order does not count. */
+  takeChanged(): boolean {
+    const changed = this.#changed;
+    this.#changed = false;
+    return changed;
   }
 
   /** Start remembering the cursors a source changes. */
@@ -184,6 +194,7 @@ class RecentCursors extends Map<string, number> {
     const journal = this.#journal;
     this.#journal = undefined;
     if (!rollback || journal === undefined) return;
+    if (journal.size > 0) this.#changed = true;
     for (const [key, value] of journal) {
       if (value === undefined) super.delete(key);
       else super.set(key, value);
@@ -208,6 +219,7 @@ class RecentCursors extends Map<string, number> {
     for (const key of super.keys()) {
       if (this.size <= limit) break;
       super.delete(key);
+      this.#changed = true;
     }
   }
 }
@@ -215,6 +227,8 @@ class RecentCursors extends Map<string, number> {
 export class ActivityCursorStore {
   readonly #dataDirectory: string;
   readonly #path: string;
+  // The private directory is prepared once, and again if it disappears.
+  #prepared = false;
 
   constructor(dataDirectory: string) {
     this.#dataDirectory = dataDirectory;
@@ -280,8 +294,11 @@ export class ActivityCursorStore {
     cursors: ReadonlyMap<string, number>,
     scannedAt?: number,
   ): Promise<void> {
-    await mkdir(this.#dataDirectory, { recursive: true, mode: 0o700 });
-    await makeDirectoryPrivate(this.#dataDirectory);
+    if (!this.#prepared) {
+      await mkdir(this.#dataDirectory, { recursive: true, mode: 0o700 });
+      await makeDirectoryPrivate(this.#dataDirectory);
+      this.#prepared = true;
+    }
     // Keep the map's order (least recently used first) so a restarted
     // reader still knows which cursors are stale.
     const files = Object.fromEntries(
@@ -293,13 +310,18 @@ export class ActivityCursorStore {
       ...(scannedAt === undefined ? {} : { scanned_at: new Date(scannedAt).toISOString() }),
     };
     const temporary = `${this.#path}.${process.pid}.${randomUUID()}.tmp`;
+    const content = `${JSON.stringify(state)}\n`;
+    const options = { encoding: "utf8", flag: "wx", mode: 0o600, flush: true } as const;
     try {
-      await writeFile(temporary, `${JSON.stringify(state)}\n`, {
-        encoding: "utf8",
-        flag: "wx",
-        mode: 0o600,
-        flush: true,
-      });
+      try {
+        await writeFile(temporary, content, options);
+      } catch (error) {
+        if (!isNodeError(error) || error.code !== "ENOENT") throw error;
+        // The data directory was removed while running: recreate it privately.
+        await mkdir(this.#dataDirectory, { recursive: true, mode: 0o700 });
+        await makeDirectoryPrivate(this.#dataDirectory);
+        await writeFile(temporary, content, options);
+      }
       await atomicReplace(temporary, this.#path);
       await chmod(this.#path, 0o600);
     } catch (error) {
@@ -325,6 +347,15 @@ export class JSONLSourceReader {
   // synchronous disk write per scan interval without changing anything.
   #savedCursors: ReadonlyMap<string, number> | undefined;
   #savedScannedAt: number | undefined;
+  // Live cursors are saved at most this often (0: on every commit). A
+  // commit within it is kept here and written by a later commit or by
+  // `flushCheckpoint`. After a crash the reader resumes from the saved,
+  // older cursors: it reads a few seconds of records again, and their
+  // stable record IDs let the server drop the copies. It never skips one,
+  // since a checkpoint is committed only once its events are durable.
+  readonly #saveIntervalMs: number;
+  #savedAt = Number.NEGATIVE_INFINITY;
+  #deferredCheckpoint: ActivitySourceCheckpoint | undefined;
   // When the scan behind the saved cursors started, as loaded at startup.
   // Undefined on the first start ever. A file without a cursor that began
   // after it was created while the observer was stopped.
@@ -349,6 +380,23 @@ export class JSONLSourceReader {
   readonly #openCodeConnections = new SQLiteConnections();
   // Folder listings for JSON-document agents, reused while folders are unchanged.
   readonly #documentListings = new DirectoryListingCache();
+  // Live JSONL files kept between scans, and which other roots exist.
+  readonly #liveListing: LiveFileListing;
+  // What each live source made of a root's listing last time, reused while
+  // the listing is the same array (nothing in the root changed).
+  readonly #rootFiles = new Map<string, Readonly<{
+    listed: readonly ListedFile[];
+    rootReal: string;
+    files: readonly SourceFile[];
+    canonicalPaths: ReadonlyArray<readonly [string, CanonicalSourcePath]>;
+  }>>();
+  // Cursor IDs of listed files; a file's ID is a digest of its path and
+  // identity, which a reused SourceFile keeps.
+  readonly #cursorIds = new WeakMap<SourceFile, string>();
+  // Whether a live scan made any root's files afresh, and the reconciled
+  // candidates of the last live scan, reused when nothing changed.
+  #rootFilesRebuilt = false;
+  #lastCandidates: Readonly<{ signature: string; files: readonly SourceFile[] }> | undefined;
   readonly #gooseConnections = new SQLiteConnections();
   readonly #zedConnections = new SQLiteConnections();
   readonly #failures = new Map<string, SourceFailure>();
@@ -365,6 +413,7 @@ export class JSONLSourceReader {
     initialReplaySessions = 1,
     mode: SourceReaderMode = "live",
     clock: () => number = Date.now,
+    checkpointSaveIntervalMs = 0,
   ) {
     this.#cursorStore = new ActivityCursorStore(dataDirectory);
     this.#replayOnFirstStart = replayOnFirstStart;
@@ -378,6 +427,8 @@ export class JSONLSourceReader {
     );
     this.#mode = mode;
     this.#clock = clock;
+    this.#saveIntervalMs = mode === "live" ? Math.max(0, checkpointSaveIntervalMs) : 0;
+    this.#liveListing = new LiveFileListing({ now: clock });
   }
 
   async scan(sources: readonly ActivitySource[], maxRecords?: number): Promise<
@@ -398,6 +449,8 @@ export class JSONLSourceReader {
       this.#scanStart = loaded.cursors;
     }
     const scannedAt = this.#clock();
+    const live = this.#mode === "live";
+    if (live) this.#liveListing.beginScan();
     const records: SourceRecord[] = [];
     let fileCount = 0;
     let malformed = 0;
@@ -406,7 +459,10 @@ export class JSONLSourceReader {
     const initialScan = !this.#initialScanComplete;
     // Files of sources that missed their baseline, baselined on this scan.
     const baselinePaths = new Set<string>();
-    const cacheKey = JSON.stringify(sources);
+    const usedRootFiles = new Set<string>();
+    const skippedSources: string[] = [];
+    this.#rootFilesRebuilt = false;
+    const cacheKey = this.#mode === "history" ? JSON.stringify(sources) : "";
     if (this.#mode === "history" && this.#sourceCache?.key === cacheKey && Date.now() - this.#sourceCache.at < 5_000) {
       candidates = this.#sourceCache.files;
     } else {
@@ -416,9 +472,12 @@ export class JSONLSourceReader {
       const key = sourceKey(source);
       const sourceInitial = initialScan || this.#unbaselinedSources.has(key);
       const listed = await this.#isolated(key, source.adapterId, sourceInitial, () =>
-        this.#listJSONLSource(source, canonicalPaths)
+        this.#listJSONLSource(source, canonicalPaths, usedRootFiles)
       );
-      if (listed === undefined) continue;
+      if (listed === undefined) {
+        skippedSources.push(key);
+        continue;
+      }
       for (const file of listed) {
         candidates.push(file);
         if (sourceInitial && !initialScan) baselinePaths.add(file.path);
@@ -431,10 +490,26 @@ export class JSONLSourceReader {
     }
     this.#sourceCache = { key: cacheKey, at: Date.now(), files: candidates };
     this.#canonicalPaths = canonicalPaths;
+    for (const key of [...this.#rootFiles.keys()]) {
+      if (!usedRootFiles.has(key)) this.#rootFiles.delete(key);
     }
-    const recentCandidates = reconciledSourceFiles(candidates)
-      .sort(recentFileFirst)
-      .slice(0, maxCursorEntries);
+    }
+    // An idle live scan reuses the last one's reconciled, sorted files when
+    // every root gave back the same files.
+    const signature = `${[...usedRootFiles].join("\u0001")}\u0002${skippedSources.join("\u0001")}`;
+    let recentCandidates: readonly SourceFile[];
+    if (
+      this.#mode === "live" && !this.#rootFilesRebuilt &&
+      this.#lastCandidates?.signature === signature
+    ) {
+      recentCandidates = this.#lastCandidates.files;
+    } else {
+      recentCandidates = reconciledSourceFiles(candidates)
+        .sort(recentFileFirst)
+        .slice(0, maxCursorEntries);
+      // Right for the next scan too if it rebuilds nothing.
+      this.#lastCandidates = this.#mode === "live" ? { signature, files: recentCandidates } : undefined;
+    }
     const selected = this.#mode === "history"
       ? await this.#pendingHistoryFiles(recentCandidates)
       : recentCandidates.slice(0, maxSourceFiles);
@@ -473,7 +548,7 @@ export class JSONLSourceReader {
       let result;
       try {
         const rootReal = rootRealPaths.get(file.root) ??
-          await realpath(file.root);
+          await this.#realRoot(file.root);
         rootRealPaths.set(file.root, rootReal);
         result = await this.#readFile(
           file.adapterId,
@@ -509,9 +584,9 @@ export class JSONLSourceReader {
       if (source.format !== "json-messages") continue;
       const key = sourceKey(source);
       const sourceInitial = initialScan || this.#unbaselinedSources.has(key);
-      const documents = await this.#isolated(key, source.adapterId, sourceInitial, () => scanJSONDocumentSource({
+      const documents = await this.#isolated(key, source.adapterId, sourceInitial, async () => scanJSONDocumentSource({
         adapterId: source.adapterId,
-        roots: source.roots.map(expandedActivityRoot),
+        roots: await this.#existingRoots(source),
         pathPattern: source.pathPattern ?? "\\.json$",
         messagesField: source.messagesField ?? "messages",
         ...source.document,
@@ -550,9 +625,9 @@ export class JSONLSourceReader {
       );
       const key = sourceKey(source);
       const sourceInitial = initialScan || this.#unbaselinedSources.has(key);
-      const goose = await this.#isolated(key, source.adapterId, sourceInitial, () => scanGooseSQLiteSources({
+      const goose = await this.#isolated(key, source.adapterId, sourceInitial, async () => scanGooseSQLiteSources({
         adapterId: source.adapterId,
-        roots: source.roots.map(expandedActivityRoot),
+        roots: await this.#existingRoots(source),
         cursors,
         initialScan: sourceInitial,
         replayOnFirstStart: this.#replayOnFirstStart,
@@ -582,9 +657,9 @@ export class JSONLSourceReader {
       const { scanZedSQLiteSources } = await import("./zed-sqlite-source.js");
       const key = sourceKey(source);
       const sourceInitial = initialScan || this.#unbaselinedSources.has(key);
-      const zed = await this.#isolated(key, source.adapterId, sourceInitial, () => scanZedSQLiteSources({
+      const zed = await this.#isolated(key, source.adapterId, sourceInitial, async () => scanZedSQLiteSources({
         adapterId: source.adapterId,
-        roots: source.roots.map(expandedActivityRoot),
+        roots: await this.#existingRoots(source),
         cursors,
         initialScan: sourceInitial,
         replayOnFirstStart: this.#replayOnFirstStart,
@@ -622,9 +697,9 @@ export class JSONLSourceReader {
       );
       const key = sourceKey(source);
       const sourceInitial = initialScan || this.#unbaselinedSources.has(key);
-      const sqlite = await this.#isolated(key, source.adapterId, sourceInitial, () => scanOpenCodeSQLiteSources({
+      const sqlite = await this.#isolated(key, source.adapterId, sourceInitial, async () => scanOpenCodeSQLiteSources({
         adapterId: source.adapterId,
-        roots: source.roots.map(expandedActivityRoot),
+        roots: await this.#existingRoots(source),
         cursors,
         initialScan: sourceInitial,
         replayOnFirstStart: this.#replayOnFirstStart,
@@ -650,11 +725,19 @@ export class JSONLSourceReader {
     this.#openCodeConnections.retain(configuredRoots(sources, "opencode-sqlite"));
     this.#gooseConnections.retain(configuredRoots(sources, "goose-sqlite"));
     this.#zedConnections.retain(configuredRoots(sources, "zed-sqlite"));
+    if (live) {
+      this.#liveListing.retain(new Set(sources.flatMap((source) => source.roots.map(expandedActivityRoot))));
+    }
     this.#initialScanComplete = true;
     this.#cursors.settle(maxCursorEntries);
+    // An unchanged scan shares the previous checkpoint's cursors instead of
+    // copying them (and lets commit see they are unchanged at once).
+    const changed = this.#cursors.takeChanged();
     const checkpoint = Object.freeze({
       generation: ++this.#generation,
-      cursors: new Map(this.#cursors),
+      cursors: !changed && this.#scanStart !== undefined
+        ? this.#scanStart
+        : new Map(this.#cursors),
       scannedAt,
     });
     this.#scanStart = checkpoint.cursors;
@@ -682,15 +765,37 @@ export class JSONLSourceReader {
     // when this one ran. Later idle scans keep the time of the last change:
     // a file read since then would have changed the cursors.
     if (
-      this.#savedCursors === undefined ||
-      this.#savedScannedAt === undefined ||
-      !sameCursors(checkpoint.cursors, this.#savedCursors)
+      this.#savedCursors !== undefined &&
+      this.#savedScannedAt !== undefined &&
+      (checkpoint.cursors === this.#savedCursors || sameCursors(checkpoint.cursors, this.#savedCursors))
     ) {
-      await this.#cursorStore.save(checkpoint.cursors, checkpoint.scannedAt);
-      this.#savedCursors = checkpoint.cursors;
-      this.#savedScannedAt = checkpoint.scannedAt;
+      this.#deferredCheckpoint = undefined;
+    } else {
+      const now = this.#clock();
+      if (
+        this.#savedScannedAt !== undefined &&
+        now >= this.#savedAt && now - this.#savedAt < this.#saveIntervalMs
+      ) {
+        this.#deferredCheckpoint = checkpoint;
+      } else {
+        await this.#save(checkpoint);
+      }
     }
     this.#committedGeneration = checkpoint.generation;
+  }
+
+  /** Writes the checkpoint a commit kept for later, for example on shutdown. */
+  async flushCheckpoint(): Promise<void> {
+    const deferred = this.#deferredCheckpoint;
+    if (deferred !== undefined) await this.#save(deferred);
+  }
+
+  async #save(checkpoint: ActivitySourceCheckpoint): Promise<void> {
+    await this.#cursorStore.save(checkpoint.cursors, checkpoint.scannedAt);
+    this.#savedCursors = checkpoint.cursors;
+    this.#savedScannedAt = checkpoint.scannedAt;
+    this.#savedAt = this.#clock();
+    if (this.#deferredCheckpoint === checkpoint) this.#deferredCheckpoint = undefined;
   }
 
   /**
@@ -726,6 +831,24 @@ export class JSONLSourceReader {
     this.#completedHistoryDatabases = new Map(position.completedHistoryDatabases);
     this.#initialScanComplete = position.initialScanComplete;
     this.#unbaselinedSources = new Set(position.unbaselinedSources);
+  }
+
+  /**
+   * Whether a watched agent folder reported a change since the last call
+   * (live mode, on systems that can watch; see LiveFileListing).
+   */
+  takeActivityHint(): boolean {
+    return this.#liveListing.takeHint();
+  }
+
+  /** Whether a change was reported that `takeActivityHint` has not taken. */
+  activityHinted(): boolean {
+    return this.#liveListing.hinted();
+  }
+
+  /** Calls `listener` when a watched agent folder reports a change. */
+  onActivityHint(listener: () => void): () => void {
+    return this.#liveListing.onHint(listener);
   }
 
   /** Sources and files that failed and are skipped until `retryAt`. */
@@ -804,6 +927,17 @@ export class JSONLSourceReader {
     this.#openCodeConnections.closeAll();
     this.#gooseConnections.closeAll();
     this.#zedConnections.closeAll();
+    this.#liveListing.close();
+  }
+
+  /** The configured roots of a source; in live mode only those that exist. */
+  async #existingRoots(source: ActivitySource): Promise<string[]> {
+    const roots = source.roots.map(expandedActivityRoot);
+    return this.#mode === "live" ? await this.#liveListing.existing(roots) : roots;
+  }
+
+  async #realRoot(root: string): Promise<string> {
+    return this.#mode === "live" ? await this.#liveListing.realRoot(root) : await realpath(root);
   }
 
   /**
@@ -813,7 +947,11 @@ export class JSONLSourceReader {
    */
   #unchangedLiveFile(file: SourceFile): boolean {
     if (this.#mode !== "live" || file.identity === undefined) return false;
-    const cursorId = fileCursorId(file.path, file.identity);
+    let cursorId = this.#cursorIds.get(file);
+    if (cursorId === undefined) {
+      cursorId = fileCursorId(file.path, file.identity);
+      this.#cursorIds.set(file, cursorId);
+    }
     return (
       this.#cursors?.get(cursorId) === file.identity.size &&
       !this.#oversizedContinuations.has(cursorId)
@@ -859,7 +997,21 @@ export class JSONLSourceReader {
           metadata.size -
             (initialReplay ? this.#initialReplayBytes : maxReadBytesPerFile),
         ));
-    if (metadata.size < offset) offset = 0;
+    // A file shorter than its cursor was emptied and written again in place
+    // (same identity, so the same cursor). Its new records start at the
+    // offsets the old ones had, so they get IDs of a new generation; else
+    // the server would drop them as copies of the old records. The
+    // generation is kept with the cursors, so reading the same records
+    // again after a restart gives them the same IDs.
+    const generationId = digest(`generation\u0000${cursorId}`);
+    let generation = this.#cursors?.get(generationId) ?? 0;
+    if (metadata.size < offset) {
+      offset = 0;
+      generation++;
+      this.#cursors?.set(generationId, generation);
+      this.#oversizedContinuations.delete(cursorId);
+    }
+    const recordIdPrefix = generation === 0 ? cursorId : `${cursorId}:${generation}`;
     let length = Math.min(
       metadata.size - offset,
       maxReadBytesPerFile,
@@ -954,7 +1106,7 @@ export class JSONLSourceReader {
         records.push({
           adapterId,
           sourceId: `ses_${sourceId.slice(0, 32)}`,
-          sourceRecordId: digest(`${cursorId}:${recordOffset}`),
+          sourceRecordId: digest(`${recordIdPrefix}:${recordOffset}`),
           ...(sourceDisplayName === undefined
             ? {}
             : { sourceDisplayName }),
@@ -975,15 +1127,39 @@ export class JSONLSourceReader {
   async #listJSONLSource(
     source: ActivitySource,
     canonicalPaths: Map<string, CanonicalSourcePath>,
+    usedRootFiles: Set<string>,
   ): Promise<SourceFile[]> {
     let files: SourceFile[] = [];
     const pathPattern = source.pathPattern === undefined
       ? undefined
       : new RegExp(source.pathPattern, "u");
+    const live = this.#mode === "live";
     for (const configuredRoot of source.roots) {
       const root = expandedActivityRoot(configuredRoot);
-      const rootFiles = await listJSONLFiles(root);
+      const rootFiles = live
+        ? await this.#liveListing.list(root)
+        : await listJSONLFiles(root);
       let rootReal: string | undefined;
+      const memoKey = JSON.stringify([sourceKey(source), source.sourceDisplayName ?? "", source.sourceCapabilities ?? [], root]);
+      const memo = live && rootFiles.length > 0 ? this.#rootFiles.get(memoKey) : undefined;
+      if (memo !== undefined && memo.listed === rootFiles) {
+        rootReal = await this.#realRoot(root);
+        if (memo.rootReal === rootReal) {
+          usedRootFiles.add(memoKey);
+          for (const [key, canonical] of memo.canonicalPaths) canonicalPaths.set(key, canonical);
+          for (const file of memo.files) files.push(file);
+          if (files.length > maxCursorEntries * 2) {
+            files = reconciledSourceFiles(files);
+            files.sort(recentFileFirst);
+            files.length = maxCursorEntries;
+          }
+          continue;
+        }
+      }
+      if (rootFiles.length > 0) this.#rootFilesRebuilt = true;
+      const rootSourceFiles: SourceFile[] = [];
+      const rootCanonicalPaths: Array<readonly [string, CanonicalSourcePath]> = [];
+      let complete = true;
       for (const file of rootFiles) {
         if (
           pathPattern !== undefined &&
@@ -996,7 +1172,7 @@ export class JSONLSourceReader {
           // The listing never follows links, so a listed file keeps its
           // canonical path while its root resolves to the same place and
           // the file keeps its identity. Resolve each file only once.
-          rootReal ??= await realpath(root);
+          rootReal ??= await this.#realRoot(root);
           const key = `${rootReal}\u0000${file.path}`;
           const identity = fileIdentityKey(file.identity);
           const known = this.#canonicalPaths.get(key);
@@ -1006,13 +1182,19 @@ export class JSONLSourceReader {
               ? known.path
               : await realpath(file.path);
           if (identity !== undefined) {
-            canonicalPaths.set(key, { path: canonicalPath, identity });
+            const canonical = { path: canonicalPath, identity };
+            canonicalPaths.set(key, canonical);
+            rootCanonicalPaths.push([key, canonical]);
           }
         } catch (error) {
-          if (isTransientSourceError(error)) continue;
+          if (isTransientSourceError(error)) {
+            // Retried on the next scan, so this root's files are not reused.
+            complete = false;
+            continue;
+          }
           throw error;
         }
-        files.push({
+        const sourceFile: SourceFile = {
           adapterId: source.adapterId,
           ...(source.sourceDisplayName === undefined
             ? {}
@@ -1024,12 +1206,23 @@ export class JSONLSourceReader {
           path: canonicalPath,
           modifiedMs: file.modifiedMs,
           identity: file.identity,
-        });
+        };
+        files.push(sourceFile);
+        rootSourceFiles.push(sourceFile);
         if (files.length > maxCursorEntries * 2) {
           files = reconciledSourceFiles(files);
           files.sort(recentFileFirst);
           files.length = maxCursorEntries;
         }
+      }
+      if (live && complete && rootReal !== undefined) {
+        usedRootFiles.add(memoKey);
+        this.#rootFiles.set(memoKey, {
+          listed: rootFiles,
+          rootReal,
+          files: rootSourceFiles,
+          canonicalPaths: rootCanonicalPaths,
+        });
       }
     }
     return files;
@@ -1107,89 +1300,6 @@ export function expandedActivityRoot(root: string): string {
   return root;
 }
 
-type ListedFile = Readonly<{
-  path: string;
-  modifiedMs: number;
-  identity: FileIdentity;
-}>;
-
-async function listJSONLFiles(
-  root: string,
-): Promise<ListedFile[]> {
-  let metadata;
-  try {
-    metadata = await stat(root);
-  } catch (error) {
-    if (
-      isNodeError(error) &&
-      (error.code === "ENOENT" ||
-        error.code === "EACCES" ||
-        error.code === "EPERM")
-    ) {
-      return [];
-    }
-    throw error;
-  }
-  if (!metadata.isDirectory()) return [];
-  const result: ListedFile[] = [];
-  const walk = async (directory: string, depth: number): Promise<void> => {
-    if (depth > maxDirectoryDepth) return;
-    let entries;
-    try {
-      entries = await readdir(directory, { withFileTypes: true });
-    } catch (error) {
-      if (
-        isNodeError(error) &&
-        (error.code === "ENOENT" ||
-          error.code === "EACCES" ||
-          error.code === "EPERM" ||
-          error.code === "ENOTDIR")
-      ) {
-        return;
-      }
-      throw error;
-    }
-    for (const entry of entries) {
-      const path = join(directory, entry.name);
-      if (entry.isDirectory()) await walk(path, depth + 1);
-      else if (
-        entry.isFile() &&
-        basename(entry.name).toLowerCase().endsWith(".jsonl")
-      ) {
-        try {
-          const metadata = await stat(path);
-          result.push({
-            path,
-            modifiedMs: metadata.mtimeMs,
-            identity: {
-              size: metadata.size,
-              dev: metadata.dev,
-              ino: metadata.ino,
-              birthtimeMs: metadata.birthtimeMs,
-            },
-          });
-          if (result.length > maxCursorEntries * 2) {
-            result.sort(recentFileFirst);
-            result.length = maxCursorEntries;
-          }
-        } catch (error) {
-          if (
-            isNodeError(error) &&
-            (error.code === "ENOENT" ||
-              error.code === "EACCES" ||
-              error.code === "EPERM")
-          ) {
-            continue;
-          }
-          throw error;
-        }
-      }
-    }
-  };
-  await walk(root, 0);
-  return result.sort(recentFileFirst).slice(0, maxCursorEntries);
-}
-
 async function readRange(
   path: string,
   position: number,
@@ -1203,15 +1313,6 @@ async function readRange(
   } finally {
     await handle.close();
   }
-}
-
-function recentFileFirst(
-  left: Readonly<{ path: string; modifiedMs: number }>,
-  right: Readonly<{ path: string; modifiedMs: number }>,
-): number {
-  return (
-    right.modifiedMs - left.modifiedMs || left.path.localeCompare(right.path)
-  );
 }
 
 /**
@@ -1231,6 +1332,11 @@ function reconciledSourceFiles(files: readonly SourceFile[]): SourceFile[] {
 }
 
 function reconciledSourceFile(claims: readonly SourceFile[]): SourceFile {
+  // One claim reconciles to itself, unless a label it carries must go.
+  const only = claims.length === 1 ? claims[0] : undefined;
+  if (only !== undefined && (only.adapterId === "generic" || only.sourceDisplayName === undefined)) {
+    return only;
+  }
   const ordered = [...claims].sort(compareSourceClaim);
   const adapterIDs = new Set(ordered.map((claim) => claim.adapterId));
   const nativeAdapterIDs = new Set(

@@ -68,6 +68,7 @@ import {
   describeConsent,
   type ObserverStreamCursorHealth,
 } from "./health.js";
+import { describeRuntime, readObserverStatus, startSelfReport } from "./self-report.js";
 import {
   OBSERVER_CONSENT_POLICY_VERSION,
   pairMachine,
@@ -889,6 +890,14 @@ export async function run(
             );
           },
         });
+        // Once a minute, what this observer costs, for doctor.
+        startSelfReport({
+          dataDirectory: config.dataDirectory,
+          observerVersion: version,
+          queue: () => client.metrics().queue,
+          scan: () => collector?.scanHealth(),
+          signal: controller.signal,
+        });
         const historicalStore = new HistoricalIdentityStore(
           config.dataDirectory,
           {
@@ -1304,6 +1313,7 @@ export async function run(
       streamCursor,
       streamCursorIssue,
       storedCredential === null ? undefined : consentHealth(storedCredential),
+      await readObserverStatus(config.dataDirectory),
     );
     output.stdout(
       json ? `${JSON.stringify(health, null, 2)}\n` : formatHealth(health),
@@ -2317,6 +2327,7 @@ function formatHealth(health: ReturnType<typeof createHealthSnapshot>): string {
           `Stream cursor: ${health.streamCursor.acknowledgedSequence} for ${health.streamCursor.machineId}`,
         ]),
     ...(health.consent === undefined ? [] : [`Consent: ${describeConsent(health.consent)}`]),
+    ...(health.runningObserver === undefined ? [] : [`Running observer: ${describeRuntime(health.runningObserver)}`]),
     `Content collection: ${health.safeCollectionDefaults ? "metadata only" : "explicit categories enabled"}`,
     "",
   ].join("\n");

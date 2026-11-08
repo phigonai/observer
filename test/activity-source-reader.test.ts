@@ -148,6 +148,113 @@ test("idle scans do not rewrite an unchanged source checkpoint", async () => {
   }
 });
 
+test("live cursors are written at most every few seconds, and a crash in between only reads records again", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-source-coalesce-"));
+  const sourceRoot = join(directory, "sessions");
+  const dataDirectory = join(directory, "data");
+  const cursorPath = join(dataDirectory, "activity-cursors.json");
+  const sources = [{ adapterId: "codex", roots: [sourceRoot] }];
+  await mkdir(sourceRoot, { recursive: true });
+  const sourceFile = join(sourceRoot, "session.jsonl");
+  await writeFile(sourceFile, '{"type":"existing"}\n', "utf8");
+  let now = Date.now();
+  const tick = () => {
+    now += 1_000;
+    return now;
+  };
+  const reader = new JSONLSourceReader(dataDirectory, false, 4_096, 1, "live", () => now, 5_000);
+  try {
+    const baseline = await reader.scan(sources);
+    await reader.commit(baseline.checkpoint);
+    const saved = await readFile(cursorPath, "utf8");
+    // An unchanged scan shares its checkpoint's cursors with the last one.
+    tick();
+    const idle = await reader.scan(sources);
+    assert.equal(idle.checkpoint.cursors, baseline.checkpoint.cursors);
+    await reader.commit(idle.checkpoint);
+
+    await appendFile(sourceFile, '{"type":"first"}\n', "utf8");
+    tick();
+    const first = await reader.scan(sources);
+    assert.deepEqual(first.records.map((record) => record.value), [{ type: "first" }]);
+    await reader.commit(first.checkpoint);
+    assert.equal(await readFile(cursorPath, "utf8"), saved, "kept back within five seconds of the last write");
+
+    // A crash now: a new reader starts from the saved cursors and reads the
+    // record again under the same ID, which the server deduplicates.
+    const afterCrash = new JSONLSourceReader(dataDirectory, false, 4_096, 1, "live", () => now, 5_000);
+    const again = await afterCrash.scan(sources);
+    assert.deepEqual(again.records.map((record) => record.sourceRecordId), first.records.map((record) => record.sourceRecordId));
+    afterCrash.close();
+
+    // Written by the first commit five seconds after the last write.
+    for (let second = 0; second < 2; second++) {
+      tick();
+      await reader.commit((await reader.scan(sources)).checkpoint);
+      assert.equal(await readFile(cursorPath, "utf8"), saved);
+    }
+    tick();
+    await reader.commit((await reader.scan(sources)).checkpoint);
+    const written = await readFile(cursorPath, "utf8");
+    assert.notEqual(written, saved);
+
+    // A commit kept back is written on shutdown.
+    await appendFile(sourceFile, '{"type":"second"}\n', "utf8");
+    tick();
+    await reader.commit((await reader.scan(sources)).checkpoint);
+    assert.equal(await readFile(cursorPath, "utf8"), written);
+    await reader.flushCheckpoint();
+    const restarted = new JSONLSourceReader(dataDirectory, false, 4_096, 1, "live", () => now, 5_000);
+    assert.deepEqual((await restarted.scan(sources)).records, []);
+    restarted.close();
+  } finally {
+    reader.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a log truncated and written again gets new record IDs, stable across a restart", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-source-truncate-"));
+  const sourceRoot = join(directory, "sessions");
+  const dataDirectory = join(directory, "data");
+  const sources = [{ adapterId: "codex", roots: [sourceRoot] }];
+  await mkdir(sourceRoot, { recursive: true });
+  const sourceFile = join(sourceRoot, "session.jsonl");
+  await writeFile(sourceFile, '{"type":"old-first","padding":"xxxxxxxxxxxxxxxx"}\n', "utf8");
+  try {
+    const reader = new JSONLSourceReader(dataDirectory, true, 4_096);
+    const before = await reader.scan(sources);
+    assert.deepEqual(before.records.map((record) => record.value), [{ type: "old-first", padding: "xxxxxxxxxxxxxxxx" }]);
+    await reader.commit(before.checkpoint);
+    const committed = reader.position();
+
+    // The same file (same identity), emptied and written again from the start.
+    await writeFile(sourceFile, '{"type":"new-first"}\n', "utf8");
+    const after = await reader.scan(sources);
+    assert.deepEqual(after.records.map((record) => record.value), [{ type: "new-first" }]);
+    assert.notEqual(after.records[0]?.sourceRecordId, before.records[0]?.sourceRecordId,
+      "a new record at the same offset is not a duplicate of the old one");
+
+    // Read again from the earlier checkpoint (as after a crash): same IDs.
+    reader.rewind(committed);
+    const again = await reader.scan(sources);
+    assert.deepEqual(again.records.map((record) => record.sourceRecordId), after.records.map((record) => record.sourceRecordId));
+    await reader.commit(again.checkpoint);
+    await appendFile(sourceFile, '{"type":"new-second"}\n', "utf8");
+    const restarted = new JSONLSourceReader(dataDirectory, true, 4_096);
+    const grown = await restarted.scan(sources);
+    assert.deepEqual(grown.records.map((record) => record.value), [{ type: "new-second" }]);
+
+    // A second truncation is told apart from the first.
+    await writeFile(sourceFile, '{"type":"third"}\n', "utf8");
+    const third = await restarted.scan(sources);
+    assert.equal(third.records.length, 1);
+    assert.ok(![before, after].some((scan) => scan.records[0]?.sourceRecordId === third.records[0]?.sourceRecordId));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("live scans skip unchanged files but still read growth and same-size replacements", async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-source-unchanged-"));
   const sourceRoot = join(directory, "sessions");

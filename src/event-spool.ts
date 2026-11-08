@@ -19,13 +19,13 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { fromBinary, toBinary } from "@bufbuild/protobuf";
+import { equals, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { atomicReplaceSync } from "./atomic-replace.js";
 import {
   EventEnvelopeSchema,
   type EventEnvelope,
 } from "./generated/phigon/v1/telemetry_pb.js";
-import { BoundedEventQueue, type QueueMetrics } from "./event-queue.js";
+import { BoundedEventQueue, takeEncoding, type QueueMetrics, type QueuedEvent } from "./event-queue.js";
 import { streamStateFileName } from "./stream-state.js";
 
 const spoolVersion = 1;
@@ -44,6 +44,10 @@ const retiredPairingsDirectory = "retired-pairings";
 const damagedSpoolsDirectory = "damaged-spools";
 // Each retired or damaged spool can be as large as the spool budget.
 const retainedRetiredPairings = 3;
+// Stored lines of queued events kept in memory, so a compaction writes
+// them again instead of encrypting each event anew. Beyond this many bytes
+// an event is encrypted again when the spool is rewritten.
+const maxRememberedLineBytes = 16 << 20;
 
 /**
  * What `restore` did instead of loading the spool as it was:
@@ -84,6 +88,8 @@ type SpoolSequenceRecord = Readonly<{
 
 type SpoolRecord = SpoolEvent | SpoolSequenceRecord;
 
+type StoredLine = Readonly<{ line: string; sequence: bigint; coalesceKey: string | undefined }>;
+
 /**
  * An encrypted append-only delivery spool. The in-memory queue remains the hot
  * path, while this log makes unacknowledged events recoverable after an
@@ -115,6 +121,9 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
   // Why the last write failed. A failed append can leave a partial record,
   // so the next write rewrites the whole spool instead of appending.
   #writeFailure: unknown;
+  // Each queued event's stored line (an encrypted record), by event.
+  #lines = new Map<EventEnvelope, StoredLine>();
+  #lineBytes = 0;
 
   constructor(
     dataDirectory: string,
@@ -239,23 +248,36 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
       // Events left out because the queue was full, until a later record
       // acknowledges or discards them.
       const dropped = new Set<bigint>();
+      const storedLines = new Map<EventEnvelope, StoredLine>();
       try {
         for (const line of completeLines) {
           if (line.length === 0) continue;
           const record = parseRecord(line, scope);
-          this.#restoreRecord(record, restored, Buffer.byteLength(line) + 1, dropped);
+          const event = this.#restoreRecord(record, restored, Buffer.byteLength(line) + 1, dropped);
+          if (event !== undefined) {
+            storedLines.set(event, { line, sequence: event.sequence, coalesceKey: record.operation === "event" ? record.coalesce_key : undefined });
+          }
         }
       } catch {
         return this.#setAsideDamaged();
       }
-      if (!raw.endsWith("\n") && (lines.at(-1)?.length ?? 0) > 0) {
-        // A crash can leave only the final write incomplete. Its records
-        // were never flushed, so no source checkpoint moved past them:
-        // ignore that tail and compact the verified prefix.
+      this.#keepLines(restored.entries(), storedLines);
+      // A crash can leave only the final write incomplete. Its records were
+      // never flushed, so no source checkpoint moved past them: that tail
+      // is left out by rewriting the verified prefix. A spool that ends
+      // cleanly, with nothing left out and not much to drop, is kept as it
+      // is and appended to, as it was before the restart.
+      const torn = raw.length > 0 && !raw.endsWith("\n");
+      const live = restored.entries().reduce((total, entry) => total + (entry.bytes ?? 0), 0);
+      const dead = Buffer.byteLength(raw) - live;
+      if (torn || dropped.size > 0 || (dead >= this.#compactAfterDeadBytes && dead > live)) {
+        const sizes = this.#writeCompactedQueue(restored);
+        this.replaceState(restored);
+        this.reweigh(sizes);
+      } else {
+        this.replaceState(restored);
+        this.#size = Buffer.byteLength(raw);
       }
-      const sizes = this.#writeCompactedQueue(restored);
-      this.replaceState(restored);
-      this.reweigh(sizes);
       const acknowledged = restored.metrics().acknowledged;
       const lost = [...dropped].filter((sequence) => sequence > acknowledged).length;
       return lost === 0 ? undefined : { reason: "over_capacity", dropped: lost };
@@ -282,9 +304,10 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
     // While the disk refuses writes, refuse new events before they reach
     // memory, as an unbuffered append did; the collector reads them again.
     if (this.#writeFailure !== undefined) this.flush();
-    const record = this.#encryptedRecord(value, sequence, coalesceKey);
-    const bytes = this.#append(record);
+    const line = JSON.stringify(this.#encryptedRecord(value, sequence, coalesceKey));
+    const bytes = this.#appendLine(line);
     super.enqueue(value, sequence, coalesceKey, bytes);
+    this.#rememberLine(value, { line, sequence, coalesceKey });
     this.#compactIfNeeded();
   }
 
@@ -296,7 +319,7 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
   override acknowledge(throughSequence: bigint): void {
     if (throughSequence <= this.metrics().acknowledged) return;
     super.acknowledge(throughSequence);
-    this.#append(this.#sequenceRecord("acknowledge", throughSequence));
+    this.#appendLine(JSON.stringify(this.#sequenceRecord("acknowledge", throughSequence)));
     this.#compactIfNeeded();
   }
 
@@ -305,43 +328,58 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
       return false;
     }
     const discarded = super.discard(sequence);
-    this.#append(this.#sequenceRecord("discard", sequence));
+    this.#appendLine(JSON.stringify(this.#sequenceRecord("discard", sequence)));
     this.#compactIfNeeded();
     return discarded;
   }
 
   override reconcileAcknowledged(throughSequence: bigint): void {
-    if (throughSequence === this.metrics().acknowledged) return;
+    const acknowledged = this.metrics().acknowledged;
+    if (throughSequence === acknowledged) return;
+    // Moving forward is an acknowledgement like any other, appended.
+    if (throughSequence > acknowledged) {
+      this.acknowledge(throughSequence);
+      return;
+    }
     super.reconcileAcknowledged(throughSequence);
     this.#compact();
   }
 
+  /**
+   * Replaces queued events, as when a new workspace policy arrives on each
+   * connection. Events it leaves as they were keep their stored records,
+   * and when none changed the spool is not rewritten at all.
+   */
   override replacePending(
     replace: (value: EventEnvelope) => EventEnvelope,
   ): void {
+    let changed = false;
     super.replacePending((event) => {
       const replaced = replace(event);
+      if (replaced === event || equals(EventEnvelopeSchema, replaced, event)) return event;
       validateEventScope(replaced, this.#requireScope(), event.sequence);
+      changed = true;
       return replaced;
     });
-    this.#compact();
+    if (changed || this.#writeFailure !== undefined) this.#compact();
   }
 
+  /** Applies one stored record; returns the event it held, if any. */
   #restoreRecord(
     record: SpoolRecord,
     target: BoundedEventQueue<EventEnvelope>,
     bytes: number,
     dropped: Set<bigint>,
-  ): void {
+  ): EventEnvelope | undefined {
     const sequence = parseSequence(record.sequence);
     if (record.operation === "acknowledge") {
       target.acknowledge(sequence);
-      return;
+      return undefined;
     }
     if (record.operation === "discard") {
       target.discard(sequence);
       dropped.delete(sequence);
-      return;
+      return undefined;
     }
     const event = this.#decrypt(record);
     if (
@@ -353,6 +391,25 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
       if (oldest !== undefined) dropped.add(oldest);
     }
     target.enqueue(event, sequence, record.coalesce_key, bytes);
+    return event;
+  }
+
+  #rememberLine(event: EventEnvelope, stored: StoredLine): void {
+    if (this.#lineBytes + stored.line.length > maxRememberedLineBytes) return;
+    this.#lines.set(event, stored);
+    this.#lineBytes += stored.line.length;
+  }
+
+  /** Keeps the stored lines of `entries` only, from `known`. */
+  #keepLines(entries: readonly QueuedEvent<EventEnvelope>[], known: ReadonlyMap<EventEnvelope, StoredLine>): void {
+    this.#lines = new Map();
+    this.#lineBytes = 0;
+    for (const entry of entries) {
+      const stored = known.get(entry.value);
+      if (stored !== undefined && stored.sequence === entry.sequence && stored.coalesceKey === entry.coalesceKey) {
+        this.#rememberLine(entry.value, stored);
+      }
+    }
   }
 
   /** Moves an unreadable spool aside so the queue can start empty. */
@@ -381,7 +438,7 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
     const cipher = createCipheriv("aes-256-gcm", this.#requireKey(), nonce);
     cipher.setAAD(spoolAAD(scope, sequence));
     const encrypted = Buffer.concat([
-      cipher.update(toBinary(EventEnvelopeSchema, event)),
+      cipher.update(takeEncoding(event) ?? toBinary(EventEnvelopeSchema, event)),
       cipher.final(),
       cipher.getAuthTag(),
     ]);
@@ -437,8 +494,8 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
   }
 
   /** Buffer one record for the next group write and return its stored size. */
-  #append(record: SpoolRecord): number {
-    const encoded = `${JSON.stringify(record)}\n`;
+  #appendLine(line: string): number {
+    const encoded = `${line}\n`;
     const bytes = Buffer.byteLength(encoded);
     if (this.#storedBytes() + bytes > this.#maxBytes) {
       this.#compact();
@@ -541,17 +598,19 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
     this.#requireScope();
     mkdirSync(this.#dataDirectory, { recursive: true, mode: 0o700 });
     makeDirectoryPrivateSync(this.#dataDirectory);
-    const records: SpoolRecord[] = [
-      this.#sequenceRecord("acknowledge", queue.metrics().acknowledged),
-      ...queue.entries().map((entry) =>
-        this.#encryptedRecord(
-          entry.value,
-          entry.sequence,
-          entry.coalesceKey,
-        )
-      ),
-    ];
-    const lines = records.map((record) => JSON.stringify(record));
+    // An event whose stored line is known is written as it was: same
+    // record, same nonce. Only the others are encrypted again.
+    const entries = queue.entries();
+    const written = new Map<EventEnvelope, StoredLine>();
+    const lines = [JSON.stringify(this.#sequenceRecord("acknowledge", queue.metrics().acknowledged))];
+    for (const entry of entries) {
+      const known = this.#lines.get(entry.value);
+      const line = known !== undefined && known.sequence === entry.sequence && known.coalesceKey === entry.coalesceKey
+        ? known.line
+        : JSON.stringify(this.#encryptedRecord(entry.value, entry.sequence, entry.coalesceKey));
+      lines.push(line);
+      written.set(entry.value, { line, sequence: entry.sequence, coalesceKey: entry.coalesceKey });
+    }
     const encoded = `${lines.join("\n")}\n`;
     if (Buffer.byteLength(encoded) > this.#maxBytes) {
       throw new Error("Telemetry spool is full; collection stopped before data loss.");
@@ -573,6 +632,7 @@ export class FileBackedEventQueue extends BoundedEventQueue<EventEnvelope> {
       // Memory already holds every buffered record's effect.
       this.#buffer = [];
       this.#bufferBytes = 0;
+      this.#keepLines(entries, written);
       this.#writeFailure = undefined;
       if (this.#flushTimer !== undefined) {
         clearTimeout(this.#flushTimer);

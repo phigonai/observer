@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { create } from "@bufbuild/protobuf";
+import { create, toBinary } from "@bufbuild/protobuf";
 import { timestampFromDate } from "@bufbuild/protobuf/wkt";
 import {
   appendFile,
@@ -14,14 +14,16 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test from "node:test";
-import { hasByteHeadroom } from "../src/event-queue.js";
+import { hasByteHeadroom, rememberEncoding, takeEncoding } from "../src/event-queue.js";
 import {
   FileBackedEventQueue,
   retirePairingState,
 } from "../src/event-spool.js";
-import { PrivacyClass } from "../src/generated/phigon/v1/common_pb.js";
-import { describeSpoolRestore } from "../src/stream-client.js";
+import { ActivityKind, PrivacyClass } from "../src/generated/phigon/v1/common_pb.js";
+import { consentedPolicy, describeSpoolRestore, sanitizeEventForPolicy } from "../src/stream-client.js";
+import { CollectionPolicySchema } from "../src/generated/phigon/v1/policy_pb.js";
 import {
+  ActivityEventSchema,
   EventEnvelopeSchema,
   LifecycleEventSchema,
   LifecyclePhase,
@@ -58,6 +60,125 @@ test("encrypted event spool survives restart without storing plaintext", async (
     afterAck.restore(tenantID, machineID, credential);
     assert.equal(afterAck.metrics().depth, 0);
     assert.equal(afterAck.metrics().acknowledged, 0n);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("the spool stores the encoding the collector already made, once", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-event-spool-encoding-"));
+  try {
+    const queue = new FileBackedEventQueue(directory, 4);
+    queue.restore(tenantID, machineID, credential);
+    const event = lifecycleEvent(1n, "as collected");
+    // A stand-in encoding of the same sequence shows which one was stored.
+    rememberEncoding(event, toBinary(EventEnvelopeSchema, lifecycleEvent(1n, "made by the collector")));
+    queue.enqueue(event, 1n);
+    queue.flush();
+    assert.equal(takeEncoding(event), undefined, "taken by the spool, not kept");
+    const restarted = new FileBackedEventQueue(directory, 4);
+    restarted.restore(tenantID, machineID, credential);
+    assert.equal(eventReason(restarted.pending()[0]), "made by the collector");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a clean spool is kept as it is on restart and on each new policy, and compaction keeps stored records", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-event-spool-reuse-"));
+  const spoolPath = join(directory, "telemetry-spool.jsonl");
+  const eventLines = (raw: string) => raw.split("\n").filter((line) => line.includes('"operation":"event"'));
+  try {
+    const first = new FileBackedEventQueue(directory, 16);
+    first.restore(tenantID, machineID, credential);
+    for (let sequence = 1n; sequence <= 4n; sequence++) {
+      first.enqueue(lifecycleEvent(sequence, `event ${sequence}`), sequence);
+    }
+    first.acknowledge(1n);
+    first.flush();
+    const written = await readFile(spoolPath, "utf8");
+
+    // A restart reads the spool and keeps appending to it unchanged.
+    const restarted = new FileBackedEventQueue(directory, 16);
+    restarted.restore(tenantID, machineID, credential);
+    assert.equal(await readFile(spoolPath, "utf8"), written);
+    assert.deepEqual(restarted.pending().map(eventReason), ["event 2", "event 3", "event 4"]);
+    // A policy that changes nothing (as on every connection) rewrites nothing.
+    restarted.replacePending((event) => create(EventEnvelopeSchema, { ...event }));
+    assert.equal(await readFile(spoolPath, "utf8"), written);
+
+    // Rewriting keeps the stored record of each event it keeps, byte for byte.
+    restarted.reconcileAcknowledged(0n);
+    const compacted = await readFile(spoolPath, "utf8");
+    assert.notEqual(compacted, written);
+    assert.deepEqual(eventLines(compacted), eventLines(written).slice(1));
+    // A policy that changes one event encrypts that one again, only.
+    restarted.replacePending((event) => event.sequence === 3n ? lifecycleEvent(3n, "redacted") : event);
+    const replaced = eventLines(await readFile(spoolPath, "utf8"));
+    assert.equal(replaced[0], eventLines(written)[1]);
+    assert.notEqual(replaced[1], eventLines(written)[2]);
+    assert.equal(replaced[2], eventLines(written)[3]);
+
+    const again = new FileBackedEventQueue(directory, 16);
+    again.restore(tenantID, machineID, credential);
+    assert.deepEqual(again.pending().map(eventReason), ["event 2", "redacted", "event 4"]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a narrower consent still rewrites queued events on disk, though an unchanged policy does not", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-event-spool-narrow-"));
+  const spoolPath = join(directory, "telemetry-spool.jsonl");
+  try {
+    const queue = new FileBackedEventQueue(directory, 16);
+    queue.restore(tenantID, machineID, credential);
+    queue.enqueue(create(EventEnvelopeSchema, {
+      tenantId: tenantID, machineId: machineID, agentId: "agent-test", sessionId: "session-test", sequence: 1n,
+      observedAt: timestampFromDate(new Date()), schemaVersion: 1, privacyClass: PrivacyClass.USER_CONTENT,
+      payload: { case: "activity", value: create(ActivityEventSchema, { kind: ActivityKind.PROMPT, content: "queued private prompt" }) },
+    }), 1n);
+    queue.enqueue(lifecycleEvent(2n, "metadata only"), 2n);
+    queue.flush();
+    const written = await readFile(spoolPath, "utf8");
+    const full = create(CollectionPolicySchema, { promptContent: true, responseContent: true, processMetadata: true });
+    // The workspace's policy on a connection, under full consent: nothing changes.
+    queue.replacePending((event) => sanitizeEventForPolicy(event, full));
+    assert.equal(await readFile(spoolPath, "utf8"), written);
+    // Paired again with the metadata profile: the prompt loses its content,
+    // in memory and on disk.
+    queue.replacePending((event) => sanitizeEventForPolicy(event, consentedPolicy(full, "metadata")));
+    assert.notEqual(await readFile(spoolPath, "utf8"), written);
+    const restarted = new FileBackedEventQueue(directory, 16);
+    restarted.restore(tenantID, machineID, credential);
+    const [prompt, lifecycle] = restarted.pending();
+    assert.equal(prompt?.payload.case, "activity");
+    assert.equal(prompt?.payload.case === "activity" ? prompt.payload.value.content : "unexpected", undefined);
+    assert.equal(prompt?.payload.case === "activity" && prompt.payload.value.contentRedacted, true);
+    assert.doesNotMatch(Buffer.from(toBinary(EventEnvelopeSchema, prompt!)).toString("utf8"), /queued private/u);
+    assert.equal(eventReason(lifecycle), "metadata only");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a spool whose last write was cut short is rewritten without that tail", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-event-spool-torn-"));
+  const spoolPath = join(directory, "telemetry-spool.jsonl");
+  try {
+    const first = new FileBackedEventQueue(directory, 16);
+    first.restore(tenantID, machineID, credential);
+    first.enqueue(lifecycleEvent(1n, "kept"), 1n);
+    first.flush();
+    await appendFile(spoolPath, '{"version":1,"tenant_id":"');
+    const restarted = new FileBackedEventQueue(directory, 16);
+    restarted.restore(tenantID, machineID, credential);
+    assert.ok((await readFile(spoolPath, "utf8")).endsWith("\n"));
+    restarted.enqueue(lifecycleEvent(2n, "after"), 2n);
+    restarted.flush();
+    const again = new FileBackedEventQueue(directory, 16);
+    again.restore(tenantID, machineID, credential);
+    assert.deepEqual(again.pending().map(eventReason), ["kept", "after"]);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

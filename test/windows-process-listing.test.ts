@@ -9,6 +9,7 @@ import test from "node:test";
 import { guardianRunnerPath } from "../src/guardian-native.js";
 import {
   listWindowsProcesses,
+  newWindowsListingState,
   runNativeProcessListing,
   runPowerShellProcessListing,
   windowsPathIdentity,
@@ -83,6 +84,55 @@ test("Windows executable paths have one spelling", () => {
   ] as const) {
     assert.equal(windowsPathIdentity(spelling), identity);
   }
+});
+
+test("a blocked helper and its PowerShell fallback back off to five minutes, and reset once the helper works", async () => {
+  const state = newWindowsListingState();
+  let helperWorks = false;
+  let helperRuns = 0;
+  let powerShellRuns = 0;
+  const native = async () => {
+    helperRuns++;
+    if (!helperWorks) throw Object.assign(new Error("blocked by application control"), { code: "UNKNOWN" });
+    return nativeRows;
+  };
+  const powerShell = async () => {
+    powerShellRuns++;
+    return powerShellRows;
+  };
+  const expected = await listWindowsProcesses(undefined, powerShell);
+  powerShellRuns = 0;
+  // Discovery every 10 seconds for an hour.
+  const start = 1_000_000;
+  const helperAt: number[] = [];
+  const powerShellAt: number[] = [];
+  for (let second = 0; second < 3_600; second += 10) {
+    const helperBefore = helperRuns;
+    const powerShellBefore = powerShellRuns;
+    assert.deepEqual(await listWindowsProcesses(native, powerShell, state, start + second * 1_000), expected);
+    if (helperRuns > helperBefore) helperAt.push(second);
+    if (powerShellRuns > powerShellBefore) powerShellAt.push(second);
+  }
+  assert.deepEqual(helperAt.slice(0, 6), [0, 10, 30, 70, 150, 310]);
+  assert.deepEqual(powerShellAt.slice(0, 6), [0, 10, 30, 70, 150, 310]);
+  // At most every five minutes from then on, instead of 360 times an hour.
+  for (const times of [helperAt, powerShellAt]) {
+    for (let index = 1; index < times.length; index++) {
+      assert.ok((times[index] ?? 0) - (times[index - 1] ?? 0) <= 300);
+    }
+    assert.ok(times.length < 20, `${times.length} runs in an hour`);
+  }
+  // The helper works again: every pass uses it, and PowerShell stops.
+  helperWorks = true;
+  const at = start + 3_600_000 + 300_000;
+  await listWindowsProcesses(native, powerShell, state, at);
+  const after = powerShellRuns;
+  for (let second = 10; second <= 60; second += 10) {
+    const listed = await listWindowsProcesses(native, powerShell, state, at + second * 1_000);
+    assert.equal(listed.length > 0, true);
+  }
+  assert.equal(powerShellRuns, after);
+  assert.equal(state.nativeFailures, 0);
 });
 
 test("a failed native listing falls back to PowerShell for that pass", async () => {

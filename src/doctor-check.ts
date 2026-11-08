@@ -4,6 +4,7 @@ import { consentHealth, type ObserverConsentHealth } from "./health.js";
 import { InstanceLock, type InstanceLockHolder } from "./instance-lock.js";
 import { machineRemovedMessage, removalConfirmed } from "./machine-removed.js";
 import { OBSERVER_CONSENT_POLICY_VERSION } from "./pair.js";
+import { describeRuntime, readObserverStatus, type ObserverRuntimeHealth } from "./self-report.js";
 import { inspectionMessage, relayHost, relayNotConnectedMessage } from "./server-authority.js";
 import { serverFetch, trustedServerAuthority } from "./server-fetch.js";
 import { StreamStateStore } from "./stream-state.js";
@@ -41,6 +42,8 @@ export type DoctorCheckReport = Readonly<{
   maxDeliveryAgeMinutes: number;
   /** How this computer consented, when it is paired with this server. */
   consent?: ObserverConsentHealth;
+  /** What the running observer last reported about itself; no check uses it. */
+  runningObserver?: ObserverRuntimeHealth;
   checks: readonly DoctorCheck[];
   checkedAt: string;
 }>;
@@ -154,6 +157,7 @@ export async function runDoctorCheck(options: DoctorCheckOptions): Promise<Docto
   checks.push(await probeControlPlane(config.controlPlaneUrl, options.fetcher ?? serverFetch, options.probeTimeoutMs ?? probeTimeoutMs));
 
   const failed = checks.find((check) => check.status === "fail");
+  const runningObserver = await readObserverStatus(config.dataDirectory, now.getTime());
   return Object.freeze({
     ok: failed === undefined,
     exitCode: failed === undefined ? doctorCheckExitCodes.ok : exitCodeFor[failed.name],
@@ -162,6 +166,7 @@ export async function runDoctorCheck(options: DoctorCheckOptions): Promise<Docto
     controlPlaneOrigin: config.controlPlaneUrl.origin,
     maxDeliveryAgeMinutes: maxAge,
     ...(consent === undefined ? {} : { consent }),
+    ...(runningObserver === undefined ? {} : { runningObserver }),
     checks: Object.freeze(checks),
     checkedAt: now.toISOString(),
   });
@@ -248,6 +253,7 @@ export function formatDoctorCheck(report: DoctorCheckReport): string {
       : `Phigon observer check found a problem (exit code ${report.exitCode}).`,
     ...report.checks.map((check) =>
       `${check.status === "pass" ? "ok  " : check.status === "fail" ? "FAIL" : "skip"}  ${labels[check.name].padEnd(13)} ${check.detail}`),
+    ...(report.runningObserver === undefined ? [] : [`      ${"Its cost".padEnd(13)} ${describeRuntime(report.runningObserver)}`]),
     "",
   ].join("\n");
 }

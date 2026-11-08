@@ -116,7 +116,8 @@ test("installed CLI probes are reused between discoveries until the executable c
     assert.equal((await inspect("phigon-probe"))?.version, "1.2.40");
     assert.equal(await launches(), 2);
 
-    now += 5 * 60_000;
+    // A version read by running the CLI is read again after an hour.
+    now += 60 * 60_000;
     assert.equal((await inspect("phigon-probe"))?.version, "1.2.40");
     assert.equal(await launches(), 3);
 
