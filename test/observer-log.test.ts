@@ -47,14 +47,15 @@ test("a credential in a logged message is stored masked, whoever logs it", async
   const machineKey = ["phg", "_m_", "q".repeat(43)].join("");
   const bearer = ["eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiJtYWNoaW5lIn0", "c2lnbmF0dXJl"].join(".");
   const password = ["hunter", "2-", "correct-horse"].join("");
+  const keyBody = ["MIIEvQIBADAN", "BgkqhkiG9w0BAQEFAASC"].join("");
   try {
     const log = new RotatingLogFile(directory, { now: () => new Date("2026-11-08T10:00:00.000Z") });
     const logged = levelledOutput({ stdout: () => undefined, stderr: () => undefined }, "debug", log);
     logged.error(`Observer command failed: the server answered 401 for Bearer ${bearer} with key ${machineKey}.\n`);
     logged.stderr(`Telemetry delivery is paused (proxy http://observer:${password}@proxy.example.test:3128 refused).\n`);
-    log.write("warn", `password=${password}\n-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----\n`);
+    log.write("warn", `password=${password}\n-----BEGIN PRIVATE KEY-----\n${keyBody}\n-----END PRIVATE KEY-----\n`);
     const stored = await readFile(logFilePath(directory), "utf8");
-    for (const secret of [machineKey, bearer, password, "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC"]) {
+    for (const secret of [machineKey, bearer, password, keyBody]) {
       assert.ok(!stored.includes(secret), "a credential was written to the log");
     }
     assert.match(stored, /ERROR Observer command failed: the server answered 401 for Bearer \[REDACTED_SECRET\] with key \[REDACTED_SECRET\]\./u);

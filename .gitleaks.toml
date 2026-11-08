@@ -1,0 +1,11 @@
+# The secret scan the mirror's sync runs over every new commit and the
+# final tree. It keeps every default rule. The allowlist names only fake
+# values that tests use on purpose, by their exact text; build any new
+# token-shaped test value at run time instead of adding it here.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Fake private-key text in the observer log test, committed before it was built at run time"
+regexTarget = "match"
+regexes = ['''MIIEvQIBADANBgkqhkiG9w0BAQEFAASC''']
