@@ -4,11 +4,13 @@ import hashlib
 import json
 import os
 import pathlib
+import signal
 import socket
 import subprocess
 import struct
 import sys
 import tempfile
+import time
 
 runner = str(pathlib.Path(sys.argv[1]).resolve(strict=True))
 executable = str(pathlib.Path(sys.executable).resolve(strict=True))
@@ -118,6 +120,96 @@ with tempfile.TemporaryDirectory(prefix="phigon-sandbox-") as directory:
                         rejected = subprocess.run(args, stdin=client, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
                         assert rejected.returncode == 77 and not rejected.stdout, "inherited service socket bypassed network restriction"
         print("PASS inherited TCP and named Unix service sockets remain blocked")
+        # Network "inherit" keeps IP networking but must not reach host services
+        # (the session bus, systemd, Docker, ssh-agent) through Unix sockets.
+        inherit = dict(profile, network="inherit")
+        services = []
+        for address in (str(base / "host-service.sock"), "\0" + str(base) + "-host-service"):
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(address); listener.listen(4)
+            services.append(listener)
+        inherit_program = r'''
+import os,socket,subprocess,sys
+def denied(name,operation):
+    try: operation()
+    except PermissionError: print('PASS '+name,flush=True)
+    else: raise AssertionError(name+' was not blocked')
+for address in sys.argv[1:3]:
+    address='\0'+address[1:] if address.startswith('@') else address
+    denied('host Unix service '+('abstract' if address.startswith('\0') else 'path'),lambda:socket.socket(socket.AF_UNIX).connect(address))
+denied('Unix datagram socketpair',lambda:socket.socketpair(socket.AF_UNIX,socket.SOCK_DGRAM))
+leaked='/proc/self/fd/'+sys.argv[3]
+assert not os.path.exists(leaked) or not os.readlink(leaked).startswith('socket:'),'an inherited descriptor reached the workload'
+print('PASS inherited descriptors beyond stdio are closed',flush=True)
+socket.socket(socket.AF_INET,socket.SOCK_STREAM).close()
+left,right=socket.socketpair(); left.sendall(b'x'); assert right.recv(1)==b'x'
+child=subprocess.run([sys.executable,'-c','print(42)'],capture_output=True,text=True)
+assert child.stdout.strip()=='42',child
+print('PASS IP sockets, stream socketpairs and child pipes still work',flush=True)
+'''
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as leaked:
+            leaked.connect(str(base / "host-service.sock"))
+            os.set_inheritable(leaked.fileno(), True)
+            unix_result = subprocess.run([runner, "--sha256", digest, "--cwd", str(allowed), "--sandbox", json.dumps([inherit]),
+                                          "--", executable, "-c", inherit_program, str(base / "host-service.sock"),
+                                          "@" + str(base) + "-host-service", str(leaked.fileno())],
+                                         capture_output=True, text=True, timeout=20, pass_fds=(leaked.fileno(),))
+        print(unix_result.stdout, end="")
+        assert unix_result.returncode == 0, (unix_result.returncode, unix_result.stderr)
+        for kind, address in (("path", str(base / "host-service.sock")), ("abstract", "\0" + str(base) + "-host-service")):
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.connect(address)
+                rejected = subprocess.run([runner, "--sha256", digest, "--cwd", str(allowed), "--sandbox", json.dumps([inherit]),
+                                           "--", executable, "-c", "print('unexpected service stream')"],
+                                          stdin=client, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+                assert rejected.returncode == 77 and not rejected.stdout, f"inherited {kind} service socket bypassed inherit mode"
+        for listener in services:
+            listener.close()
+        print("PASS network inherit blocks host Unix services, including as standard streams")
+        # Without Landlock's signal scope a same-user workload can still kill the
+        # supervisor through one of its other thread IDs. It must die with it.
+        attacker = r'''
+import os,pathlib,signal,sys,time
+pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))
+supervisor=os.getppid()
+threads=[int(t) for t in os.listdir(f'/proc/{supervisor}/task') if int(t)!=supervisor]
+try:
+    os.kill(threads[0],signal.SIGKILL); print('KILLED',flush=True)
+except PermissionError:
+    print('BLOCKED',flush=True)
+time.sleep(30)
+'''
+        marker = allowed / "workload.pid"
+        watched = dict(inherit, read_paths=inherit["read_paths"] + ["/proc"])
+        supervisor = subprocess.Popen([runner, "--sha256", digest, "--cwd", str(allowed), "--sandbox", json.dumps([watched]),
+                                       "--", executable, "-c", attacker, str(marker)],
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        def running(pid):
+            try:
+                return pathlib.Path(f"/proc/{pid}/stat").read_text().split(") ", 1)[1][0] != "Z"
+            except FileNotFoundError:
+                return False
+        workload = None
+        try:
+            outcome = supervisor.stdout.readline().strip()
+            workload = int(marker.read_text())
+            if outcome == "KILLED":
+                supervisor.wait(timeout=10)
+                for _ in range(100):
+                    if not running(workload):
+                        break
+                    time.sleep(.02)
+                assert not running(workload), "the workload outlived its killed supervisor"
+                print("PASS a workload that kills its supervisor through a thread ID dies with it")
+            else:
+                assert outcome == "BLOCKED" and supervisor.poll() is None, (outcome, supervisor.poll())
+                print("PASS Landlock's signal scope keeps the workload from signalling the supervisor")
+        finally:
+            if supervisor.poll() is None:
+                supervisor.terminate()
+                supervisor.wait(timeout=10)
+            if workload and running(workload):
+                os.kill(workload, signal.SIGKILL)
         # Exercise the actual Node observer integration: libuv's subprocess
         # streams are Unix socketpairs, unlike Python's anonymous OS pipes.
         modules = pathlib.Path(__file__).resolve().parent.parent / "dist" / "src"

@@ -532,6 +532,12 @@ output and exit code are recorded:
 phigon-observer guardian exec --agent codex:worker-1 -- npm test
 ```
 
+The command gets a minimal environment: paths, locale, terminal, proxy and
+certificate settings. Name any other variable it needs, comma separated, in
+`PHIGON_GUARDIAN_ENV_ALLOW` (for example `GITHUB_TOKEN`). Variables that make a
+program load or run other code, such as `LD_PRELOAD` or `NODE_OPTIONS`, are never
+passed.
+
 **Launch an agent through Guardian.** One short-lived grant covers starting the
 agent, using the declared model and running the command. The Guardian runner
 contains the process tree, renews its lease directly with the control plane and

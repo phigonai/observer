@@ -20,6 +20,10 @@ import (
 	"github.com/phigonai/observer/go/guardianos"
 )
 
+// selfExecutable names this runner's running Linux image even if its file was
+// replaced after it started.
+const selfExecutable = "/proc/self/exe"
+
 func main() { exitProcess(run()) }
 func run() int {
 	if len(os.Args) > 1 && os.Args[1] == "__relay" {
@@ -117,12 +121,15 @@ func run() int {
 		return 77
 	}
 	command := exec.Command(args[0], args[1:]...) // #nosec G204 -- Reviewed absolute manifest and executable digest verified above; native runner intentionally executes authorized commands without a shell.
+	// Run the bytes just hashed, not whatever the path names by the time the
+	// process starts. The open file stays open until after Start.
+	if pinned := pinnedExecutablePath(file); pinned != "" {
+		command.Path = pinned
+	}
 	if constraints.Platform == "linux" {
-		helper, err := os.Executable()
-		if err != nil {
-			return fail(err)
-		}
-		command = exec.Command(helper, append([]string{"__sandbox", *sandbox, *digest, *cwd, strconv.Itoa(parentPID)}, args...)...) // #nosec G204 -- Relaunch this trusted executable to apply the already validated sandbox manifest.
+		// The sandbox helper re-hashes the workload and executes that open file.
+		// /proc/self/exe is this runner's own image, even if its path was replaced.
+		command = exec.Command(selfExecutable, append([]string{"__sandbox", *sandbox, *digest, *cwd, strconv.Itoa(parentPID)}, args...)...) // #nosec G204 -- Relaunch this trusted executable to apply the already validated sandbox manifest.
 	}
 	command.Dir = *cwd
 	command.Stdin = os.Stdin
@@ -163,6 +170,21 @@ func run() int {
 	parentLost := make(chan struct{})
 	watchDone := make(chan struct{})
 	defer close(watchDone)
+	if interval := containmentInterval(); interval > 0 {
+		// Track descendants while the command runs; see observeContained.
+		go func() {
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-watchDone:
+					return
+				case <-ticker.C:
+					observeContained(command.Process.Pid)
+				}
+			}
+		}()
+	}
 	go func() {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
@@ -180,19 +202,9 @@ func run() int {
 	}()
 	select {
 	case err := <-exited:
-		terminateContained(command, true)
+		confirmed := terminateContained(command, true)
 		cleanup()
-		if err == nil {
-			return 0
-		}
-		if e, ok := err.(*exec.ExitError); ok {
-			if e.ExitCode() < 0 {
-				reportTermination("Phigon Guardian: managed process exited after an operating-system signal.")
-				return 77
-			}
-			return e.ExitCode()
-		}
-		return 1
+		return finishedExitCode(err, confirmed)
 	case <-signals:
 		terminateContained(command, true)
 		waitForContainedExit(exited)
@@ -217,6 +229,27 @@ func run() int {
 		reportTermination("Phigon Guardian stopped this agent because its company runtime limit was reached.")
 		return 77
 	}
+}
+
+// finishedExitCode is the runner's result once the managed command exited and
+// cleanup ran. A run whose cleanup could not confirm that every process the
+// command started has stopped fails, whatever the command itself returned.
+func finishedExitCode(err error, cleanupConfirmed bool) int {
+	if !cleanupConfirmed {
+		reportTermination("Phigon Guardian could not confirm that every process this agent started has stopped.")
+		return 77
+	}
+	if err == nil {
+		return 0
+	}
+	if e, ok := err.(*exec.ExitError); ok {
+		if e.ExitCode() < 0 {
+			reportTermination("Phigon Guardian: managed process exited after an operating-system signal.")
+			return 77
+		}
+		return e.ExitCode()
+	}
+	return 1
 }
 
 // The observer may be stalled and the workload may have filled its stderr pipe.

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -19,6 +20,7 @@ import (
 
 func runSandboxChild(args []string) int {
 	runtime.LockOSThread()
+	supervisor := os.Getppid()
 	if len(args) < 5 || !filepath.IsAbs(args[2]) || !filepath.IsAbs(args[4]) {
 		return fail(nil)
 	}
@@ -51,6 +53,25 @@ func runSandboxChild(args []string) int {
 	}
 	if err := unix.Prctl(unix.PR_CAP_AMBIENT, unix.PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0); err != nil {
 		return fail(fmt.Errorf("could not clear ambient workload capabilities: %w", err))
+	}
+	// The workload dies with its supervisor, even if a workload on a kernel
+	// without Landlock's signal scope kills the supervisor through one of its
+	// thread IDs. The signal follows the supervisor thread that started this
+	// helper, which the supervisor keeps locked and alive while it runs. Set
+	// after every credential change (a change clears it) and kept across exec,
+	// which no_new_privs stops from gaining privileges. If the supervisor
+	// already exited, this helper was reparented and must not start anything.
+	if err := unix.Prctl(unix.PR_SET_PDEATHSIG, uintptr(unix.SIGKILL), 0, 0, 0); err != nil {
+		return fail(fmt.Errorf("could not tie the workload to its supervisor: %w", err))
+	}
+	if os.Getppid() != supervisor {
+		return fail(fmt.Errorf("the supervisor exited before launch"))
+	}
+	// Landlock checks access when a file is opened, and seccomp only sees new
+	// sockets. Descriptors inherited beyond stdio (a connected service socket,
+	// say) would bypass both, so none survive the exec below.
+	if err := unix.CloseRange(3, math.MaxUint32, unix.CLOSE_RANGE_CLOEXEC); err != nil {
+		return fail(fmt.Errorf("could not close inherited descriptors: %w", err))
 	}
 	fd, err := unix.Open(args[4], unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
@@ -102,8 +123,16 @@ func validateSandboxStream(fd int, denyNetwork bool, peerPID int) error {
 	case unix.S_IFIFO:
 		// Explicit data pipes do not carry an ambient file/device handle.
 	case unix.S_IFSOCK:
-		if denyNetwork && !observerStreamSocket(fd, peerPID) {
+		domain, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_DOMAIN)
+		switch {
+		case err != nil:
+			return fmt.Errorf("invalid standard stream socket: %w", err)
+		case denyNetwork && !observerStreamSocket(fd, peerPID):
 			return fmt.Errorf("network sockets cannot be inherited as standard streams")
+		case domain == unix.AF_UNIX && !unnamedStreamSocket(fd):
+			// Even when the network is allowed, a connected D-Bus, Docker or
+			// ssh-agent socket must not reach the workload as a standard stream.
+			return fmt.Errorf("local service sockets cannot be inherited as standard streams")
 		}
 	case unix.S_IFCHR:
 		if unix.Major(uint64(stat.Rdev)) == 1 && unix.Minor(uint64(stat.Rdev)) == 3 {
@@ -120,10 +149,21 @@ func validateSandboxStream(fd int, denyNetwork bool, peerPID int) error {
 	return nil
 }
 
-// libuv uses unnamed Unix stream socketpairs for subprocess "pipes". Permit
-// only this data channel to the original observer, never TCP, named/abstract
-// Unix services, datagrams, or socketpairs owned by an unrelated process.
+// libuv uses unnamed Unix stream socketpairs for subprocess "pipes". Under
+// network denial, permit only this data channel to the original observer, never
+// TCP, named/abstract Unix services, datagrams, or socketpairs owned by an
+// unrelated process.
 func observerStreamSocket(fd, peerPID int) bool {
+	if !unnamedStreamSocket(fd) {
+		return false
+	}
+	credentials, err := unix.GetsockoptUcred(fd, unix.SOL_SOCKET, unix.SO_PEERCRED)
+	return err == nil && peerPID > 1 && int(credentials.Pid) == peerPID
+}
+
+// unnamedStreamSocket reports an unnamed Unix stream socketpair: a data channel
+// that cannot be connected or addressed to another service.
+func unnamedStreamSocket(fd int) bool {
 	// Preserve sockaddr length: text conversions can represent both an unnamed
 	// socket and an empty abstract socket as "@", losing the required distinction.
 	for _, call := range []uintptr{unix.SYS_GETSOCKNAME, unix.SYS_GETPEERNAME} {
@@ -135,9 +175,5 @@ func observerStreamSocket(fd, peerPID int) bool {
 		}
 	}
 	kind, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TYPE)
-	if err != nil || kind != unix.SOCK_STREAM {
-		return false
-	}
-	credentials, err := unix.GetsockoptUcred(fd, unix.SOL_SOCKET, unix.SO_PEERCRED)
-	return err == nil && peerPID > 1 && int(credentials.Pid) == peerPID
+	return err == nil && kind == unix.SOCK_STREAM
 }

@@ -91,6 +91,20 @@ from the matching `vX.Y.Z` tag in this repository.
   - Exactly one observer takes over a stale `observer.lock`.
   - New `logs [--tail <lines>] [--follow]` and `discover --explain`.
 - Guardian runner sandbox hardening.
+- A Linux sandbox profile with `network: inherit` no longer lets the agent
+  create Unix-domain sockets, so it cannot reach the session bus, systemd,
+  Docker, ssh-agent or X11. IP networking and the stream socketpairs Node
+  and Python use for child processes still work.
+- A runtime limit on Linux needs kernel 6.12 or later (Landlock ABI 6) or a
+  separate `run_as` account. Otherwise the launch is blocked, because the
+  agent could pause Guardian so the limit never fires.
+- `guardian exec` and `guardian launch` give the command a minimal
+  environment. Name any other variable it needs, comma separated, in
+  `PHIGON_GUARDIAN_ENV_ALLOW`. Variables that make a program load or run
+  other code, such as `LD_PRELOAD` or `NODE_OPTIONS`, are never passed.
+- When a Guardian run ends, every process the agent started is stopped, even
+  without a cgroup and after `setsid` or a double fork. On macOS a process
+  that forks, detaches and loses its parent within 200 ms can still escape.
 - CI and release hardening:
   - The release publishes only after the full test suite passes on Linux,
     macOS and Windows for the tagged commit, from a job that runs none of

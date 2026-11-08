@@ -78,8 +78,16 @@ func prepareContainment(_ *exec.Cmd, cgroupRoot string, constraints guardianos.C
 	// terminate the supervisor before it can preserve the command's exit status.
 	return func() {}, nil
 }
-func terminateContained(_ *exec.Cmd, _ bool) {}
-func terminationSignals() []os.Signal        { return []os.Signal{os.Interrupt} }
+
+// The share-mode lock in openExecutionFile already pins the executable.
+func pinnedExecutablePath(_ *os.File) string { return "" }
+
+func terminateContained(_ *exec.Cmd, _ bool) bool { return true }
+
+// The kill-on-close job already holds every descendant.
+func containmentInterval() time.Duration { return 0 }
+func observeContained(_ int)             {}
+func terminationSignals() []os.Signal    { return []os.Signal{os.Interrupt} }
 func parentIsAlive(pid int) bool {
 	if pid <= 0 || int64(pid) > math.MaxUint32 {
 		return false
@@ -92,6 +100,10 @@ func parentIsAlive(pid int) bool {
 	state, err := windows.WaitForSingleObject(handle, 0)
 	return err == nil && state == uint32(windows.WAIT_TIMEOUT)
 }
+
+// openExecutionFile shares the file for reading only. Until the handle closes,
+// after the process has started, nobody can write, rename or delete the file,
+// or rename a directory above it, so the path keeps naming the hashed bytes.
 func openExecutionFile(path string) (*os.File, error) {
 	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {

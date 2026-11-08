@@ -76,3 +76,40 @@ func TestWindowsKernelResourceLimits(t *testing.T) {
 		}
 	}
 }
+
+// Between the hash check and process creation nobody may swap the reviewed
+// executable: not by writing it, renaming or deleting it, or renaming the
+// directory above it. The runner holds this handle until after Start.
+func TestHashedExecutableCannotBeSwappedWhileOpen(t *testing.T) {
+	directory := t.TempDir()
+	folder := directory + `\bin`
+	if err := os.Mkdir(folder, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := folder + `\agent.exe`
+	if err := os.WriteFile(target, []byte("MZ reviewed bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := openExecutionFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("MZ replaced"), 0o600); err == nil {
+		t.Error("the open executable could be overwritten")
+	}
+	if err := os.Rename(target, folder+`\moved.exe`); err == nil {
+		t.Error("the open executable could be renamed")
+	}
+	if err := os.Remove(target); err == nil {
+		t.Error("the open executable could be deleted")
+	}
+	if err := os.Rename(folder, directory+`\moved`); err == nil {
+		t.Error("the directory holding the open executable could be renamed")
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(folder, directory+`\moved`); err != nil {
+		t.Fatalf("the lock should end with the handle: %v", err)
+	}
+}

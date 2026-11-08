@@ -16,7 +16,42 @@ export type ExecutionManifest = Readonly<{
   cgroup_root: string;
 }>;
 
+// Variables a workload may receive without configuration: locating the user,
+// the system and the terminal, language, proxies and certificate bundles. None
+// of them makes a program load or run other code.
+const workloadVariables = new Set([
+  "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TZ", "LANG", "LANGUAGE",
+  "TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "NO_COLOR", "FORCE_COLOR", "CLICOLOR", "COLUMNS", "LINES", "CI",
+  "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_DIRS", "XDG_DATA_DIRS",
+  "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+  "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+  "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "USERPROFILE", "USERNAME", "USERDOMAIN",
+  "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432",
+  "COMMONPROGRAMFILES", "COMMONPROGRAMFILES(X86)", "COMMONPROGRAMW6432", "ALLUSERSPROFILE", "PUBLIC", "COMPUTERNAME",
+  "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER", "PROCESSOR_LEVEL", "PROCESSOR_REVISION", "OS",
+  "__CF_USER_TEXT_ENCODING",
+]);
+
+// Variables that make a reviewed program load libraries, run startup code or
+// execute another command. They are never passed, even when configured.
+const codeInjection = [
+  /^(LD_|DYLD_|BASH_FUNC_|PYTHON|PERL|RUBY|LUA_|PHP|COR_|CORECLR_)/iu, // loaders and interpreters, including LD_AUDIT, PYTHONSTARTUP and PERL5OPT
+  /(_OPTIONS|_OPTS|ASKPASS)$/iu, // JAVA_TOOL_OPTIONS, NODE_OPTIONS, MAVEN_OPTS, GIT_ASKPASS
+  /^GIT_(?!(AUTHOR|COMMITTER)_(NAME|EMAIL)$)/iu, // GIT_SSH_COMMAND, GIT_EXEC_PATH, GIT_CONFIG_*, GIT_PAGER
+  /^(NODE_PATH|NODE_REPL_EXTERNAL_MODULE|ELECTRON_RUN_AS_NODE|BASH_ENV|ENV|PS[0-4]|PROMPT_COMMAND|IFS|SHELLOPTS|BASHOPTS|ZDOTDIR|FPATH)$/iu,
+  /^(GCONV_PATH|GLIBC_TUNABLES|LOCPATH|OPENSSL_CONF|OPENSSL_ENGINES|OPENSSL_MODULES|LESSOPEN|LESSCLOSE|CLASSPATH|GOFLAGS|DOTNET_STARTUP_HOOKS|DOTNET_ADDITIONAL_DEPS|PSMODULEPATH)$/iu,
+];
+
+/**
+ * Builds the environment of a managed workload from an allowlist. Model
+ * provider credentials reach it through the Guardian model bridge, added after
+ * this filter. Anything else a command needs is named, comma separated, in
+ * PHIGON_GUARDIAN_ENV_ALLOW; code-injection variables are refused even then.
+ */
 export function executionEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const configuredKey = Object.keys(source).find((key) => key.toUpperCase() === "PHIGON_GUARDIAN_ENV_ALLOW");
+  const configured = new Set((configuredKey === undefined ? "" : source[configuredKey] ?? "").split(/[\s,]+/u)
+    .filter((name) => /^[A-Za-z_][A-Za-z0-9_]{0,127}$/u.test(name)).slice(0, 64).map((name) => name.toUpperCase()));
   const result: NodeJS.ProcessEnv = {};
   const seen = new Set<string>();
   for (const key of Object.keys(source).sort()) {
@@ -24,10 +59,10 @@ export function executionEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessE
     const normalized = process.platform === "win32" ? key.toUpperCase() : key;
     if (value === undefined || seen.has(normalized)) continue;
     seen.add(normalized);
-    // Machine management credentials and runtime injection must never be
-    // inherited by the supervised workload.
-    if (/^PHIGON_/iu.test(key) || /^(NODE_OPTIONS|NODE_PATH|LD_PRELOAD|LD_LIBRARY_PATH|DYLD_.*|PYTHONPATH|PYTHONHOME|RUBYOPT|PERL5OPT|BASH_ENV|ENV)$/iu.test(key)) continue;
-    result[key] = value;
+    // Machine management credentials never reach the supervised workload.
+    if (/^PHIGON_/iu.test(key) || codeInjection.some((pattern) => pattern.test(key))) continue;
+    const name = key.toUpperCase();
+    if (workloadVariables.has(name) || /^LC_[A-Z0-9_]+$/u.test(name) || configured.has(name)) result[key] = value;
   }
   return result;
 }
