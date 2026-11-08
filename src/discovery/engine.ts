@@ -24,6 +24,8 @@ import {
   SystemEvidenceProvider,
 } from "./system-evidence.js";
 import type {
+  AdapterResult,
+  AgentDetection,
   AgentDiscoveryAdapter,
   DiscoverySnapshot,
 } from "./types.js";
@@ -75,9 +77,18 @@ export class DiscoveryEngine {
   async discover(machineId = ""): Promise<DiscoverySnapshot> {
     const observedAt = this.#clock();
     const evidence = this.#evidenceFactory();
+    // An adapter that fails is reported and skipped; the others' agents are
+    // still discovered.
     const results = await Promise.all(
       this.#adapters.map((adapter) =>
-        adapter.discover(evidence, observedAt),
+        adapter.discover(evidence, observedAt).catch((): AdapterResult => ({
+          agents: [],
+          health: {
+            adapterId: adapter.id,
+            status: "error",
+            notices: [`Discovery adapter ${adapter.id} failed; its agents were not discovered.`],
+          },
+        })),
       ),
     );
     const discoveredAgents = results.flatMap((result) => result.agents);
@@ -127,7 +138,14 @@ export class DiscoveryEngine {
       partial,
       notices,
     });
-    return Object.freeze({ inventory, adapterHealth });
+    const detections = explainDetections(
+      agents,
+      results.flatMap((result) => result.detections ?? []),
+      new Set(discoveredAgents
+        .filter((agent) => agent.capabilities.some((capability) => conflictingProcessClaims.has(capability)))
+        .map((agent) => agent.agentId)),
+    );
+    return Object.freeze({ inventory, adapterHealth, detections });
   }
 
   #retainRuntimeHistory(
@@ -203,6 +221,48 @@ function processClaimConflicts(
       .filter(([, identities]) => identities.size > 1)
       .map(([claim]) => claim),
   );
+}
+
+/**
+ * Why each reported agent is in the inventory, then evidence that was set
+ * aside: runtimes two definitions claimed, and programs that only share an
+ * agent's name. An agent kept from an earlier scan says so.
+ */
+function explainDetections(
+  agents: readonly AgentIdentity[],
+  detections: readonly AgentDetection[],
+  conflicting: ReadonlySet<string>,
+): AgentDetection[] {
+  const byID = new Map(detections.flatMap((detection) =>
+    detection.agentId === undefined ? [] : [[detection.agentId, detection] as const]
+  ));
+  const reported = agents.map((agent): AgentDetection => {
+    const detection = byID.get(agent.agentId);
+    if (detection !== undefined) {
+      return { ...detection, stoppable: detection.stoppable && agent.state === AgentState.RUNNING };
+    }
+    return {
+      agentId: agent.agentId,
+      adapterId: agentProductCapabilities(agent)[0]?.slice("agent-product:".length) ?? "",
+      displayName: agent.displayName,
+      reported: true,
+      confidence: "high",
+      stoppable: false,
+      evidence: [],
+      notes: [isRuntimeIdentity(agent)
+        ? "Found running in an earlier scan; this scan did not find it."
+        : "Found in an earlier scan."],
+    };
+  });
+  const unattributed = detections
+    .filter((detection) => detection.agentId !== undefined && conflicting.has(detection.agentId))
+    .map((detection): AgentDetection => ({
+      ...detection,
+      reported: false,
+      stoppable: false,
+      notes: [...detection.notes, "Not reported: another agent definition claims the same process."],
+    }));
+  return [...reported, ...unattributed, ...detections.filter((detection) => !detection.reported)];
 }
 
 function isRuntimeIdentity(agent: AgentIdentity): boolean {

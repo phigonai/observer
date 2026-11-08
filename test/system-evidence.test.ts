@@ -54,6 +54,7 @@ test("an npm-installed CLI's version comes from its package.json, without starti
     assert.deepEqual(await packageVersion(executable), {
       version: "1.4.2",
       file: join(prefix, windows ? "" : "lib", "node_modules", "@example", "agent", "package.json"),
+      name: "@example/agent",
     });
     let now = 1_000_000;
     const cache = new ExecutableProbeCache({ clock: () => now });
@@ -66,6 +67,9 @@ test("an npm-installed CLI's version comes from its package.json, without starti
       return result.status === "ok" ? result.value?.version : undefined;
     };
     assert.equal(await inspect(), "1.4.2");
+    // The command says which package it runs, for a name other programs share.
+    const found = await new SystemEvidenceProvider(process.platform, environment).inspectExecutable(["agent"]);
+    assert.equal(found.status === "ok" ? found.value?.packageName : undefined, "@example/agent");
     // An upgrade rewrites package.json; the shim stays the same.
     await new Promise((resolve) => setTimeout(resolve, 20));
     await npmInstall(prefix, "1.5.0");

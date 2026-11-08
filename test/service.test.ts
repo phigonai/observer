@@ -117,11 +117,17 @@ test("the Windows task runs at sign-in as this user, hidden, and is retried ever
   }
 });
 
-test("the LaunchAgent starts at sign-in and is kept alive", () => {
+test("the LaunchAgent starts at sign-in and is started again only when it fails", () => {
   const plist = launchAgentPlist(context("macos", "/Users/ada", { dataDirectory: "/Users/ada/Phigon & Co" }));
   assert.match(plist, /<key>Label<\/key>\s*<string>com\.phigon\.observer<\/string>/u);
   assert.match(plist, /<key>RunAtLoad<\/key>\s*<true\/>/u);
-  assert.match(plist, /<key>KeepAlive<\/key>\s*<true\/>/u);
+  // A clean exit, as on a removed computer, is final; a failure or a
+  // pairing change (75) is started again.
+  assert.match(plist, /<key>KeepAlive<\/key>\s*<dict>\s*<key>SuccessfulExit<\/key>\s*<false\/>\s*<\/dict>/u);
+  assert.doesNotMatch(plist, /<key>KeepAlive<\/key>\s*<true\/>/u);
+  // What Node.js itself prints, such as failing to start, is kept.
+  assert.match(plist, /<key>StandardErrorPath<\/key>\s*<string>\/Users\/ada\/Phigon &amp; Co\/logs\/service-errors\.log<\/string>/u);
+  assert.match(plist, /<key>StandardOutPath<\/key>\s*<string>\/dev\/null<\/string>/u);
   assert.match(plist, /<string>\/usr\/local\/bin\/node<\/string>\s*<string>\/usr\/local\/lib\/node_modules\/@phigon\/observer\/dist\/src\/entry\.js<\/string>\s*<string>run<\/string>\s*<string>--service-settings<\/string>\s*<string>\/Users\/ada\/Phigon &amp; Co\/service-settings\.json<\/string>/u);
   assert.doesNotMatch(plist, /EnvironmentVariables|phg_/u);
   assert.throws(() => launchAgentPlist(context("macos", "/Users/ada", { nodePath: "node" })), /Node\.js path/u);
@@ -256,6 +262,8 @@ test("macOS install writes the LaunchAgent and loads it in the user's session", 
     assert.equal(serviceDefinitionPath(service), plist);
     assert.match(await readFile(plist, "utf8"), /<key>KeepAlive<\/key>/u);
     if (process.platform !== "win32") assert.equal((await stat(plist)).mode & 0o022, 0);
+    // launchd does not create the folder of the stderr file itself.
+    assert.ok((await stat(join(home, "data", "logs"))).isDirectory());
     assert.deepEqual(calls.map((call) => call.args.join(" ")), [
       "bootout gui/501/com.phigon.observer",
       "enable gui/501/com.phigon.observer",

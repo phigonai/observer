@@ -15,7 +15,9 @@ import { customAgentAdapter } from "../src/discovery/adapters/custom.js";
 import { genericAdapter } from "../src/discovery/adapters/generic.js";
 import { hermesAdapter } from "../src/discovery/adapters/hermes.js";
 import { openClawAdapter } from "../src/discovery/adapters/openclaw.js";
+import { run } from "../src/cli.js";
 import { DiscoveryEngine, runDiscoveryLoop } from "../src/discovery/engine.js";
+import { formatDetections } from "../src/discovery/explain.js";
 import {
   ExecutableProbeCache,
   SystemEvidenceProvider,
@@ -109,7 +111,8 @@ test("installed CLI probes are reused between discoveries until the executable c
   try {
     await install("phigon-probe", "1.2.3");
     assert.equal((await inspect("phigon-probe"))?.version, "1.2.3");
-    assert.equal((await inspect("phigon-probe"))?.version, "1.2.3");
+    // Its first line is kept too, to tell programs that share a name apart.
+    assert.equal((await inspect("phigon-probe"))?.versionBanner, "phigon-probe 1.2.3");
     assert.equal(await launches(), 1);
 
     await install("phigon-probe", "1.2.40");
@@ -204,7 +207,7 @@ test("independent adapters map macOS-style evidence into stable sanitized identi
       ],
     ]),
     configurations: new Map([
-      ["~/.hermes", [{ identifierDigest: "hermes-config-digest" }]],
+      ["~/.hermes/sessions", [{ identifierDigest: "hermes-config-digest" }]],
       ["~/.openclaw", [{ identifierDigest: "openclaw-config-digest" }]],
     ]),
   });
@@ -801,6 +804,296 @@ test("agents whose conversations are not read are still discovered", async () =>
       agent.process === undefined ? AgentState.INSTALLED : AgentState.RUNNING,
       agent.displayName,
     );
+  }
+});
+
+// Anonymized samples of programs that share an agent's name: kdb+'s q
+// (`q --version` prints its banner, "KDB+ 4.1 2024.10.16 ..."), the goose
+// database migration tool ("goose version: v3.24.1"), the AWS Copilot CLI
+// ("copilot version: v1.34.1"), the Hermes IBC relayer ("hermes 1.10.0")
+// and the amp text editor.
+const lookAlikeStart = new Date("2026-07-24T09:30:00.000Z");
+const lookAlike = (executableName: string, processId: number): ProcessEvidence => ({
+  processKey: `process-${executableName}-${processId}-start-a`,
+  processId,
+  startedAt: lookAlikeStart,
+  executableName,
+  executablePathDigest: `${executableName}-path-digest`,
+});
+const lookAlikeExecutables = new Map<string, ExecutableEvidence>([
+  ["q", { executableName: "q", executablePathDigest: "kdb-q-digest", version: "4.1" }],
+  ["goose", { executableName: "goose", executablePathDigest: "pressly-goose-digest", version: "v3.24.1" }],
+  ["copilot", { executableName: "copilot", executablePathDigest: "aws-copilot-digest", version: "v1.34.1" }],
+  ["hermes", { executableName: "hermes", executablePathDigest: "ibc-hermes-digest", version: "1.10.0" }],
+  ["amp", { executableName: "amp", executablePathDigest: "amp-editor-digest", version: "0.7.1" }],
+]);
+
+test("programs that only share an agent's name are not reported and cannot be stopped", async () => {
+  const processes = [
+    lookAlike("q", 3101),
+    lookAlike("goose", 3102),
+    lookAlike("copilot", 3103),
+    lookAlike("hermes", 3104),
+    lookAlike("amp", 3105),
+  ];
+  const snapshot = await new DiscoveryEngine({
+    adapters: [hermesAdapter, genericAdapter],
+    evidenceFactory: () => new FixtureEvidenceProvider({
+      processes: { status: "ok", value: processes },
+      executables: lookAlikeExecutables,
+      // The Hermes IBC relayer's own folder is ~/.hermes, holding config.toml.
+      configurations: new Map([["~/.hermes", [{ identifierDigest: "ibc-relayer-home" }]]]),
+    }),
+    clock: () => observedAt,
+  }).discover("machine-fixture");
+
+  assert.deepEqual(snapshot.inventory.agents.map((agent) => agent.displayName), []);
+  assert.equal(snapshot.inventory.partial, false);
+  assert.ok(snapshot.adapterHealth.every((health) => health.status === "healthy"));
+  // kdb+'s q is not even looked at: Amazon Q is found by its own qchat.
+  const setAside = snapshot.detections.filter((detection) => !detection.reported);
+  assert.deepEqual(setAside.map((detection) => detection.displayName).sort(), [
+    "Amp",
+    "GitHub Copilot CLI",
+    "Goose",
+    "Hermes Agent",
+  ]);
+  for (const detection of setAside) {
+    assert.equal(detection.stoppable, false);
+    assert.equal(detection.confidence, "low");
+    assert.ok(detection.evidence.every((item) => !item.identifying));
+    assert.match(detection.notes.join(" "), /other programs use the same name/u);
+  }
+});
+
+test("where an agent's own configuration exists, its native processes with a shared name are that agent", async () => {
+  const processes: ProcessEvidence[] = [
+    // Goose desktop's agent server, and a goose CLI session.
+    lookAlike("goosed", 4101),
+    lookAlike("goose", 4102),
+    // GitHub Copilot CLI installed with npm, and the native binary that
+    // WinGet, Homebrew and the install script put on PATH.
+    { ...lookAlike("node", 4201), scriptPackage: "@github/copilot" },
+    lookAlike("copilot", 4202),
+    // An Amazon Q chat session, and a q program: kdb+'s, or Amazon Q's
+    // launcher, which never counts.
+    lookAlike("qchat", 4301),
+    lookAlike("q", 4302),
+    // Hermes Agent, a Python console script listed by its name.
+    lookAlike("hermes", 4401),
+  ];
+  const snapshot = await new DiscoveryEngine({
+    adapters: [hermesAdapter, genericAdapter],
+    evidenceFactory: () => new FixtureEvidenceProvider({
+      processes: { status: "ok", value: processes },
+      executables: lookAlikeExecutables,
+      configurations: new Map([
+        ["~/.config/goose", [{ identifierDigest: "goose-config" }]],
+        ["~/.copilot", [{ identifierDigest: "copilot-config" }]],
+        ["~/.aws/amazonq", [{ identifierDigest: "amazonq-config" }]],
+        ["~/.hermes/sessions", [{ identifierDigest: "hermes-sessions" }]],
+      ]),
+    }),
+    clock: () => observedAt,
+  }).discover("machine-fixture");
+
+  const stoppable = snapshot.inventory.agents
+    .filter((agent) => agent.capabilities.includes("process-instance") && agent.state === AgentState.RUNNING)
+    .map((agent) => [agent.displayName, Number(agent.processId)]);
+  assert.deepEqual(stoppable.sort(([, left], [, right]) => Number(left) - Number(right)), [
+    ["Goose · PID 4101", 4101],
+    ["Goose · PID 4102", 4102],
+    ["GitHub Copilot CLI · PID 4201", 4201],
+    ["GitHub Copilot CLI · PID 4202", 4202],
+    ["Amazon Q Developer CLI · PID 4301", 4301],
+    ["Hermes Agent · PID 4401", 4401],
+  ]);
+  // A q process is never Amazon Q, even where Amazon Q is installed.
+  assert.ok(!snapshot.inventory.agents.some((agent) => agent.processId === 4302n));
+  assert.equal(snapshot.inventory.partial, false);
+  assert.ok(!snapshot.inventory.notices.some((notice) => /other programs use the same name/u.test(notice)));
+  // Only the amp editor's command, with no Amp settings here, is set aside.
+  assert.deepEqual(snapshot.detections.filter((detection) => !detection.reported).map((detection) => detection.displayName), ["Amp"]);
+
+  // The WinGet copilot: a native process, its command on PATH and ~/.copilot.
+  const copilot = snapshot.detections.find((detection) => detection.displayName === "GitHub Copilot CLI · PID 4202");
+  assert.equal(copilot?.confidence, "high");
+  assert.equal(copilot?.stoppable, true);
+  assert.deepEqual(copilot?.evidence.map((item) => [item.detail, item.identifying]), [
+    ['running process "copilot" (PID 4202)', true],
+    ['"copilot" command on PATH, version v1.34.1', true],
+    ["~/.copilot exists", true],
+  ]);
+  const npmCopilot = snapshot.detections.find((detection) => detection.displayName === "GitHub Copilot CLI · PID 4201");
+  assert.equal(npmCopilot?.evidence[0]?.detail, "node process running the npm package @github/copilot (PID 4201)");
+  assert.equal(npmCopilot?.evidence[0]?.kind, "package");
+  // The copilot on PATH may be AWS's, so its version is not Copilot's.
+  for (const agent of snapshot.inventory.agents.filter((identity) => identity.displayName.startsWith("GitHub Copilot CLI"))) {
+    assert.equal(agent.version, "", agent.displayName);
+  }
+  assert.match(copilot?.notes.join(" ") ?? "", /Other programs are also called "copilot", so the version of that command is not given as GitHub Copilot CLI's\./u);
+  // goose on PATH may be the migration tool; no qchat is on PATH here.
+  assert.equal(snapshot.inventory.agents.find((agent) => agent.displayName === "Goose · PID 4101")?.version, "");
+  assert.equal(snapshot.inventory.agents.find((agent) => agent.displayName === "Amazon Q Developer CLI · PID 4301")?.version, "");
+});
+
+test("an npm agent's runtime never takes the version of a same-named command on PATH", async () => {
+  // GitHub Copilot CLI runs from npm, without ~/.copilot, while AWS's
+  // copilot is the copilot command on PATH.
+  const snapshot = await new DiscoveryEngine({
+    adapters: [genericAdapter],
+    evidenceFactory: () => new FixtureEvidenceProvider({
+      processes: { status: "ok", value: [{ ...lookAlike("node", 4601), scriptPackage: "@github/copilot" }] },
+      executables: new Map([
+        ["copilot", lookAlikeExecutables.get("copilot")!],
+        ["gemini", { executableName: "gemini", executablePathDigest: "gemini-digest", version: "0.12.0" }],
+      ]),
+    }),
+    clock: () => observedAt,
+  }).discover("machine-fixture");
+  const copilot = snapshot.inventory.agents.find((agent) => agent.displayName === "GitHub Copilot CLI · PID 4601");
+  assert.ok(copilot?.capabilities.includes("process-instance"));
+  assert.equal(copilot?.version, "");
+  assert.ok(!snapshot.inventory.notices.some((notice) => /GitHub Copilot CLI version is unknown/u.test(notice)));
+  // A command with the agent's own name still gives its version.
+  assert.equal(snapshot.inventory.agents.find((agent) => agent.displayName === "Gemini CLI")?.version, "0.12.0");
+});
+
+test("a shared-name command gives the agent's version when it shows it is the agent", async () => {
+  const versionOf = async (copilot: ExecutableEvidence) => (await new DiscoveryEngine({
+    adapters: [genericAdapter],
+    evidenceFactory: () => new FixtureEvidenceProvider({
+      processes: { status: "ok", value: [] },
+      executables: new Map([["copilot", copilot]]),
+      configurations: new Map([["~/.copilot", [{ identifierDigest: "copilot-config" }]]]),
+    }),
+    clock: () => observedAt,
+  }).discover("machine-fixture")).inventory.agents.find((agent) => agent.displayName === "GitHub Copilot CLI")?.version;
+  // WinGet's native copilot.exe names itself.
+  assert.equal(await versionOf({
+    executableName: "copilot", executablePathDigest: "winget-copilot", version: "1.0.41", versionBanner: "GitHub Copilot CLI 1.0.41.",
+  }), "1.0.41");
+  // npm's copilot shim, whose version came from @github/copilot's package.json.
+  assert.equal(await versionOf({
+    executableName: "copilot", executablePathDigest: "npm-copilot", version: "1.0.40", packageName: "@github/copilot",
+  }), "1.0.40");
+  // AWS's copilot on PATH where GitHub's configuration is.
+  assert.equal(await versionOf({
+    executableName: "copilot", executablePathDigest: "aws-copilot", version: "v1.34.1", versionBanner: "copilot version: v1.34.1",
+  }), "");
+  assert.equal(await versionOf({
+    executableName: "copilot", executablePathDigest: "other-copilot", version: "2.0.0", packageName: "@someone/copilot",
+  }), "");
+});
+
+test("without the agent's configuration, a shared name is set aside even next to the agent's own process", async () => {
+  // No ~/.config/goose: the goose desktop server identifies Goose, while a
+  // goose program may be the migration tool and is not attributed.
+  const snapshot = await new DiscoveryEngine({
+    adapters: [genericAdapter],
+    evidenceFactory: () => new FixtureEvidenceProvider({
+      processes: { status: "ok", value: [lookAlike("goosed", 4501), lookAlike("goose", 4502), lookAlike("copilot", 4503)] },
+      executables: lookAlikeExecutables,
+    }),
+    clock: () => observedAt,
+  }).discover("machine-fixture");
+  const stoppable = snapshot.inventory.agents
+    .filter((agent) => agent.capabilities.includes("process-instance"))
+    .map((agent) => Number(agent.processId));
+  assert.deepEqual(stoppable, [4501]);
+  assert.ok(!snapshot.inventory.agents.some((agent) => agent.displayName.startsWith("GitHub Copilot CLI")));
+  const goose = snapshot.detections.find((detection) => detection.displayName === "Goose · PID 4501");
+  assert.match(goose?.notes.join(" ") ?? "", /1 other running program\(s\) with a name other programs also use were set aside/u);
+  assert.ok(snapshot.inventory.notices.some((notice) => /Goose were not attributed to it: other programs use the same name/u.test(notice)));
+  const copilot = snapshot.detections.find((detection) => detection.displayName === "GitHub Copilot CLI");
+  assert.equal(copilot?.reported, false);
+  assert.equal(copilot?.stoppable, false);
+});
+
+test("a q command or process never stands for Amazon Q; qchat, its configuration or data folder do", async () => {
+  const qchat: ExecutableEvidence = { executableName: "qchat", executablePathDigest: "amazon-qchat-digest", version: "1.19.3" };
+  const explain = async (executables: ReadonlyMap<string, ExecutableEvidence>, configurations = new Map<string, readonly ConfigurationEvidence[]>()) =>
+    formatDetections((await new DiscoveryEngine({
+      adapters: [genericAdapter],
+      evidenceFactory: () => new FixtureEvidenceProvider({ processes: { status: "ok", value: [] }, executables, configurations }),
+      clock: () => observedAt,
+    }).discover("machine-fixture")).detections);
+  const kdb = new Map([["q", lookAlikeExecutables.get("q")!]]);
+
+  // kdb+'s q alone: nothing, not even a look at it.
+  assert.equal(await explain(kdb), "Why each agent was detected:\n  Nothing was detected.\n");
+
+  // Amazon Q's qchat beside kdb+'s q: Amazon Q, with qchat's own version.
+  assert.equal(await explain(new Map([...kdb, ["qchat", qchat]])), [
+    "Why each agent was detected:",
+    "Amazon Q Developer CLI (adapter generic:amazon-q)",
+    "  Confidence: medium. Can be stopped from Phigon: no.",
+    '  Evidence: "qchat" command on PATH, version 1.19.3',
+    "  Note: Installed; no process of its own is running.",
+    "",
+  ].join("\n"));
+
+  // Amazon Q's data folder beside kdb+'s q: installed, without q's version.
+  assert.equal(await explain(kdb, new Map([["~/.local/share/amazon-q", [{ identifierDigest: "amazon-q-data" }]]])), [
+    "Why each agent was detected:",
+    "Amazon Q Developer CLI (adapter generic:amazon-q)",
+    "  Confidence: medium. Can be stopped from Phigon: no.",
+    "  Evidence: ~/.local/share/amazon-q exists",
+    "  Note: Installed; no process of its own is running.",
+    "",
+  ].join("\n"));
+});
+
+test("discover --explain says which evidence identified each agent and what was set aside", async () => {
+  const snapshot = await new DiscoveryEngine({
+    adapters: [claudeAdapter, hermesAdapter, genericAdapter],
+    evidenceFactory: () => new FixtureEvidenceProvider({
+      processes: { status: "ok", value: [lookAlike("claude", 5101), lookAlike("goose", 5102)] },
+      executables: new Map([
+        ["claude", { executableName: "claude", executablePathDigest: "claude-digest", version: "2.1.0" }],
+        ["goose", lookAlikeExecutables.get("goose")!],
+      ]),
+      configurations: new Map([["~/.claude", [{ identifierDigest: "claude-config" }]]]),
+    }),
+    clock: () => observedAt,
+  }).discover("machine-fixture");
+  const text = formatDetections(snapshot.detections);
+  assert.equal(text, [
+    "Why each agent was detected:",
+    "Claude Code · PID 5101 (adapter claude)",
+    "  Confidence: high. Can be stopped from Phigon: yes, when this computer allows remote actions.",
+    '  Evidence: running process "claude" (PID 5101); "claude" command on PATH, version 2.1.0; ~/.claude exists',
+    "",
+    "Set aside, not reported:",
+    "Goose (adapter generic:goose)",
+    '  Name only, not proof: running process "goose" (PID 5102); "goose" command on PATH, version v3.24.1',
+    "  Note: Not reported: other programs use the same name, and nothing on this computer identifies one as Goose (its configuration was not found).",
+    "",
+  ].join("\n"));
+  assert.equal(formatDetections([]), "Why each agent was detected:\n  Nothing was detected.\n");
+});
+
+test("discover --explain --json adds the detections to the inventory", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-discover-explain-"));
+  try {
+    let stdout = "";
+    const code = await run(
+      ["discover", "--explain", "--json"],
+      { PHIGON_CONTROL_PLANE_URL: "https://control.example.test", PHIGON_DATA_DIR: directory, PATH: directory },
+      { stdout: (value) => { stdout += value; }, stderr: () => undefined },
+    );
+    assert.equal(code, 0);
+    const report = JSON.parse(stdout) as { inventory: unknown; detections: Array<{ reported: boolean; confidence: string; evidence: unknown[] }> };
+    assert.ok(Array.isArray(report.detections));
+    for (const detection of report.detections) {
+      assert.ok(["high", "medium", "low"].includes(detection.confidence));
+      assert.ok(Array.isArray(detection.evidence));
+    }
+    stdout = "";
+    await run(["discover", "--json"], { PHIGON_CONTROL_PLANE_URL: "https://control.example.test", PHIGON_DATA_DIR: directory, PATH: directory }, { stdout: (value) => { stdout += value; }, stderr: () => undefined });
+    assert.equal("detections" in (JSON.parse(stdout) as object), false);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
   }
 });
 

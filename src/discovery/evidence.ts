@@ -25,6 +25,14 @@ export type ExecutableEvidence = Readonly<{
   executableName: string;
   executablePathDigest: string;
   version: string;
+  /** The npm package the command runs, when its version came from it. */
+  packageName?: string;
+  /**
+   * The first line its `--version` printed, at most 128 characters, such as
+   * "GitHub Copilot CLI 1.0.41.". Kept on this computer only, to tell an
+   * agent's command from another program's with the same name.
+   */
+  versionBanner?: string;
 }>;
 
 export type ConfigurationEvidence = Readonly<{

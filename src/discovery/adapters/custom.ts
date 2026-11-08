@@ -7,13 +7,21 @@ import {
 } from "../known-agent.js";
 import type { AgentDiscoveryAdapter } from "../types.js";
 
+/**
+ * Sent with the inventory when definitions were skipped. The local warning
+ * and `doctor` name the file and the reason; this says only what to do.
+ */
+export const customAgentProblemNotice =
+  "Some custom agent definitions on this computer could not be used and were skipped; run phigon-observer doctor there.";
+
 export function customAgentAdapter(
   registry: CustomAgentRegistry,
 ): AgentDiscoveryAdapter {
   return {
     id: "custom",
     async discover(evidence, observedAt) {
-      const registrations = await registry.list();
+      // A damaged file skips the definitions it holds, never discovery.
+      const { agents: registrations, problem } = await registry.read();
       const results = await Promise.all(
         registrations.map((registration) => {
           const spec: KnownAgentSpec = {
@@ -28,7 +36,18 @@ export function customAgentAdapter(
           return discoverKnownAgent(spec, evidence, observedAt);
         }),
       );
-      return combineAdapterResults("custom", results);
+      const combined = combineAdapterResults("custom", results);
+      if (problem === undefined) return combined;
+      // Skipped definitions leave coverage incomplete: their runtimes are
+      // unknown, not stopped.
+      return {
+        ...combined,
+        health: {
+          adapterId: "custom",
+          status: "error",
+          notices: [customAgentProblemNotice, ...combined.health.notices].slice(0, 32),
+        },
+      };
     },
   };
 }

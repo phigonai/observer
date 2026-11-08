@@ -1,9 +1,17 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { latestObserverVersion, newerVersion, offerObserverUpdate } from "../src/update.js";
+import {
+  bundledNpmCli,
+  installObserverUpdate,
+  latestObserverVersion,
+  newerVersion,
+  offerObserverUpdate,
+  packageVersion,
+  runningPackageRoot,
+} from "../src/update.js";
 
 test("update comparison handles numeric versions and rejects command syntax/prereleases", () => {
   assert.equal(newerVersion("8.9.0", "8.10.0"), true);
@@ -25,6 +33,77 @@ test("update checks are bounded, cached and tolerate offline use", async () => {
     assert.equal(requests, 1);
     assert.equal(await latestObserverVersion(directory, { force: true, fetcher: async () => { throw new Error("offline"); } }), null);
   } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("update uses the npm that came with the running Node.js, by absolute path", () => {
+  const windowsNode = "C:\\Program Files\\nodejs\\node.exe";
+  const windowsNpm = "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js";
+  assert.equal(bundledNpmCli(windowsNode, "win32", (path) => path === windowsNpm), windowsNpm);
+  assert.equal(bundledNpmCli(windowsNode, "win32", () => false), undefined);
+
+  // nvm, distribution packages: bin/npm links into lib.
+  const nvmNode = "/home/dev/.nvm/versions/node/v24.5.0/bin/node";
+  const nvmNpm = "/home/dev/.nvm/versions/node/v24.5.0/lib/node_modules/npm/bin/npm-cli.js";
+  assert.equal(bundledNpmCli(nvmNode, "linux", (path) => path === nvmNpm, (path) => {
+    assert.equal(path, "/home/dev/.nvm/versions/node/v24.5.0/bin/npm");
+    return nvmNpm;
+  }), nvmNpm);
+  // Homebrew keeps npm under libexec, without a link it can follow here.
+  const brewNode = "/opt/homebrew/Cellar/node/24.5.0/bin/node";
+  const brewNpm = "/opt/homebrew/Cellar/node/24.5.0/libexec/lib/node_modules/npm/bin/npm-cli.js";
+  assert.equal(bundledNpmCli(brewNode, "darwin", (path) => path === brewNpm, () => { throw new Error("ENOENT"); }), brewNpm);
+
+  // This Node.js's own npm, and the running observer's own package.
+  assert.match(bundledNpmCli() ?? "", /npm-cli\.js$/u);
+});
+
+test("the running observer's package is the one update checks", async () => {
+  const own = JSON.parse(await readFile(new URL("../../package.json", import.meta.url), "utf8")) as { version: string };
+  assert.equal(await packageVersion(runningPackageRoot), own.version);
+});
+
+test("update runs npm without a shell and reports an install that went elsewhere as a failure", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-update-install-"));
+  const packageRoot = join(directory, "observer");
+  const calls: Array<readonly string[]> = [];
+  try {
+    await mkdir(packageRoot);
+    await writeFile(join(packageRoot, "package.json"), JSON.stringify({ name: "@phigon/observer", version: "8.11.2" }));
+    const options = { execPath: "/opt/node/bin/node", npmCli: "/opt/node/lib/node_modules/npm/bin/npm-cli.js", packageRoot };
+
+    // npm succeeds but installs into another prefix: this observer is unchanged.
+    await assert.rejects(
+      installObserverUpdate("8.12.0", { ...options, run: async (command, args) => { calls.push([command, ...args]); return 0; } }),
+      (error: unknown) => error instanceof Error &&
+        error.message.includes(`the observer in ${packageRoot} is still 8.11.2, not 8.12.0`) &&
+        error.message.includes("phigon-observer service install"),
+    );
+    assert.deepEqual(calls, [[
+      "/opt/node/bin/node",
+      "/opt/node/lib/node_modules/npm/bin/npm-cli.js",
+      "install", "--global", "@phigon/observer@8.12.0", "--registry=https://registry.npmjs.org",
+    ]]);
+
+    // npm installs into this observer's folder.
+    await installObserverUpdate("8.12.0", {
+      ...options,
+      run: async () => {
+        await writeFile(join(packageRoot, "package.json"), JSON.stringify({ name: "@phigon/observer", version: "8.12.0" }));
+        return 0;
+      },
+    });
+    assert.equal(await packageVersion(packageRoot), "8.12.0");
+
+    await assert.rejects(installObserverUpdate("8.13.0", { ...options, run: async () => 1 }), /^Error: Update failed\./u);
+    await assert.rejects(installObserverUpdate("8.13.0", { ...options, run: () => Promise.reject(new Error("ENOENT")) }), /Could not start npm/u);
+    await assert.rejects(
+      installObserverUpdate("8.13.0", { ...options, npmCli: undefined }),
+      /The npm that came with this Node\.js \(\/opt\/node\/bin\/node\) was not found, so the observer was not updated/u,
+    );
+    await assert.rejects(installObserverUpdate("8.13.0; rm -rf /", options), /Invalid observer version/u);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("update installs only after yes and asks for a restart", async () => {

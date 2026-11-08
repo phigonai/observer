@@ -1,7 +1,9 @@
+import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, unlinkSync } from "node:fs";
-import { mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { uptime } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { atomicReplace } from "./atomic-replace.js";
 import { makeDirectoryPrivate } from "./private-directory.js";
 import { defaultProcessSampler } from "./system-inspection.js";
 
@@ -59,7 +61,9 @@ export type InstanceLockHolder = Readonly<{
  * The lock is a file created with the exclusive `wx` flag that names the
  * holder's process ID and start time. A lock whose process is gone, that was
  * taken before the computer last started, or whose process ID now belongs to
- * a process that started at another time, is stale and is taken over.
+ * a process that started at another time, is stale and is taken over. Of
+ * several observers taking over one stale lock at once, exactly one gets it
+ * (see takeOver).
  */
 export class InstanceLock {
   readonly #path: string;
@@ -97,9 +101,10 @@ export class InstanceLock {
     })}\n`;
     await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
     await makeDirectoryPrivate(dataDirectory);
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < 4; attempt++) {
       try {
         await writeFile(path, content, { encoding: "utf8", flag: "wx", mode: 0o600 });
+        await removeTakeoverMarkers(path);
         return new InstanceLock(path, content);
       } catch (error) {
         if (!isNodeError(error) || error.code !== "EEXIST") throw error;
@@ -127,13 +132,17 @@ export class InstanceLock {
       } else if (await holderIsLive(holder, isAlive, processStartedAt, bootedAt)) {
         throw alreadyRunning(path, holder);
       }
-      // Stale. Remove it only while it is still the lock that was judged
-      // stale, so an observer that took it over meanwhile keeps it.
-      try {
-        if (await readFile(path, "utf8") === existing) await unlink(path);
-      } catch (error) {
-        if (!isNodeError(error) || error.code !== "ENOENT") throw error;
+      // Stale. Reading it again and removing it would race: another
+      // observer could take it over between the two, and this one would
+      // then remove that observer's lock. A takeover marker that only one
+      // observer can create decides who replaces this stale lock.
+      const takenOver = await takeOver(path, existing, content, now, (record) =>
+        holderIsLive(record, isAlive, processStartedAt, bootedAt));
+      if (takenOver === "taken") {
+        await removeTakeoverMarkers(path);
+        return new InstanceLock(path, content);
       }
+      if (takenOver === "busy") throw alreadyRunning(path, undefined);
     }
     throw alreadyRunning(path, undefined);
   }
@@ -195,6 +204,103 @@ export class InstanceLock {
     } catch {
       // Exiting anyway; the next start treats a dead holder as stale.
     }
+  }
+}
+
+/**
+ * Replaces the stale lock `stale` with `content`, so that of several
+ * observers taking over the same stale lock at once exactly one succeeds.
+ *
+ * Each observer first creates a takeover marker for that stale lock with
+ * the exclusive `wx` flag; the one that creates it checks that the lock
+ * still is the stale one and then replaces it in a single rename, so the
+ * lock never goes missing and nobody else can create one meanwhile.
+ *
+ * Markers are numbered. An observer creates the number after the highest
+ * one there, and only when the observer that wrote that one is gone, so
+ * only the highest marker can belong to a live observer, and two observers
+ * that both find the same dead marker race for one name that only one gets.
+ * A dead marker is never removed and its name reused, which would race the
+ * same way; numbers have no limit, so dead markers never block a takeover.
+ * Every marker is removed once an observer holds the lock (see
+ * removeTakeoverMarkers). The markers end in `.tmp`, so a purge removes them.
+ *
+ * "taken": this observer holds the lock. "busy": another live observer is
+ * taking it over. "changed": the lock or the markers changed; look again.
+ */
+async function takeOver(
+  path: string,
+  stale: string,
+  content: string,
+  now: () => number,
+  isLive: (record: LockRecord) => Promise<boolean>,
+): Promise<"taken" | "busy" | "changed"> {
+  const digest = createHash("sha256").update(stale).digest("hex").slice(0, 16);
+  const prefix = `${basename(path)}.takeover-${digest}-`;
+  const markerPath = (generation: number) => join(dirname(path), `${prefix}${generation}.tmp`);
+  const highest = (await readdir(dirname(path)))
+    .filter((name) => name.startsWith(prefix) && name.endsWith(".tmp"))
+    .map((name) => name.slice(prefix.length, -".tmp".length))
+    .filter((generation) => /^\d{1,15}$/u.test(generation))
+    .reduce((top, generation) => Math.max(top, Number(generation)), -1);
+  if (highest >= 0) {
+    // The latest marker is taking the lock over unless its observer died.
+    let other: string;
+    let modifiedMs: number;
+    try {
+      [other, modifiedMs] = await Promise.all([
+        readFile(markerPath(highest), "utf8"),
+        stat(markerPath(highest)).then((metadata) => metadata.mtimeMs),
+      ]);
+    } catch (error) {
+      if (isNodeError(error) && error.code === "ENOENT") return "changed";
+      throw error;
+    }
+    const record = parseLock(other);
+    if (record === undefined ? now() - modifiedMs < unreadableLockGraceMs : await isLive(record)) {
+      return "busy";
+    }
+  }
+  const marker = markerPath(highest + 1);
+  try {
+    await writeFile(marker, content, { encoding: "utf8", flag: "wx", mode: 0o600 });
+  } catch (error) {
+    // Another observer took this number first: look again.
+    if (isNodeError(error) && error.code === "EEXIST") return "changed";
+    throw error;
+  }
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    let current: string;
+    try {
+      current = await readFile(path, "utf8");
+    } catch (error) {
+      if (isNodeError(error) && error.code === "ENOENT") return "changed";
+      throw error;
+    }
+    if (current !== stale) return "changed";
+    await writeFile(temporary, content, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    await atomicReplace(temporary, path);
+    return "taken";
+  } finally {
+    await rm(temporary, { force: true }).catch(() => undefined);
+    // Only this observer's marker; once one holds the lock, all go.
+    await rm(marker, { force: true }).catch(() => undefined);
+  }
+}
+
+/**
+ * Removes every takeover marker, once this observer holds the lock. Each
+ * names a lock that is gone now, so an observer that creates one again, or
+ * still holds one, finds the lock changed and looks again.
+ */
+async function removeTakeoverMarkers(path: string): Promise<void> {
+  const prefix = `${basename(path)}.takeover-`;
+  try {
+    const names = (await readdir(dirname(path))).filter((name) => name.startsWith(prefix) && name.endsWith(".tmp"));
+    await Promise.all(names.map((name) => rm(join(dirname(path), name), { force: true }).catch(() => undefined)));
+  } catch {
+    // Left for the next observer that holds the lock.
   }
 }
 

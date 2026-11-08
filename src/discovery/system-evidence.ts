@@ -275,10 +275,14 @@ export class SystemEvidenceProvider implements HostEvidenceProvider {
         const executablePath = await this.#findExecutable(candidate);
         if (executablePath === null) continue;
         const installed = await packageVersion(executablePath, this.#platform);
-        const value = {
+        const probed = installed === undefined ? await readVersion(executablePath) : undefined;
+        const value: ExecutableEvidence = {
           executableName: normalizedExecutableName(candidate),
           executablePathDigest: digest(executablePath),
-          version: installed?.version ?? await readVersion(executablePath),
+          version: installed?.version ?? probed?.version ?? "",
+          // Which program it is, for a name other programs share.
+          ...(installed === undefined ? {} : { packageName: installed.name }),
+          ...(probed?.banner ? { versionBanner: probed.banner } : {}),
         };
         await this.#executableCache?.remember(cacheKey, value, executablePath, installed?.file ?? null);
         return { status: "ok", value };
@@ -850,7 +854,7 @@ export function windowsPathIdentity(path: string): string {
 export async function packageVersion(
   executablePath: string,
   platform: NodeJS.Platform = process.platform,
-): Promise<Readonly<{ version: string; file: string }> | undefined> {
+): Promise<Readonly<{ version: string; file: string; name: string }> | undefined> {
   const candidates: string[] = [];
   try {
     const metadata = await stat(executablePath);
@@ -883,7 +887,7 @@ export async function packageVersion(
         name === installed.name && typeof version === "string" &&
         version.length <= 64 && packageVersionPattern.test(version)
       ) {
-        return { version, file };
+        return { version, file, name: installed.name };
       }
     } catch {
       // Not this one.
@@ -910,7 +914,8 @@ function npmPackageOf(path: string): Readonly<{ directory: string; name: string 
   };
 }
 
-async function readVersion(executablePath: string): Promise<string> {
+/** The version `--version` prints, and its first line (see ExecutableEvidence). */
+async function readVersion(executablePath: string): Promise<Readonly<{ version: string; banner: string }>> {
   try {
     // npm exposes .cmd shims on Windows, which execFile cannot launch.
     // Its sibling PowerShell shim accepts a literal file argument, avoiding
@@ -940,10 +945,13 @@ async function readVersion(executablePath: string): Promise<string> {
     // wait until the timeout instead of returning its version.
     execution.child.stdin?.end();
     const { stdout, stderr } = await execution;
-    const match = versionPattern.exec(`${stdout}\n${stderr}`.slice(0, 4_096));
-    return match?.[0]?.slice(0, 64) ?? "";
+    const output = `${stdout}\n${stderr}`.slice(0, 4_096);
+    const match = versionPattern.exec(output);
+    const banner = output.split(/\r?\n/u).map((line) => line.replace(/[\u0000-\u001f\u007f]/gu, "").trim())
+      .find((line) => line.length > 0) ?? "";
+    return { version: match?.[0]?.slice(0, 64) ?? "", banner: banner.slice(0, 128) };
   } catch {
-    return "";
+    return { version: "", banner: "" };
   }
 }
 

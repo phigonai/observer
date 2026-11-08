@@ -70,6 +70,8 @@ test("every command line a service, a device management script, the Phigon app o
     ["update", "--check", "--json"],
     ["update", "--yes"],
     ["discover", "--json"],
+    ["discover", "--explain", "--json"],
+    ["logs", "--tail", "20", "--follow"],
     ["ingest", "--agent", "cursor", "--quiet"],
     ["ingest", "--agent", "custom", "--name", "Acme Research Agent", "--quiet", "--json"],
     ["agent", "add", "--id", "release-bot", "--name", "Release Bot", "--executable", "release-bot", "--executable", "rb",

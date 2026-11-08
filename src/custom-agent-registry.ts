@@ -49,57 +49,150 @@ type StoredRegistry = Readonly<{
   agents: readonly CustomAgentRegistration[];
 }>;
 
+/** The definitions that can be used, and why others were skipped. */
+export type CustomAgentRegistryRead = Readonly<{
+  agents: readonly CustomAgentRegistration[];
+  /**
+   * One plain sentence when the file, or some of its definitions, could not
+   * be used. Built-in discovery and the other definitions keep working.
+   */
+  problem?: string;
+}>;
+
+export type CustomAgentRegistryOptions = Readonly<{
+  /**
+   * Told about a damaged file once, not on every scan; told again only
+   * when the problem changes, or is fixed and comes back.
+   */
+  onProblem?: (message: string) => void;
+}>;
+
 export class CustomAgentRegistry {
   readonly #dataDirectory: string;
   readonly #path: string;
+  readonly #onProblem: ((message: string) => void) | undefined;
+  #reportedProblem: string | undefined;
 
-  constructor(dataDirectory: string) {
+  constructor(dataDirectory: string, options: CustomAgentRegistryOptions = {}) {
     this.#dataDirectory = dataDirectory;
     this.#path = join(dataDirectory, "custom-agents.json");
+    this.#onProblem = options.onProblem;
   }
 
+  /**
+   * The usable definitions. A damaged file never stops discovery: a file
+   * that cannot be read is skipped as a whole, and a definition that is
+   * invalid, repeats an ID or claims evidence an earlier one claims is
+   * skipped on its own.
+   */
   async list(): Promise<readonly CustomAgentRegistration[]> {
+    return (await this.read()).agents;
+  }
+
+  /** `list`, with the reason anything was skipped. */
+  async read(): Promise<CustomAgentRegistryRead> {
+    let result: CustomAgentRegistryRead;
+    try {
+      result = await this.#readLenient();
+    } catch {
+      result = { agents: [], problem: this.#fileProblem("could not be read") };
+    }
+    if (result.problem === undefined) {
+      this.#reportedProblem = undefined;
+    } else if (result.problem !== this.#reportedProblem) {
+      this.#reportedProblem = result.problem;
+      this.#onProblem?.(result.problem);
+    }
+    return result;
+  }
+
+  async #readLenient(): Promise<CustomAgentRegistryRead> {
     let raw: string;
     try {
       raw = await readFile(this.#path, "utf8");
     } catch (error) {
-      if (isNodeError(error) && error.code === "ENOENT") return [];
-      throw error;
+      if (isNodeError(error) && error.code === "ENOENT") return { agents: [] };
+      return { agents: [], problem: this.#fileProblem("could not be read") };
     }
-    if (Buffer.byteLength(raw, "utf8") > maxRegistryBytes) {
-      throw new Error("Custom agent registry exceeds the 1 MiB safety limit.");
-    }
-    let value: unknown;
+    let entries: readonly unknown[];
     try {
-      value = JSON.parse(raw);
-    } catch {
-      throw new Error("Custom agent registry is not valid JSON.");
+      entries = parsedEntries(raw);
+    } catch (error) {
+      return { agents: [], problem: this.#fileProblem(`is damaged (${reason(error)})`) };
     }
-    if (
-      typeof value !== "object" ||
-      value === null ||
-      !("version" in value) ||
-      value.version !== registryVersion ||
-      !("agents" in value) ||
-      !Array.isArray(value.agents) ||
-      value.agents.length > maxRegistrations
-    ) {
-      throw new Error("Custom agent registry is invalid.");
+    const agents: CustomAgentRegistration[] = [];
+    let skipped = 0;
+    let firstReason: string | undefined;
+    for (const [index, entry] of entries.entries()) {
+      try {
+        if (index >= maxRegistrations) {
+          throw new Error(`Custom agent registry is limited to ${maxRegistrations} agents.`);
+        }
+        const registration = validatedRegistration(entry);
+        if (agents.some((agent) => agent.id === registration.id)) {
+          throw new Error(`Custom agent ${registration.id} is defined twice.`);
+        }
+        validateClaimConflicts([...agents, registration]);
+        agents.push(registration);
+      } catch (error) {
+        skipped++;
+        firstReason ??= reason(error);
+      }
     }
-    const agents = value.agents.map(validatedRegistration);
-    const ids = new Set(agents.map((agent) => agent.id));
-    if (ids.size !== agents.length) {
-      throw new Error("Custom agent registry contains duplicate IDs.");
+    agents.sort((left, right) => left.id.localeCompare(right.id));
+    if (skipped === 0) return { agents };
+    return {
+      agents,
+      problem: `${skipped} of ${entries.length} custom agent definitions in ${this.#path} ` +
+        `were skipped (${firstReason ?? "invalid"}). Built-in agents and the other definitions ` +
+        "are still discovered. Fix the file, or remove it and add the agents again with " +
+        "phigon-observer agent add.",
+    };
+  }
+
+  #fileProblem(cause: string): string {
+    return `The custom agent file ${this.#path} ${cause}, so custom agents are not discovered ` +
+      "until it is fixed. Built-in agents are still discovered. Fix the file, or remove it " +
+      "and add the agents again with phigon-observer agent add.";
+  }
+
+  /**
+   * Every definition, or an error when any is damaged: a change starts from
+   * a sound file, so it never quietly drops definitions it could not read.
+   */
+  async #readForChange(): Promise<readonly CustomAgentRegistration[]> {
+    try {
+      let raw: string;
+      try {
+        raw = await readFile(this.#path, "utf8");
+      } catch (error) {
+        if (isNodeError(error) && error.code === "ENOENT") return [];
+        throw error;
+      }
+      const entries = parsedEntries(raw);
+      if (entries.length > maxRegistrations) {
+        throw new Error("Custom agent registry is invalid.");
+      }
+      const agents = entries.map(validatedRegistration);
+      const ids = new Set(agents.map((agent) => agent.id));
+      if (ids.size !== agents.length) {
+        throw new Error("Custom agent registry contains duplicate IDs.");
+      }
+      validateClaimConflicts(agents);
+      return agents.sort((left, right) => left.id.localeCompare(right.id));
+    } catch (error) {
+      throw new Error(
+        `The custom agent file ${this.#path} is damaged (${reason(error)}), so it was not changed. ` +
+          "Fix the file, or remove it and add the agents again.",
+      );
     }
-    validateClaimConflicts(agents);
-    return agents.sort((left, right) => left.id.localeCompare(right.id));
   }
 
   async add(
     value: CustomAgentRegistration,
   ): Promise<CustomAgentRegistration> {
     const registration = validatedRegistration(value);
-    const existing = await this.list();
+    const existing = await this.#readForChange();
     if (existing.some((agent) => agent.id === registration.id)) {
       throw new Error(
         `Custom agent ${registration.id} already exists; remove it before replacing its monitoring definition.`,
@@ -116,7 +209,7 @@ export class CustomAgentRegistry {
 
   async remove(id: string): Promise<CustomAgentRegistration | undefined> {
     const normalizedID = validatedID(id);
-    const existing = await this.list();
+    const existing = await this.#readForChange();
     const removed = existing.find((agent) => agent.id === normalizedID);
     if (removed === undefined) return undefined;
     await this.#save(existing.filter((agent) => agent.id !== normalizedID));
@@ -148,6 +241,35 @@ export class CustomAgentRegistry {
       throw error;
     }
   }
+}
+
+/** The `agents` array of a registry file, or an error saying what is wrong. */
+function parsedEntries(raw: string): readonly unknown[] {
+  if (Buffer.byteLength(raw, "utf8") > maxRegistryBytes) {
+    throw new Error("Custom agent registry exceeds the 1 MiB safety limit.");
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new Error("Custom agent registry is not valid JSON.");
+  }
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    !("version" in value) ||
+    value.version !== registryVersion ||
+    !("agents" in value) ||
+    !Array.isArray(value.agents)
+  ) {
+    throw new Error("Custom agent registry is invalid.");
+  }
+  return value.agents as readonly unknown[];
+}
+
+function reason(error: unknown): string {
+  const message = error instanceof Error ? error.message : "invalid";
+  return message.replace(/\s+/gu, " ").replace(/\.$/u, "").slice(0, 200);
 }
 
 export function customAgentRegistration(

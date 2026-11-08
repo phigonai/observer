@@ -1,5 +1,6 @@
 export * from "./engine.js";
 export * from "./evidence.js";
+export * from "./explain.js";
 export * from "./system-evidence.js";
 export * from "./types.js";
 export { claudeAdapter } from "./adapters/claude.js";

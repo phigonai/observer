@@ -23,7 +23,10 @@ const genericAgents: readonly KnownAgentSpec[] = [
     executableNames: ["amp"],
     processNames: ["amp"],
     scriptPackages: ["@sourcegraph/amp"],
-    configurationPaths: ["~/.config/amp"],
+    // The amp text editor shares the name and ~/.config/amp (config.yml);
+    // Amp keeps settings.json there.
+    sharedNames: ["amp"],
+    configurationPaths: ["~/.config/amp/settings.json"],
     capabilities: ["activity", "filesystem", "git", "terminal"],
   },
   {
@@ -80,8 +83,13 @@ const genericAgents: readonly KnownAgentSpec[] = [
     kind: AgentKind.GENERIC,
     displayName: "Goose",
     executableNames: ["goose"],
-    processNames: ["goose"],
-    configurationPaths: ["~/.config/goose"],
+    // goosed is the agent server of the Goose desktop application.
+    processNames: ["goose", "goosed"],
+    // The goose database migration tool (pressly/goose) has the same name.
+    sharedNames: ["goose"],
+    // Block's goose keeps its configuration here (etcetera's Block/goose
+    // folder on Windows); the migration tool does not.
+    configurationPaths: ["~/.config/goose", "~/AppData/Roaming/Block/goose"],
     capabilities: ["activity", "filesystem", "mcp", "terminal"],
   },
   {
@@ -91,6 +99,12 @@ const genericAgents: readonly KnownAgentSpec[] = [
     executableNames: ["copilot"],
     processNames: ["copilot"],
     scriptPackages: ["@github/copilot"],
+    // The AWS Copilot CLI has the same name. GitHub's is identified by
+    // ~/.copilot, whether installed natively (WinGet, Homebrew, the install
+    // script) or with npm, where it also runs as node with its package.
+    sharedNames: ["copilot"],
+    // "GitHub Copilot CLI 1.0.41."; AWS's prints "copilot version: v1.34.1".
+    versionBanner: /^GitHub Copilot CLI\b/u,
     configurationPaths: ["~/.copilot"],
     capabilities: [
       "activity",
@@ -234,9 +248,20 @@ const genericAgents: readonly KnownAgentSpec[] = [
     id: "generic:amazon-q",
     kind: AgentKind.GENERIC,
     displayName: "Amazon Q Developer CLI",
-    executableNames: ["q"],
-    processNames: ["q"],
-    configurationPaths: ["~/.aws/amazonq"],
+    // Amazon Q installs qchat beside q, and its agent runs as qchat (`q chat`
+    // starts it). A q command or process is never used: kdb+ and other
+    // tools are also called q, and kdb+'s q server is a long-running process
+    // an administrator must not stop by mistake. qchat, its configuration
+    // or its data folder shows that Amazon Q is installed.
+    executableNames: ["qchat"],
+    processNames: ["qchat"],
+    configurationPaths: [
+      "~/.aws/amazonq",
+      "/Applications/Amazon Q.app",
+      // Its data folder on Linux and macOS.
+      "~/.local/share/amazon-q",
+      "~/Library/Application Support/amazon-q",
+    ],
     capabilities: ["activity", "filesystem", "terminal"],
   },
   {

@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -254,6 +255,103 @@ test("a running observer is recognised when the clock was corrected between its 
     const otherProcess = { ...options, processStartedAt: () => Promise.resolve(now - 60_000) };
     assert.deepEqual(await InstanceLock.inspect(directory, otherProcess), { running: false });
     await lock.release();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("observers that take over the same stale lock at once leave exactly one holder", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-instance-lock-race-"));
+  const path = join(directory, "observer.lock");
+  const stalePid = 424_242;
+  const startedAt = new Date(Date.now() - 1_000);
+  // Each racer stands for its own observer process; only the stale holder is gone.
+  const racer = (pid: number) => InstanceLock.acquire(directory, {
+    pid,
+    startedAt,
+    isAlive: (candidate) => candidate !== stalePid,
+    processStartedAt: async () => startedAt.getTime(),
+  });
+  try {
+    for (let round = 0; round < 40; round++) {
+      await writeFile(path, JSON.stringify({ pid: stalePid, started_at: new Date(0).toISOString() }));
+      const results = await Promise.allSettled(
+        Array.from({ length: 6 }, (_, index) => racer(10_000 + round * 10 + index)),
+      );
+      const holders = results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+      for (const result of results) {
+        if (result.status === "rejected") {
+          assert.ok(result.reason instanceof ObserverAlreadyRunningError, String(result.reason));
+        }
+      }
+      assert.equal(holders.length, 1, `round ${round}: ${holders.length} observers hold the data directory`);
+      const held = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+      assert.ok(typeof held["pid"] === "number" && held["pid"] >= 10_000);
+      await Promise.all(holders.map((holder) => holder.release()));
+    }
+    // Takeover markers are cleaned up.
+    assert.deepEqual((await readdir(directory)).filter((name) => name.includes("takeover")), []);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a takeover left unfinished by an observer that died does not block the lock; one in progress does", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-instance-lock-marker-"));
+  const path = join(directory, "observer.lock");
+  const stale = JSON.stringify({ pid: 424_242, started_at: new Date(0).toISOString() });
+  const marker = `${path}.takeover-${createHash("sha256").update(stale).digest("hex").slice(0, 16)}-0.tmp`;
+  const startedAt = Date.now() - 1_000;
+  const options = {
+    isAlive: (pid: number) => pid === 515_151,
+    processStartedAt: async () => startedAt,
+  };
+  try {
+    await writeFile(path, stale);
+    await writeFile(marker, JSON.stringify({ pid: 616_161, started_at: new Date(startedAt).toISOString() }));
+    const lock = await InstanceLock.acquire(directory, { ...options, pid: 717_171 });
+    assert.equal(JSON.parse(await readFile(path, "utf8")).pid, 717_171);
+    await lock.release();
+    assert.deepEqual((await readdir(directory)).filter((name) => name.includes("takeover")), []);
+
+    await writeFile(path, stale);
+    await writeFile(marker, JSON.stringify({ pid: 515_151, started_at: new Date(startedAt).toISOString() }));
+    await assert.rejects(InstanceLock.acquire(directory, { ...options, pid: 717_171 }), ObserverAlreadyRunningError);
+    assert.equal(await readFile(path, "utf8"), stale);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("any number of takeovers that died part-way never keep the lock from being taken over", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-instance-lock-markers-"));
+  const path = join(directory, "observer.lock");
+  const stale = JSON.stringify({ pid: 424_242, started_at: new Date(0).toISOString() });
+  const digest = createHash("sha256").update(stale).digest("hex").slice(0, 16);
+  const startedAt = Date.now() - 1_000;
+  const options = { isAlive: (pid: number) => pid === 717_171, processStartedAt: async () => startedAt };
+  const dead = (pid: number) => JSON.stringify({ pid, started_at: new Date(startedAt).toISOString() });
+  try {
+    await writeFile(path, stale);
+    // Forty observers were stopped between their marker and the lock's
+    // replacement, far more than any fixed number of attempts allows; and
+    // one left a marker for an older lock.
+    for (let generation = 0; generation < 40; generation++) {
+      await writeFile(`${path}.takeover-${digest}-${generation}.tmp`, dead(600_000 + generation));
+    }
+    await writeFile(`${path}.takeover-0123456789abcdef-3.tmp`, dead(699_999));
+    const lock = await InstanceLock.acquire(directory, { ...options, pid: 717_171 });
+    assert.equal(JSON.parse(await readFile(path, "utf8")).pid, 717_171);
+    // Every marker is gone once the lock is held.
+    assert.deepEqual((await readdir(directory)).filter((name) => name.includes("takeover")), []);
+    await lock.release();
+
+    // The highest marker belongs to a live observer: it is taking over.
+    await writeFile(path, stale);
+    await writeFile(`${path}.takeover-${digest}-0.tmp`, dead(600_000));
+    await writeFile(`${path}.takeover-${digest}-1.tmp`, dead(717_171));
+    await assert.rejects(InstanceLock.acquire(directory, { ...options, pid: 818_181 }), ObserverAlreadyRunningError);
+    assert.equal(await readFile(path, "utf8"), stale);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

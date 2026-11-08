@@ -46,6 +46,7 @@ import {
 } from "./custom-agent-registry.js";
 import {
   DiscoveryEngine,
+  formatDetections,
   runDiscoveryLoop,
   type DiscoverySnapshot,
 } from "./discovery/index.js";
@@ -81,6 +82,7 @@ import {
   enrollmentCodeVariable,
   type EnrollResult,
 } from "./enroll.js";
+import { runLogsCommand } from "./logs-command.js";
 import { removeMachine } from "./remove-machine.js";
 import { addDefaultAuthority, forgetServerAuthority, parseAuthorityFingerprint } from "./server-authority.js";
 import { useServerProxy } from "./server-fetch.js";
@@ -89,6 +91,7 @@ import { preparePairingAuthority } from "./server-move.js";
 import { pairingChanged, pairingChangedExitCode, watchPairing, type PairingChange, type PairingWatch } from "./pairing-watch.js";
 import { moveServiceEndpoints, readServiceSettings, serviceSettingsPath, startService, stopService, uninstallService } from "./service.js";
 import {
+  backgroundServiceProblem,
   installServiceAfterPairing,
   restartServiceAfterUpdate,
   runServiceCommand,
@@ -137,6 +140,7 @@ import {
   RotatingLogFile,
   levelledOutput,
   logLevelFrom,
+  serviceConsole,
   type LevelledOutput,
 } from "./observer-log.js";
 
@@ -204,13 +208,20 @@ export async function run(
     const log = new RotatingLogFile(dataDirectoryFrom(environment), {
       onFailure: (message) => output.stderr(message),
     });
-    logged = levelledOutput(output, logLevelFrom(environment["PHIGON_LOG_LEVEL"]), log);
+    // A LaunchAgent's stderr is a file nothing rotates: the log takes over.
+    const darwinService = serviceSettingsFile !== undefined && process.platform === "darwin" && output === defaultOutput;
+    logged = levelledOutput(darwinService ? serviceConsole(output, log) : output, logLevelFrom(environment["PHIGON_LOG_LEVEL"]), log);
     output = logged;
   }
 
   let callerEnvironment = environment;
   let proxy: ProxySetup | undefined;
   try {
+    // `logs` needs only the data directory: it must work when a bad
+    // endpoint or other setting is what stops the observer.
+    if (command === "logs") {
+      return await runLogsCommand(flags, dataDirectoryFrom(environment), output);
+    }
     if (serviceSettingsFile !== undefined) {
       const dataDirectory = dirname(resolve(serviceSettingsFile));
       // A move to a new server address that stopped between its two writes
@@ -269,8 +280,11 @@ export async function run(
         return latest === null ? 1 : 0;
       }
     }
+    // A damaged custom-agents.json is skipped with one warning; built-in
+    // discovery keeps working.
     const customAgentRegistry = new CustomAgentRegistry(
       config.dataDirectory,
+      { onProblem: (message) => output.stderr(`${message}\n`) },
     );
 
     if (command === "service") {
@@ -656,10 +670,12 @@ export async function run(
       }).discover(
         storedCredential?.machineId ?? "",
       );
+      // --explain: why each agent was detected (local evidence, never sent).
+      const explain = flags.includes("--explain");
       output.stdout(
         json
-          ? formatDiscoveryJSON(snapshot)
-          : formatDiscovery(snapshot),
+          ? formatDiscoveryJSON(snapshot, explain)
+          : `${formatDiscovery(snapshot)}${explain ? `\n${formatDetections(snapshot.detections)}` : ""}`,
       );
       return 0;
     }
@@ -1315,8 +1331,19 @@ export async function run(
       storedCredential === null ? undefined : consentHealth(storedCredential),
       await readObserverStatus(config.dataDirectory),
     );
+    // Read without the warning: doctor shows the problem itself.
+    const customAgents = await new CustomAgentRegistry(config.dataDirectory).read();
+    // A service left pointing at a Node.js a version manager removed.
+    const serviceProblem = await backgroundServiceProblem(config, callerEnvironment, dependencies);
     output.stdout(
-      json ? `${JSON.stringify(health, null, 2)}\n` : formatHealth(health),
+      json
+        ? `${JSON.stringify({
+          ...health,
+          customAgents: { definitions: customAgents.agents.length, ...(customAgents.problem === undefined ? {} : { problem: customAgents.problem }) },
+          ...(serviceProblem === undefined ? {} : { backgroundService: { problem: serviceProblem } }),
+        }, null, 2)}\n`
+        : `${formatHealth(health)}${customAgents.problem === undefined ? "" : `Custom agents: ${customAgents.problem}\n`}` +
+          `${serviceProblem === undefined ? "" : `Background service: ${serviceProblem}\n`}`,
     );
     return 0;
   } catch (error) {
@@ -1704,8 +1731,8 @@ const removedRecheckMs = 60 * 60_000;
 
 /**
  * How `run` exits on a computer the workspace removed. A background service
- * exits cleanly: systemd then leaves it stopped, and on Windows and macOS,
- * which start it again anyway, the next start stops at once. A person
+ * exits cleanly: systemd and launchd then leave it stopped, and on Windows,
+ * whose task starts it again anyway, the next start stops at once. A person
  * running it in a terminal sees a failure.
  */
 function removedExitCode(service: boolean): number {
@@ -1804,7 +1831,7 @@ function helpText(): string {
     "  phigon-observer doctor --check [--max-delivery-age <minutes>] [--json]",
     "  phigon-observer update [--check] [--yes] [--json]",
     "  phigon-observer --version",
-    "  phigon-observer discover [--json]",
+    "  phigon-observer discover [--explain] [--json]",
     "  phigon-observer ingest --agent <agent-id|custom> [--name <agent-name>] [--quiet] [--json]",
     "  phigon-observer pair --code <one-time-code> --consent-profile <metadata|full> [--control-plane-url <url> --grpc-url <url> [--server-ca-sha256 <fingerprint>]] [--name <machine-name>] [--accept-consent] [--no-service] [--remote-actions <all|stop-agents|none>] [--json]",
     "  PHIGON_ENROLLMENT_CODE=<code> phigon-observer pair [--control-plane-url <url> --grpc-url <url> [--server-ca-sha256 <fingerprint>]] [--name <machine-name>] [--remote-actions <all|stop-agents|none>] [--json]",
@@ -1815,6 +1842,7 @@ function helpText(): string {
     "  phigon-observer service install [--profile <metadata|full>] [--json]",
     "  phigon-observer service uninstall [--json]",
     "  phigon-observer service status [--json]",
+    "  phigon-observer logs [--tail <lines>] [--follow]",
     "  phigon-observer help",
     "",
     "The doctor command validates local configuration without transmitting data. With --check it also probes the control plane and exits non-zero when something needs attention: 3 not paired, 4 consent missing or outdated, 5 observer not running, 6 nothing delivered within --max-delivery-age minutes (default 15), 7 control plane unreachable.",
@@ -1824,14 +1852,15 @@ function helpText(): string {
     "The guardian status command reports central management. Only administrator policies authorize blocking and containment; local overrides are unavailable.",
     "The guardian exec command checks agent.start and command.execute, launches without a shell after authorization, and journals command input/output and its exit code for hosted telemetry delivery.",
     "The guardian launch command requires a model claim and a single-use grant covering agent.start, model.use, and command.execute. The native supervisor stops the managed process tree when its online lease is revoked or unavailable.",
-    "The discover command reports a sanitized one-time local inventory.",
+    "The discover command reports a sanitized one-time local inventory. With --explain it also shows, for each agent, the evidence that identified it, the adapter and how sure discovery is, and what was set aside because other programs share an agent's name.",
     "The ingest command accepts NDJSON on stdin for every supported bridge; use --agent custom --name <agent-name> for any other agent.",
     "The pair command shows the selected collection scope, requires machine-owner acceptance, and stores that evidence with the mode-0600 credential.",
     "The owner also decides what the company's administrators may do on the computer: --remote-actions all (stop agents and run the commands they approve), stop-agents or none. At the prompt the default is all, and the prompt says so. With --accept-consent there is no prompt, so the default is none. --no-remote-commands (stop-agents) and --no-remote-actions (none) still work.",
     "With a company's enrollment code (phe_...), pair asks nothing: the company has given consent and chosen the profile, which the observer stores and keeps collection within. Administrators may stop agents and run the commands they approve unless --remote-actions says less. Prefer PHIGON_ENROLLMENT_CODE to --enrollment-code, which shows in process lists. The code is never printed or stored. A busy server is retried a few times. Exit codes: 20 try again later, 21 the code expired, was revoked, is used up or outdated, 22 not a valid code, 23 this computer already used this code, 24 already connected to this workspace. Then run phigon-observer service install.",
     "The remove-machine command stops collection on this paired machine and revokes its credential; activity already collected stays until an administrator deletes the machine or it expires. It requires local confirmation. With --purge it also removes the background service and every file the observer keeps in the data directory. unpair is another name for it.",
     "The run command maintains an authenticated, resumable telemetry stream; --profile applies the same portable local collection profile on Windows, macOS, and Linux.",
-    "The service commands run the observer in the background for the signed-in user (a Task Scheduler task, a LaunchAgent or a systemd user unit) with this data directory and these settings, starting it at sign-in and again if it stops. Install needs a paired computer with the owner's consent.",
+    "The service commands run the observer in the background for the signed-in user (a Task Scheduler task, a LaunchAgent or a systemd user unit) with this data directory and these settings, starting it at sign-in and again if it stops. Install needs a paired computer with the owner's consent. Status also says why a stopped service cannot start, what the service manager reported, and the last error in the log.",
+    "The logs command prints the last lines of the observer log (50 unless --tail says otherwise); --follow keeps printing new lines until interrupted.",
     "A command, option or value the observer does not know stops the command before it does anything, with exit code 2. Options go before --; everything after -- belongs to the program guardian exec or launch runs.",
     "",
   ].join("\n");
@@ -1861,13 +1890,14 @@ function parseOptionalProcessID(value: string | undefined): number | undefined {
   return parsed;
 }
 
-function formatDiscoveryJSON(snapshot: DiscoverySnapshot): string {
+function formatDiscoveryJSON(snapshot: DiscoverySnapshot, explain = false): string {
   return `${JSON.stringify(
     {
       inventory: JSON.parse(
         toJsonString(AgentInventorySchema, snapshot.inventory),
       ),
       adapterHealth: snapshot.adapterHealth,
+      ...(explain ? { detections: snapshot.detections } : {}),
     },
     null,
     2,

@@ -8,10 +8,14 @@ import { serverFetch } from "./server-fetch.js";
 /**
  * Remembers that the workspace no longer accepts this computer's key, so a
  * background service that starts the observer again (every minute on
- * Windows, every 30 seconds on macOS) stops at once instead of scanning for
- * agents and failing again; systemd does not restart a service that exits
- * cleanly. Pairing again gives the computer a new key, which this file does
- * not match, so the observer starts normally.
+ * Windows, and at the next sign-in everywhere) stops at once instead of
+ * scanning for agents and failing again. The service then exits cleanly,
+ * which systemd (Restart=on-failure) and launchd (KeepAlive with
+ * SuccessfulExit false) do not restart. A LaunchAgent written by an older
+ * observer, with KeepAlive true, still starts it every 30 seconds until the
+ * service is installed again, which `update` does.
+ * Pairing again gives the computer a new key, which this file does not
+ * match, so the observer starts normally.
  */
 export const machineRemovedFileName = "machine-removed.json";
 

@@ -99,7 +99,7 @@ export const commandOptions: Readonly<Record<string, CommandSpec>> = {
     },
   },
   update: { options: { "--check": {}, "--yes": {}, ...json } },
-  discover: { options: json },
+  discover: { options: { "--explain": {}, ...json } },
   ingest: {
     options: {
       "--agent": { value: "<agent-id|custom>" },
@@ -141,6 +141,8 @@ export const commandOptions: Readonly<Record<string, CommandSpec>> = {
   "service install": { options: { ...profile, ...json } },
   "service uninstall": { options: json },
   "service status": { options: json },
+  // Without --tail it prints the last 50 lines.
+  logs: { options: { "--tail": { value: "<lines>" }, "--follow": {} } },
 };
 
 /** The subcommand a command runs when none is named. */

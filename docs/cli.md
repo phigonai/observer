@@ -17,6 +17,7 @@ phigon-observer help                    # the short form of this page
 | [`pair` with an enrollment code](#pair-with-an-enrollment-code) | Connect many computers at once with a company's code. |
 | [`run`](#run) | Find agents and stream the activity the owner allowed. |
 | [`service`](#service) | Keep the observer running in the background. |
+| [`logs`](#logs) | Show what the observer has been doing. |
 | [`doctor`](#doctor) | Check the setup, and whether collection works. |
 | [`update`](#update) | Install a new release. |
 | [`discover`](#discover) | List the AI agents on this computer once. |
@@ -207,6 +208,36 @@ consent covers. Use it after pairing with `--no-service`, or to change the
 profile. `status` says whether the service is installed and running.
 `uninstall` removes it; the pairing stays.
 
+When the service is stopped, `status` also says why it cannot start, what the
+service manager last reported (launchd's exit code, systemd's result, Task
+Scheduler's last result) and the time and message of the last error in the
+observer log, with any secret masked. `--json` adds them as `problem`,
+`serviceManager` and `lastError`.
+
+The service runs the Node.js that ran `service install`, by its full path.
+A version manager such as nvm, Volta or mise can remove that Node.js later;
+`status` and `doctor` then say so, and running `phigon-observer service
+install` again from a terminal where `phigon-observer` works fixes it. When
+the service cannot start the observer, for example because its Node.js is
+too old, the reason is written to `logs/observer.log`. On macOS what Node.js
+itself prints, such as a crash, goes to `logs/service-errors.log`. On Linux it
+stays in the journal (`journalctl --user -u phigon-observer`).
+
+A computer the workspace removed stops its observer for good: systemd and
+launchd do not start it again, and on Windows each start stops at once.
+
+## logs
+
+```sh
+phigon-observer logs [--tail <lines>] [--follow]
+```
+
+Prints the last lines of `logs/observer.log` in the data directory, which the
+background service writes: 50 lines, or as many as `--tail` says (1 to
+10000), reading on into the older files when the log was rotated.
+`--follow` then keeps printing new lines until you press Ctrl+C. Secrets that
+look like keys or passwords are masked on the way out.
+
 ## doctor
 
 ```sh
@@ -216,7 +247,10 @@ phigon-observer doctor --check [--max-delivery-age <minutes>] [--json]
 
 Plain `doctor` checks the local setup without sending anything, and exits
 `0` unless a setting is invalid. It reports what the background service
-collects; `--profile` shows what that profile would collect instead.
+collects; `--profile` shows what that profile would collect instead. It also
+names a damaged `custom-agents.json`, whose bad definitions are skipped while
+built-in agents are still discovered, and a background service that cannot
+start because its Node.js or observer is gone.
 
 `doctor --check` also asks the server whether it answers, through the same
 proxy and pinned certificate authority the observer uses. It sends no
@@ -263,11 +297,22 @@ update on their own. `PHIGON_UPDATE_CHECK=false` turns the daily check off.
 ## discover
 
 ```sh
-phigon-observer discover [--json]
+phigon-observer discover [--explain] [--json]
 ```
 
 Prints which AI agents are installed and running on this computer, once. It
 reads only local, sanitized information and sends nothing.
+
+`--explain` also says why each agent was detected: the evidence (a running
+process, an npm package, a command on `PATH` and its version, a
+configuration folder), the adapter that found it, how sure discovery is
+(`high` for a process of its own, `medium` for an installation, `low` when a
+same-named program was set aside) and whether an administrator could stop it
+from Phigon. It then lists what was set aside: some names, such as `q`,
+`goose`, `copilot`, `hermes` and `amp`, belong to other programs too, so a
+process or command with one of them is never treated as an agent, and never
+stopped, unless the agent's own configuration, process name or npm package
+identifies it. With `--json` the same information is in `detections`.
 
 ## agent
 
@@ -462,6 +507,7 @@ All in the data directory, readable by the owner only.
 | `server-endpoints.json` | The server's network address, learned from the server, so the observer can move between it and the relay. |
 | `service-settings.json` | The settings the background service runs with. |
 | `logs/observer.log` | What `run` prints. Rotated at about 5 MB; three files are kept. |
+| `logs/service-errors.log` | macOS only: what Node.js itself printed under the LaunchAgent, such as a crash. Kept small. |
 | `observer.lock` | Makes sure only one observer runs with this data directory. |
 | The queue and checkpoints | Activity not yet delivered, encrypted, and how far each agent's records were read. |
 

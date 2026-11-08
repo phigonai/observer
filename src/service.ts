@@ -4,6 +4,7 @@ import { chmod, mkdir, readFile, rm, stat, unlink, writeFile } from "node:fs/pro
 import { dirname, isAbsolute, join, posix, win32 } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { atomicReplace } from "./atomic-replace.js";
+import { logDirectoryName, serviceErrorsFileName } from "./observer-log.js";
 import { makeDirectoryPrivate } from "./private-directory.js";
 
 /**
@@ -205,7 +206,13 @@ export function windowsTaskXml(context: ServiceContext): string {
 `;
 }
 
-/** A LaunchAgent that starts at sign-in and is started again if it stops. */
+/**
+ * A LaunchAgent that starts at sign-in and is started again if it fails.
+ * Like the systemd unit's Restart=on-failure, a clean exit is final: `run`
+ * exits with 0 on a computer the workspace removed, and launchd would
+ * otherwise start it again every ThrottleInterval, for good. A pairing
+ * change exits with 75 and is started again.
+ */
 export function launchAgentPlist(context: ServiceContext): string {
   const program = serviceCommand(context).map((value) => `    <string>${xml(value)}</string>`).join("\n");
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -223,7 +230,10 @@ ${program}
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
   <key>ThrottleInterval</key>
   <integer>30</integer>
   <key>ProcessType</key>
@@ -233,10 +243,19 @@ ${program}
   <key>StandardOutPath</key>
   <string>/dev/null</string>
   <key>StandardErrorPath</key>
-  <string>/dev/null</string>
+  <string>${xml(serviceErrorsPath(context))}</string>
 </dict>
 </plist>
 `;
+}
+
+/**
+ * The LaunchAgent's stderr: what Node.js itself prints when it cannot
+ * start the observer or crashes. The observer keeps it small (see
+ * trimServiceErrors) and writes its own messages to observer.log.
+ */
+function serviceErrorsPath(context: ServiceContext): string {
+  return posix.join(checkedPath(context.dataDirectory, "macos", "data directory"), logDirectoryName, serviceErrorsFileName);
 }
 
 /** A systemd user unit, restarted when it fails. */
@@ -475,6 +494,10 @@ export async function installService(
   }
   const definition = serviceDefinitionPath(context)!;
   await mkdir(dirname(definition), { recursive: true, mode: 0o755 });
+  // launchd opens the LaunchAgent's stderr file but does not create its folder.
+  if (context.platform === "macos") {
+    await mkdir(join(context.dataDirectory, logDirectoryName), { recursive: true, mode: 0o700 });
+  }
   const content = context.platform === "macos" ? launchAgentPlist(context) : systemdUserUnit(context);
   const temporary = `${definition}.${randomUUID()}.tmp`;
   await writeFile(temporary, content, { encoding: "utf8", mode: 0o644 });
@@ -566,6 +589,133 @@ export async function uninstallService(context: ServiceContext): Promise<boolean
   }
   await rm(serviceSettingsPath(context.dataDirectory), { force: true });
   return installed;
+}
+
+// ---------------------------------------------------------------------------
+// What the installed service runs, and what its service manager says.
+
+/** The Node.js and observer entry point an installed service starts. */
+export type ServiceProgram = Readonly<{ node: string; entry: string }>;
+
+function unxml(value: string): string {
+  return value.replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&quot;", "\"")
+    .replaceAll("&apos;", "'").replaceAll("&amp;", "&");
+}
+
+/** The program a LaunchAgent plist runs, as launchAgentPlist writes it. */
+export function programFromPlist(text: string): ServiceProgram | undefined {
+  const array = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/u.exec(text)?.[1];
+  if (array === undefined) return undefined;
+  const [node, entry] = [...array.matchAll(/<string>([\s\S]*?)<\/string>/gu)].map((match) => unxml(match[1] ?? ""));
+  return node === undefined || entry === undefined ? undefined : { node, entry };
+}
+
+/** The program a systemd unit's ExecStart runs, as systemdUserUnit quotes it. */
+export function programFromUnit(text: string): ServiceProgram | undefined {
+  const line = /^ExecStart=(.*)$/mu.exec(text)?.[1];
+  if (line === undefined) return undefined;
+  const [node, entry] = [...line.matchAll(/"((?:[^"\\]|\\.)*)"/gu)].map((match) =>
+    (match[1] ?? "").replace(/\\(.)|%%|\$\$/gu, (escaped: string, character: string | undefined) =>
+      character ?? escaped.slice(1)));
+  return node === undefined || entry === undefined ? undefined : { node, entry };
+}
+
+/** The program a Task Scheduler task runs through conhost, as windowsTaskXml writes it. */
+export function programFromTaskXml(text: string): ServiceProgram | undefined {
+  const argumentsText = /<Arguments>([\s\S]*?)<\/Arguments>/u.exec(text)?.[1];
+  if (argumentsText === undefined) return undefined;
+  const [node, entry] = [...unxml(argumentsText).matchAll(/"([^"]*)"/gu)].map((match) => match[1] ?? "");
+  return node === undefined || entry === undefined ? undefined : { node, entry };
+}
+
+/**
+ * What the installed service starts, read from its definition, or
+ * undefined when it is not installed or cannot be read.
+ */
+export async function installedServiceProgram(context: ServiceContext): Promise<ServiceProgram | undefined> {
+  try {
+    if (context.platform === "windows") {
+      const result = await context.run(windowsTool(context, "schtasks.exe"), ["/Query", "/TN", serviceName(context), "/XML"]);
+      return result.code === 0 && result.missing !== true ? programFromTaskXml(result.stdout) : undefined;
+    }
+    const text = await readFile(serviceDefinitionPath(context)!, "utf8");
+    return context.platform === "macos" ? programFromPlist(text) : programFromUnit(text);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Why the installed service cannot start, in one plain sentence: the
+ * Node.js or observer it was installed with is gone, as after a version
+ * manager such as nvm, Volta or mise removed that Node.js. Undefined when
+ * both exist or this cannot be told.
+ */
+export async function serviceProgramProblem(
+  context: ServiceContext,
+  exists: (path: string) => Promise<boolean> = async (path) => await stat(path).then(() => true, () => false),
+): Promise<string | undefined> {
+  const program = await installedServiceProgram(context);
+  if (program === undefined) return undefined;
+  // schtasks may print a path in another code page; a path it garbled is
+  // not reported as missing.
+  const readable = (path: string) => context.platform !== "windows" || /^[\x20-\x7e]*$/u.test(path);
+  const again = "Run phigon-observer service install again from a terminal where phigon-observer works.";
+  if (readable(program.node) && !(await exists(program.node))) {
+    return `The background service starts Node.js from ${program.node}, which no longer exists, so it cannot run; ` +
+      `Node.js was probably upgraded or removed (for example with nvm, Volta or mise). ${again}`;
+  }
+  if (readable(program.entry) && !(await exists(program.entry))) {
+    return `The background service starts the observer from ${program.entry}, which no longer exists, so it cannot run; ` +
+      `the observer was probably removed or installed under another Node.js. ${again}`;
+  }
+  return undefined;
+}
+
+/**
+ * What the service manager says about the service's last exit, in one
+ * plain sentence, when it failed: launchd's last exit code, systemd's
+ * result, or Task Scheduler's last result. Undefined when it did not fail
+ * or cannot be asked.
+ */
+export async function serviceManagerProblem(context: ServiceContext): Promise<string | undefined> {
+  const name = serviceName(context);
+  try {
+    if (context.platform === "macos") {
+      const result = await context.run("launchctl", ["print", `gui/${context.user}/${name}`]);
+      if (result.code !== 0 || result.missing === true) return undefined;
+      const exit = /last exit code = (-?\d+)(?::\s*([^\n]+))?/u.exec(result.stdout);
+      if (exit === null || exit[1] === "0") return undefined;
+      return `launchd says the observer last exited with code ${exit[1]}${exit[2] === undefined ? "" : ` (${exit[2].trim()})`}.`;
+    }
+    if (context.platform === "linux") {
+      const result = await context.run("systemctl", [
+        "--user", "show", `${name}.service`, "--property=Result,ExecMainStatus,ExecMainExitTimestamp",
+      ]);
+      if (result.code !== 0 || result.missing === true) return undefined;
+      const property = (key: string) => new RegExp(`^${key}=(.*)$`, "mu").exec(result.stdout)?.[1]?.trim() ?? "";
+      const outcome = property("Result");
+      if (outcome === "" || outcome === "success") return undefined;
+      const status = property("ExecMainStatus");
+      const at = property("ExecMainExitTimestamp");
+      return `systemd says the service failed (${outcome}${status === "" || status === "0" ? "" : `, exit status ${status}`})` +
+        `${at === "" ? "" : ` at ${at}`}. See journalctl --user -u ${name}.service.`;
+    }
+    const result = await context.run(windowsTool(context, "schtasks.exe"), ["/Query", "/TN", name, "/V", "/FO", "CSV", "/NH"]);
+    if (result.code !== 0 || result.missing === true) return undefined;
+    // HostName, TaskName, Next Run Time, Status, Logon Mode, Last Run Time, Last Result, ...
+    const fields = [...(result.stdout.trim().split(/\r?\n/u)[0] ?? "").matchAll(/"([^"]*)"/gu)].map((match) => match[1] ?? "");
+    const code = Number(fields[6]);
+    // Success, still running, not run yet, ended by stopping the service,
+    // and a minute trigger refused because the observer already runs
+    // (0x800710E0, MultipleInstancesPolicy IgnoreNew).
+    if (!/^-?\d+$/u.test(fields[6] ?? "") || [0, 0x41301, 0x41303, 0x41306, 0x40010004, 0x800710e0].includes(code >>> 0)) {
+      return undefined;
+    }
+    return `Task Scheduler says the last run ended with result 0x${(code >>> 0).toString(16).toUpperCase()}.`;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Runs a program with execFile: no shell, no window, a time limit. */

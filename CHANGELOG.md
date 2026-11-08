@@ -73,7 +73,23 @@ from the matching `vX.Y.Z` tag in this repository.
     and refused if others can still read it or write to its folder.
   - An unreadable stream cursor is copied aside once, and only three copies
     are kept.
-- Background service and agent discovery fixes.
+- Background service and agent discovery fixes:
+  - Programs that only share an agent's name (kdb+'s `q`, the goose
+    migration tool, the AWS Copilot CLI, the Hermes engine and relayer, the
+    amp editor) are no longer reported as agents or offered to stop, unless
+    the agent's own configuration, process name or npm package is there.
+  - A damaged `custom-agents.json` is skipped with one warning instead of
+    stopping discovery; `doctor` names it.
+  - `update` installs with the npm of the Node.js running the observer and
+    checks that this installation got the new version.
+  - `service status` and `doctor` say when the service's Node.js or observer
+    is gone, as after a version manager removed it; `service status` also
+    shows the service manager's record and the last error in the log. Start
+    failures are written to the log, and on macOS what Node.js prints to
+    `logs/service-errors.log`.
+  - A removed Mac's LaunchAgent is no longer started again every 30 seconds.
+  - Exactly one observer takes over a stale `observer.lock`.
+  - New `logs [--tail <lines>] [--follow]` and `discover --explain`.
 - Guardian runner sandbox hardening.
 - CI and release hardening:
   - The release publishes only after the full test suite passes on Linux,

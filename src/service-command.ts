@@ -6,7 +6,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { contentOutsideProfileMessage, type ObserverConfig } from "./config.js";
 import { FileCredentialStore } from "./credential-store.js";
 import { InstanceLock } from "./instance-lock.js";
-import { logFilePath } from "./observer-log.js";
+import { lastLoggedError, logFilePath } from "./observer-log.js";
 import { OBSERVER_CONSENT_POLICY_VERSION } from "./pair.js";
 import { currentUserSID } from "./private-directory.js";
 import {
@@ -15,8 +15,10 @@ import {
   runCommand,
   serviceDefinitionPath,
   serviceInstalled,
+  serviceManagerProblem,
   serviceName,
   servicePlatform,
+  serviceProgramProblem,
   serviceSettings,
   serviceSettingsPath,
   startService,
@@ -196,6 +198,25 @@ export async function restartServiceAfterUpdate(
   }
 }
 
+/**
+ * For `doctor`: why the installed background service cannot start, such as
+ * a Node.js removed by a version manager, or undefined when nothing is
+ * wrong, no service is installed or this computer cannot have one.
+ */
+export async function backgroundServiceProblem(
+  config: ObserverConfig,
+  environment: NodeJS.ProcessEnv,
+  dependencies: ServiceDependencies = {},
+): Promise<string | undefined> {
+  try {
+    const context = serviceContext(config, environment, dependencies);
+    if (!(await serviceInstalled(context))) return undefined;
+    return await serviceProgramProblem(context);
+  } catch {
+    return undefined;
+  }
+}
+
 /** `service install | uninstall | status`. */
 export async function runServiceCommand(
   flags: readonly string[],
@@ -218,13 +239,26 @@ export async function runServiceCommand(
     const installed = await serviceInstalled(context);
     const running = (await InstanceLock.inspect(context.dataDirectory)).running;
     const state = !installed ? "not_installed" : running ? "running" : "stopped";
+    // A stopped service may not be able to start at all: say why.
+    const problem = installed && !running ? await serviceProgramProblem(context) : undefined;
+    // An earlier failed start does not matter while the observer runs.
+    const serviceManager = installed && !running ? await serviceManagerProblem(context) : undefined;
+    const lastError = await lastLoggedError(context.dataDirectory).catch(() => undefined);
     output.stdout(json
-      ? `${JSON.stringify({ state, installed, running, name, platform: context.platform, definition, dataDirectory: context.dataDirectory, logFile }, null, 2)}\n`
+      ? `${JSON.stringify({
+        state, installed, running, name, platform: context.platform, definition, dataDirectory: context.dataDirectory, logFile,
+        ...(problem === undefined ? {} : { problem }),
+        ...(serviceManager === undefined ? {} : { serviceManager }),
+        ...(lastError === undefined ? {} : { lastError }),
+      }, null, 2)}\n`
       : [
           `Background service: ${!installed ? "not installed" : running ? "installed and running" : "installed and stopped"}`,
           `Name: ${name}`,
           ...(installed ? [`Log: ${logFile}`] : []),
           ...(!installed && running ? ["An observer started by hand is running with this data directory."] : []),
+          ...(problem === undefined ? [] : [`Problem: ${problem}`]),
+          ...(serviceManager === undefined ? [] : [`Service manager: ${serviceManager}`]),
+          ...(lastError === undefined ? [] : [`Last error: ${lastError.at} ${lastError.message}`]),
           "",
         ].join("\n"));
     return 0;

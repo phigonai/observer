@@ -28,7 +28,7 @@ test("each message becomes timestamped lines without control characters", async 
       [
         "2026-11-02T10:00:00.000Z INFO  Telemetry stream connected.",
         "2026-11-02T10:00:00.000Z WARN  first line",
-        "2026-11-02T10:00:00.000Z WARN  second [31mline[0m",
+        "2026-11-02T10:00:00.000Z WARN  second line",
         "",
       ].join("\n"),
     );
@@ -36,6 +36,29 @@ test("each message becomes timestamped lines without control characters", async 
       assert.equal((await stat(logFilePath(directory))).mode & 0o777, 0o600);
       assert.equal((await stat(join(directory, "logs"))).mode & 0o777, 0o700);
     }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a credential in a logged message is stored masked, whoever logs it", async () => {
+  const directory = await temporaryDirectory();
+  // Built at run time so no token-shaped string sits in the source.
+  const machineKey = ["phg", "_m_", "q".repeat(43)].join("");
+  const bearer = ["eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiJtYWNoaW5lIn0", "c2lnbmF0dXJl"].join(".");
+  const password = ["hunter", "2-", "correct-horse"].join("");
+  try {
+    const log = new RotatingLogFile(directory, { now: () => new Date("2026-11-08T10:00:00.000Z") });
+    const logged = levelledOutput({ stdout: () => undefined, stderr: () => undefined }, "debug", log);
+    logged.error(`Observer command failed: the server answered 401 for Bearer ${bearer} with key ${machineKey}.\n`);
+    logged.stderr(`Telemetry delivery is paused (proxy http://observer:${password}@proxy.example.test:3128 refused).\n`);
+    log.write("warn", `password=${password}\n-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----\n`);
+    const stored = await readFile(logFilePath(directory), "utf8");
+    for (const secret of [machineKey, bearer, password, "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC"]) {
+      assert.ok(!stored.includes(secret), "a credential was written to the log");
+    }
+    assert.match(stored, /ERROR Observer command failed: the server answered 401 for Bearer \[REDACTED_SECRET\] with key \[REDACTED_SECRET\]\./u);
+    assert.match(stored, /WARN {2}Telemetry delivery is paused \(proxy http:\/\/\[REDACTED_SECRET\]@proxy\.example\.test:3128 refused\)\./u);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
