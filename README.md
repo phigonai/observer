@@ -25,6 +25,17 @@
   <a href="https://x.com/phigonai">X</a>
 </p>
 
+> [!NOTE]
+> **This repository is a copy of the observer from Phigon's private main
+> repository.** The maintainers work there, and every change is synced here
+> automatically, commit by commit, so the code you read here is exactly what
+> is released to npm.
+>
+> **Pull requests and issues are welcome here.** A maintainer applies an
+> accepted pull request in the main repository, keeping you as its author,
+> and it comes back here with the next sync. See
+> [CONTRIBUTING.md](CONTRIBUTING.md).
+
 The Phigon Observer runs on a computer where people use AI coding agents such as
 Claude Code, Codex, Cursor and GitHub Copilot. It finds the agents, records what
 they do within the scope that was agreed for that computer, removes secrets on
