@@ -43,12 +43,12 @@
     "check": "npm run lint && npm run typecheck && npm run test"
   },
   "devDependencies": {
-    "@bufbuild/protoc-gen-es": "2.13.0",
-    "@types/node": "24.13.3",
-    "eslint": "10.8.0",
-    "tsx": "4.23.1",
-    "typescript": "5.9.3",
-    "typescript-eslint": "8.65.0"
+    "@bufbuild/protoc-gen-es": "2.16.0",
+    "@types/node": "26.6.6",
+    "eslint": "10.14.0",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "typescript-eslint": "8.72.1"
   },
   "publishConfig": {
     "access": "public",
