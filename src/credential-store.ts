@@ -148,8 +148,9 @@ export class FileCredentialStore implements CredentialStore {
    */
   async #keepPrivate(): Promise<void> {
     if (process.platform === "win32") return;
-    // A key others can still read, or one in a folder others can write to
-    // (and so swap files in), is not used: it may already be known to them.
+    // Both are made owner-only where possible. A key others can still read,
+    // or one in a folder others can still write to (and so swap files in),
+    // is not used: it may already be known to them.
     const file = await tightened(this.#credentialPath, 0o600, 0o077, this.#chmod);
     const directory = await tightened(this.#dataDirectory, 0o700, 0o022, this.#chmod);
     if (!file || !directory) {
@@ -235,13 +236,16 @@ function validateCredential(
 }
 
 /**
- * Sets `path` to `mode` when any of the `exposed` permission bits is set,
- * and says whether none is set afterwards.
+ * Sets `path` to `mode` when others have any access to it, and says whether
+ * none of the `exposed` permission bits is set afterwards.
  */
 async function tightened(path: string, mode: number, exposed: number, change: typeof chmod): Promise<boolean> {
   try {
-    if (((await stat(path)).mode & exposed) === 0) return true;
-    await change(path, mode);
+    // Anything beyond the owner is taken away where it can be; only the
+    // `exposed` bits make the key unusable when that is not permitted.
+    if (((await stat(path)).mode & 0o077) !== 0) {
+      await change(path, mode).catch(() => undefined);
+    }
     return ((await stat(path)).mode & exposed) === 0;
   } catch {
     return false;
