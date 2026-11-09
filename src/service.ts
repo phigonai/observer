@@ -294,10 +294,10 @@ const settingNames = new Set([
 
 /**
  * Names that may hold a secret are never copied, even from PHIGON_*. That
- * includes PHIGON_ENROLLMENT_CODE, which an enrollment script may still
- * have set when it installs the service.
+ * includes PHIGON_ENROLLMENT_CODE and PHIGON_UNINSTALL_CODE, which a
+ * device management script may still have set when it installs the service.
  */
-const secretName = /TOKEN|SECRET|PASSWORD|PASSPHRASE|CREDENTIAL|ENROLLMENT/u;
+const secretName = /TOKEN|SECRET|PASSWORD|PASSPHRASE|CREDENTIAL|ENROLLMENT|_CODE$/u;
 
 function allowedSetting(name: string): boolean {
   if (name === "PHIGON_DATA_DIR") return false;

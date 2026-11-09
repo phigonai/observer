@@ -6,7 +6,9 @@ import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { contentOutsideProfileMessage, type ObserverConfig } from "./config.js";
 import { gapPoster, queueGaps, sendPendingGaps } from "./coverage-gaps.js";
-import { FileCredentialStore } from "./credential-store.js";
+import { consentSourceOf, FileCredentialStore } from "./credential-store.js";
+import { uninstallCodeFrom } from "./remove-machine.js";
+import { serverFetch } from "./server-fetch.js";
 import { InstanceLock } from "./instance-lock.js";
 import { lastLoggedError, logFilePath } from "./observer-log.js";
 import { OBSERVER_CONSENT_POLICY_VERSION } from "./pair.js";
@@ -39,6 +41,8 @@ export type ServiceDependencies = Readonly<{
   stopTimeoutMs?: number;
   /** The home folder a LaunchAgent or user unit goes under; tests replace it. */
   homeDirectory?: string;
+  /** Requests to the paired server; tests replace it. */
+  fetcher?: typeof fetch;
 }>;
 
 type Output = Readonly<{ stdout: (value: string) => void }>;
@@ -267,6 +271,10 @@ export async function runServiceCommand(
   }
 
   if (subcommand === "uninstall") {
+    // On a computer the company enrolled, the company decides when the
+    // service goes: its server must accept an uninstall code first.
+    const refusal = await companyUninstallRefusal(config, flags, environment, dependencies.fetcher ?? serverFetch);
+    if (refusal !== undefined) throw new Error(refusal);
     const removed = await uninstallService(context);
     // Told to the company's server once it is gone, since nothing runs here
     // to report it afterwards; a removal that failed is not reported.
@@ -326,4 +334,57 @@ async function reportServiceRemoved(config: ObserverConfig): Promise<void> {
   if (credential === null) return;
   await queueGaps(config.dataDirectory, [{ id: randomUUID(), kind: "service_removed", from: new Date().toISOString() }]);
   await sendPendingGaps(config.dataDirectory, gapPoster(config.controlPlaneUrl, credential.credential));
+}
+
+/**
+ * Why the background service of a computer the company enrolled may not be
+ * removed now, or undefined when it may: the computer's owner paired it,
+ * the company's server accepted the uninstall code given, or the server no
+ * longer accepts this computer's key because an administrator removed it.
+ * Anything the server cannot confirm, including a key that cannot be read
+ * and a server too old to check codes, keeps the service.
+ */
+async function companyUninstallRefusal(
+  config: ObserverConfig,
+  flags: readonly string[],
+  environment: NodeJS.ProcessEnv,
+  fetcher: typeof fetch,
+): Promise<string | undefined> {
+  let credential: Awaited<ReturnType<FileCredentialStore["load"]>>;
+  try {
+    credential = await new FileCredentialStore(config.dataDirectory).load();
+  } catch {
+    return "Phigon's key on this computer could not be read, so whether your company manages it cannot be checked. " +
+      "Nothing was removed; ask your IT team.";
+  }
+  if (credential === null || consentSourceOf(credential) !== "company") return undefined;
+  const code = uninstallCodeFrom(flags, environment);
+  const codeNeeded = "Your company manages Phigon on this computer, so its background service can be removed only with an uninstall code " +
+    "from your IT team: phigon-observer service uninstall --uninstall-code <code>. Nothing was removed.";
+  let response: Response;
+  try {
+    // Asked even without a code: a computer an administrator removed is no longer the company's to keep.
+    response = await fetcher(new URL("/v1/machine/uninstall-code", config.controlPlaneUrl), {
+      method: "POST", redirect: "error",
+      headers: { Authorization: `Bearer ${credential.credential}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ code: code ?? "" }), signal: AbortSignal.timeout(10_000),
+    });
+  } catch {
+    return code === undefined
+      ? codeNeeded
+      : "The uninstall code could not be checked: your company's Phigon server could not be reached. Nothing was removed; try again when this computer is online.";
+  }
+  if (response.ok) {
+    await response.body?.cancel().catch(() => undefined);
+    return undefined;
+  }
+  const body = await response.json().catch(() => null) as { error?: { code?: unknown; message?: unknown } } | null;
+  if (response.status === 401 && body?.error?.code === "invalid_credential") return undefined;
+  if (code === undefined) return codeNeeded;
+  if (response.status === 404) {
+    return "Your company's Phigon server cannot check uninstall codes yet. Nothing was removed; ask your IT team to update Phigon, " +
+      "or to remove this computer from Phigon.";
+  }
+  const message = typeof body?.error?.message === "string" ? body.error.message.slice(0, 300) : "";
+  return `${message || "Your company's Phigon server did not accept the uninstall code."} Nothing was removed.`;
 }

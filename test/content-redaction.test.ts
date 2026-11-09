@@ -88,6 +88,8 @@ test("redaction covers Phigon keys, temporary cloud keys, signing secrets and we
     // Phigon enrollment code: phe_<32 base64url characters>.
     ["phe", "_", randomBytes(24).toString("base64url")],
     ["phe", "_", filler("x", 10), "-_", filler("Y", 20)],
+    // Phigon uninstall code: phu_<32 base32 characters>.
+    ["phu", "_", filler("q", 16), "abcdefgh23456777"],
     ["AS", "IA", "Q3EGRLMN", "4XKP7TZW"],
     ["GOC", "SPX-", filler("k", 20), "_-Ab12Cd"],
     ["wh", "sec_", filler("m", 24), "+/AbC123=="],

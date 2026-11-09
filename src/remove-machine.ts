@@ -13,10 +13,26 @@ export type RemoveMachineResult = Readonly<{
   credentialRemoved: true;
 }>;
 
+/**
+ * The uninstall code an administrator gave for this computer, from
+ * `--uninstall-code` or PHIGON_UNINSTALL_CODE. A computer the company
+ * enrolled is removed only with one; the server decides.
+ */
+export function uninstallCodeFrom(flags: readonly string[], environment: NodeJS.ProcessEnv): string | undefined {
+  for (let index = 0; index < flags.length; index++) {
+    const flag = flags[index];
+    if (flag === "--uninstall-code") return flags[index + 1]?.trim() || undefined;
+    if (flag?.startsWith("--uninstall-code=")) return flag.slice("--uninstall-code=".length).trim() || undefined;
+  }
+  return environment["PHIGON_UNINSTALL_CODE"]?.trim() || undefined;
+}
+
 export async function removeMachine(options: Readonly<{
   config: ObserverConfig;
   credential: StoredMachineCredential;
   clearCredential: () => Promise<boolean>;
+  /** Needed on a computer the company enrolled. */
+  uninstallCode?: string | undefined;
   fetcher?: typeof fetch;
 }>): Promise<RemoveMachineResult> {
   const configuredOrigin = options.config.controlPlaneUrl.origin;
@@ -37,6 +53,7 @@ export async function removeMachine(options: Readonly<{
       headers: {
         Authorization: `Bearer ${options.credential.credential}`,
         Accept: "application/json",
+        ...(options.uninstallCode === undefined ? {} : { "X-Phigon-Uninstall-Code": options.uninstallCode }),
       },
       redirect: "error",
       signal: AbortSignal.timeout(10_000),

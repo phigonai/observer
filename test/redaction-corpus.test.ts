@@ -50,6 +50,7 @@ const corpus: readonly Sample[] = [
   sample("phigon access key", (s) => `key ${s}`, join("ph", "g_", fill("a", 12), "_", fill("b", 32))),
   sample("phigon license key", (s) => `license ${s}`, join("ph", "l_", fill("c", 24), ".", fill("d", 50))),
   sample("phigon enrollment code", (s) => `code ${s}`, word(join("ph", "e_"), "e", 32)),
+  sample("phigon uninstall code", (s) => `remove-machine --uninstall-code ${s}`, word(join("ph", "u_"), "u", 32)),
   sample("webhook signing secret", (s) => `secret ${s}`, word(join("wh", "sec_"), "S", 32)),
   sample("slack webhook", (s) => join("post to https://hooks.", "slack.com/services/", s), join("T0", fill("T", 8), "/B0", fill("B", 8), "/", fill("w", 24))),
   sample("gitlab token", (s) => `gitlab ${s}`, word(join("gl", "pat-"), "U", 24)),

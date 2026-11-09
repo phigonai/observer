@@ -39,7 +39,9 @@ const endpoints = {
   "--control-plane-url": { value: "<url>" },
   "--grpc-url": { value: "<url>" },
 } satisfies Record<string, OptionSpec>;
-const removal = { "--purge": {}, "--yes": {}, ...json } satisfies Record<string, OptionSpec>;
+// A computer the company enrolled is removed only with an administrator's code.
+const uninstall = { "--uninstall-code": { value: "<code>" } } satisfies Record<string, OptionSpec>;
+const removal = { "--purge": {}, "--yes": {}, ...uninstall, ...json } satisfies Record<string, OptionSpec>;
 
 /**
  * Every command and the options it takes. A command with subcommands has
@@ -139,7 +141,7 @@ export const commandOptions: Readonly<Record<string, CommandSpec>> = {
     },
   },
   "service install": { options: { ...profile, ...json } },
-  "service uninstall": { options: json },
+  "service uninstall": { options: { ...uninstall, ...json } },
   "service status": { options: json },
   // Without --tail it prints the last 50 lines.
   logs: { options: { "--tail": { value: "<lines>" }, "--follow": {} } },

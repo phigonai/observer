@@ -158,8 +158,9 @@ test("service settings keep what the observer needs and never a secret", async (
     PHIGON_DATA_DIR: "/elsewhere",
     PHIGON_MACHINE_TOKEN: "do-not-copy",
     PHIGON_SECRET_THING: "do-not-copy",
-    // An enrollment script may still have the code set when it installs.
+    // A device management script may still have a code set when it installs.
     PHIGON_ENROLLMENT_CODE: "do-not-copy",
+    PHIGON_UNINSTALL_CODE: "do-not-copy",
     Path: "C:\\Windows;C:\\Tools",
     HTTPS_PROXY: "http://proxy.example:3128",
     no_proxy: "internal.example",
@@ -515,4 +516,79 @@ test("the observer notices when the Windows task that started it ends", async ()
   stop();
   await new Promise((resolve) => setTimeout(resolve, 30));
   assert.equal(calls, 0);
+});
+
+test("on a computer the company enrolled, the service is removed only with a code the server accepts", async () => {
+  const root = await temporary("phigon-service-company-");
+  const data = join(root, "data");
+  const origin = "http://127.0.0.1:9";
+  const { runner } = recorder();
+  const requests: { url: string; authorization: string; body: string }[] = [];
+  let answer: { status: number; body: unknown } = { status: 200, body: { accepted: true } };
+  const fetcher = (async (url: URL, init: RequestInit) => {
+    requests.push({ url: url.toString(), authorization: (init.headers as Record<string, string>)["Authorization"] ?? "", body: String(init.body) });
+    return new Response(JSON.stringify(answer.body), { status: answer.status, headers: { "Content-Type": "application/json" } });
+  }) as unknown as typeof fetch;
+  const dependencies = { serviceRunner: runner, platform: "linux" as const, homeDirectory: root, stopTimeoutMs: 50, fetcher };
+  const environment = { PHIGON_DATA_DIR: data, PHIGON_LOG_LEVEL: "warn", PATH: "/usr/bin" };
+  const invoke = async (args: readonly string[]) => {
+    let stdout = "";
+    let stderr = "";
+    const code = await run([...args], environment, {
+      stdout: (value) => { stdout += value; },
+      stderr: (value) => { stderr += value; },
+    }, undefined, dependencies);
+    return { code, stdout, stderr };
+  };
+  // Built at runtime, so the file holds no secret-shaped text.
+  const uninstallCode = ["ph", "u_", "a".repeat(32)].join("");
+  try {
+    await new FileCredentialStore(data).save(pairedCredential(origin, { consentSource: "company" }));
+    assert.equal((await invoke(["service", "install"])).code, 0);
+
+    answer = { status: 403, body: { error: { code: "uninstall_code_not_accepted", message: "That uninstall code is not valid for this computer." } } };
+    const withoutCode = await invoke(["service", "uninstall"]);
+    assert.equal(withoutCode.code, 1);
+    assert.match(withoutCode.stderr, /Your company manages Phigon on this computer.*--uninstall-code <code>\. Nothing was removed\./u);
+    assert.equal(JSON.parse(requests.at(-1)?.body ?? "{}").code, "");
+    assert.match((await invoke(["service", "status"])).stdout, /^Background service: installed/mu);
+
+    // A server older than uninstall codes cannot say the code is good.
+    answer = { status: 404, body: { error: { code: "not_found", message: "This server has no uninstall codes." } } };
+    const oldServer = await invoke(["service", "uninstall", "--uninstall-code", uninstallCode]);
+    assert.equal(oldServer.code, 1);
+    assert.match(oldServer.stderr, /cannot check uninstall codes yet\. Nothing was removed/u);
+    assert.match((await invoke(["service", "status"])).stdout, /^Background service: installed/mu);
+
+    answer = { status: 403, body: { error: { code: "uninstall_code_not_accepted", message: "That uninstall code is not valid for this computer." } } };
+    const refused = await invoke(["service", "uninstall", "--uninstall-code", uninstallCode]);
+    assert.equal(refused.code, 1);
+    assert.match(refused.stderr, /That uninstall code is not valid for this computer\. Nothing was removed\./u);
+    assert.match((await invoke(["service", "status"])).stdout, /^Background service: installed/mu);
+
+    answer = { status: 200, body: { accepted: true } };
+    const removed = await invoke(["service", "uninstall", `--uninstall-code=${uninstallCode}`]);
+    assert.equal(removed.code, 0, removed.stderr);
+    assert.match(removed.stdout, /^Background service removed/mu);
+    const check = requests.findLast((request) => request.url.endsWith("/v1/machine/uninstall-code"));
+    assert.equal(JSON.parse(check?.body ?? "{}").code, uninstallCode);
+    assert.match(check?.authorization ?? "", /^Bearer /u);
+
+    // An administrator removed the computer: its key no longer works, and the service may go without a code.
+    assert.equal((await invoke(["service", "install"])).code, 0);
+    answer = { status: 401, body: { error: { code: "invalid_credential", message: "Machine credential is invalid or revoked." } } };
+    const afterRemoval = await invoke(["service", "uninstall"]);
+    assert.equal(afterRemoval.code, 0, afterRemoval.stderr);
+    assert.match(afterRemoval.stdout, /^Background service removed/mu);
+
+    // A key that cannot be read keeps the service.
+    assert.equal((await invoke(["service", "install"])).code, 0);
+    await writeFile(join(data, "machine-credential.json"), "{ not json", "utf8");
+    const unreadable = await invoke(["service", "uninstall", "--uninstall-code", uninstallCode]);
+    assert.equal(unreadable.code, 1);
+    assert.match(unreadable.stderr, /unreadable|could not be read/u);
+    assert.equal((await readdir(join(root, ".config", "systemd", "user"))).filter((name) => name.endsWith(".service")).length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

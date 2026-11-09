@@ -4,6 +4,28 @@ All notable changes to `@phigon/observer` are listed here. Versions follow
 [Semantic Versioning](https://semver.org/). Each release is published to npm
 from the matching `vX.Y.Z` tag in this repository.
 
+## Unreleased
+
+### Company computers
+
+- On a computer the company enrolled with an enrollment code, `remove-machine`
+  (and `unpair`) and `service uninstall` need an uninstall code from an
+  administrator: `--uninstall-code <code>`, or `PHIGON_UNINSTALL_CODE`.
+  Without one, or when the company's server cannot confirm it, nothing is
+  removed. A computer its owner paired stays theirs to remove, and a computer
+  an administrator already removed may drop its service without a code.
+- The service never keeps an uninstall code in its settings, like an
+  enrollment code.
+- Uninstall codes (`phu_…`) are redacted like other Phigon keys.
+
+### Collection gaps
+
+- The observer tells the company's server when collection stopped on the
+  computer and why: stopped by hand, the service stopped, the computer was
+  off or asleep, the observer ended unexpectedly, or the background service
+  was removed. Each report waits in the data directory
+  (`coverage-gaps/`) until the server has it.
+
 ## 8.12.0 (2026-11-08)
 
 ### Consent and command line

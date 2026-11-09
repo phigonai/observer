@@ -85,7 +85,7 @@ import {
   type EnrollResult,
 } from "./enroll.js";
 import { runLogsCommand } from "./logs-command.js";
-import { removeMachine } from "./remove-machine.js";
+import { removeMachine, uninstallCodeFrom } from "./remove-machine.js";
 import { addDefaultAuthority, forgetServerAuthority, parseAuthorityFingerprint } from "./server-authority.js";
 import { useServerProxy } from "./server-fetch.js";
 import { followServer, reconcileServiceEndpoints, saveMovedServer } from "./server-follow.js";
@@ -639,6 +639,7 @@ export async function run(
         result = await removeMachine({
           config,
           credential,
+          uninstallCode: uninstallCodeFrom(flags, callerEnvironment),
           clearCredential: async () => {
             clearEventSpool(config.dataDirectory);
             await forgetServerAuthority(config.dataDirectory);
@@ -1860,11 +1861,11 @@ function helpText(): string {
     "  phigon-observer pair --code <one-time-code> --consent-profile <metadata|full> [--control-plane-url <url> --grpc-url <url> [--server-ca-sha256 <fingerprint>]] [--name <machine-name>] [--accept-consent] [--no-service] [--remote-actions <all|stop-agents|none>] [--json]",
     "  PHIGON_ENROLLMENT_CODE=<code> phigon-observer pair [--control-plane-url <url> --grpc-url <url> [--server-ca-sha256 <fingerprint>]] [--name <machine-name>] [--remote-actions <all|stop-agents|none>] [--json]",
     "  phigon-observer pair --enrollment-code <code> [same options]",
-    "  phigon-observer remove-machine [--purge] [--yes] [--json]",
-    "  phigon-observer unpair [--purge] [--yes] [--json]",
+    "  phigon-observer remove-machine [--purge] [--yes] [--uninstall-code <code>] [--json]",
+    "  phigon-observer unpair [--purge] [--yes] [--uninstall-code <code>] [--json]",
     "  phigon-observer run [--profile <metadata|full>] [--control-plane-url <url> --grpc-url <url>]",
     "  phigon-observer service install [--profile <metadata|full>] [--json]",
-    "  phigon-observer service uninstall [--json]",
+    "  phigon-observer service uninstall [--uninstall-code <code>] [--json]",
     "  phigon-observer service status [--json]",
     "  phigon-observer logs [--tail <lines>] [--follow]",
     "  phigon-observer help",
@@ -1881,7 +1882,7 @@ function helpText(): string {
     "The pair command shows the selected collection scope, requires machine-owner acceptance, and stores that evidence with the mode-0600 credential.",
     "The owner also decides what the company's administrators may do on the computer: --remote-actions all (stop agents and run the commands they approve), stop-agents or none. At the prompt the default is all, and the prompt says so. With --accept-consent there is no prompt, so the default is none. --no-remote-commands (stop-agents) and --no-remote-actions (none) still work.",
     "With a company's enrollment code (phe_...), pair asks nothing: the company has given consent and chosen the profile, which the observer stores and keeps collection within. Administrators may stop agents and run the commands they approve unless --remote-actions says less. Prefer PHIGON_ENROLLMENT_CODE to --enrollment-code, which shows in process lists. The code is never printed or stored. A busy server is retried a few times. Exit codes: 20 try again later, 21 the code expired, was revoked, is used up or outdated, 22 not a valid code, 23 this computer already used this code, 24 already connected to this workspace. Then run phigon-observer service install.",
-    "The remove-machine command stops collection on this paired machine and revokes its credential; activity already collected stays until an administrator deletes the machine or it expires. It requires local confirmation. With --purge it also removes the background service and every file the observer keeps in the data directory. unpair is another name for it.",
+    "The remove-machine command stops collection on this paired machine and revokes its credential; activity already collected stays until an administrator deletes the machine or it expires. It requires local confirmation. With --purge it also removes the background service and every file the observer keeps in the data directory. On a computer the company enrolled with an enrollment code, removing Phigon or its background service needs an uninstall code from an administrator (--uninstall-code, or PHIGON_UNINSTALL_CODE). unpair is another name for it.",
     "The run command maintains an authenticated, resumable telemetry stream; --profile applies the same portable local collection profile on Windows, macOS, and Linux.",
     "The service commands run the observer in the background for the signed-in user (a Task Scheduler task, a LaunchAgent or a systemd user unit) with this data directory and these settings, starting it at sign-in and again if it stops. Install needs a paired computer with the owner's consent. Status also says why a stopped service cannot start, what the service manager reported, and the last error in the log.",
     "The logs command prints the last lines of the observer log (50 unless --tail says otherwise); --follow keeps printing new lines until interrupted.",
@@ -2056,6 +2057,7 @@ async function removeMachineAndPurge(
         result = await removeMachine({
           config,
           credential,
+          uninstallCode: uninstallCodeFrom(flags, environment),
           clearCredential: async () => {
             clearEventSpool(config.dataDirectory);
             await forgetServerAuthority(config.dataDirectory);
