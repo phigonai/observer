@@ -1,9 +1,11 @@
+import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { contentOutsideProfileMessage, type ObserverConfig } from "./config.js";
+import { gapPoster, queueGaps, sendPendingGaps } from "./coverage-gaps.js";
 import { FileCredentialStore } from "./credential-store.js";
 import { InstanceLock } from "./instance-lock.js";
 import { lastLoggedError, logFilePath } from "./observer-log.js";
@@ -266,6 +268,9 @@ export async function runServiceCommand(
 
   if (subcommand === "uninstall") {
     const removed = await uninstallService(context);
+    // Told to the company's server once it is gone, since nothing runs here
+    // to report it afterwards; a removal that failed is not reported.
+    if (removed) await reportServiceRemoved(config).catch(() => undefined);
     const stopped = removed ? await waitUntilStopped(context.dataDirectory, dependencies.stopTimeoutMs ?? 15_000) : true;
     output.stdout(json
       ? `${JSON.stringify({ status: removed ? "removed" : "not_installed", name, platform: context.platform, observerStopped: stopped }, null, 2)}\n`
@@ -309,4 +314,16 @@ export async function runServiceCommand(
         "",
       ].join("\n"));
   return 0;
+}
+
+/**
+ * Tells the company's server, when this computer is paired, that its
+ * background service is being removed. Sent at once; if the server cannot
+ * be reached the report waits with the others for the next run here.
+ */
+async function reportServiceRemoved(config: ObserverConfig): Promise<void> {
+  const credential = await new FileCredentialStore(config.dataDirectory).load();
+  if (credential === null) return;
+  await queueGaps(config.dataDirectory, [{ id: randomUUID(), kind: "service_removed", from: new Date().toISOString() }]);
+  await sendPendingGaps(config.dataDirectory, gapPoster(config.controlPlaneUrl, credential.credential));
 }

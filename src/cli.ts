@@ -4,6 +4,7 @@ import { create, toJsonString } from "@bufbuild/protobuf";
 import { timestampDate, timestampFromDate } from "@bufbuild/protobuf/wkt";
 import { constants, readFileSync, realpathSync } from "node:fs";
 import { access, readFile } from "node:fs/promises";
+import { uptime } from "node:os";
 import { dirname, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import type { Readable } from "node:stream";
@@ -70,6 +71,7 @@ import {
   type ObserverStreamCursorHealth,
 } from "./health.js";
 import { describeRuntime, readObserverStatus, startSelfReport } from "./self-report.js";
+import { beginRun, endRun, gapPoster, markAlive, queueGaps, sendPendingGaps, type StopReason } from "./coverage-gaps.js";
 import {
   OBSERVER_CONSENT_POLICY_VERSION,
   pairMachine,
@@ -695,9 +697,14 @@ export async function run(
         process.stdout.on("error", ignoreConsoleError);
         process.stderr.on("error", ignoreConsoleError);
       }
+      // How this run ends, recorded for the administrator: the next start
+      // reports the gap in collection with this reason.
+      let stopReason: StopReason = "stopped";
+      let gapReports: NodeJS.Timeout | undefined;
       const stopWatchingParent = serviceSettingsFile !== undefined && process.platform === "win32"
         ? watchParentProcess(process.ppid, () => {
           output.stdout("The background service stopped, so the observer stops too.\n");
+          stopReason = "service_stopped";
           controller.abort();
         })
         : undefined;
@@ -750,6 +757,20 @@ export async function run(
         // Before any queued activity, cursor or saved state is read. A
         // signal only aborts the tasks, so `finally` releases the lock.
         instanceLock = await InstanceLock.acquire(config.dataDirectory);
+        // Whether collection stopped since the last run here, and how: off,
+        // asleep, stopped, or ended from outside while the computer was on.
+        // Reported to the server once a minute until it has them.
+        await beginRun(config.dataDirectory, { now: new Date(), bootedAt: new Date(Date.now() - uptime() * 1_000), pid: process.pid })
+          .catch(() => undefined);
+        const postGaps = gapPoster(config.controlPlaneUrl, credential.credential);
+        const reportGaps = async () => {
+          const asleep = await markAlive(config.dataDirectory, new Date()).catch(() => undefined);
+          if (asleep !== undefined) await queueGaps(config.dataDirectory, [asleep]).catch(() => undefined);
+          await sendPendingGaps(config.dataDirectory, postGaps).catch(() => undefined);
+        };
+        void reportGaps();
+        gapReports = setInterval(() => void reportGaps(), 60_000);
+        gapReports.unref();
         logged?.debug(
           `Observer ${version} started for machine ${credential.machineId} ` +
             `with the ${config.observabilityProfile} profile, using ${config.dataDirectory}.\n`,
@@ -1186,6 +1207,8 @@ export async function run(
         }
         output.stdout("Observer stopped.\n");
       } finally {
+        clearInterval(gapReports);
+        if (instanceLock !== undefined) await endRun(config.dataDirectory, stopReason).catch(() => undefined);
         pairingWatch?.stop();
         process.removeListener("SIGINT", stop);
         process.removeListener("SIGTERM", stop);

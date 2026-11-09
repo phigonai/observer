@@ -281,6 +281,7 @@ code, the profile the company chose.
 | --- | --- | --- |
 | Which agents are installed and running | Yes | Yes |
 | Agent state, health and kind of activity | Yes | Yes |
+| When collection stopped, and why | Yes | Yes |
 | Prompts and replies | No | Supported agents |
 | Commands, tool calls and their output | No | Supported agents, redacted |
 | Past conversations | No | Imported once, then live |
@@ -292,6 +293,13 @@ run as Node.js. To tell which agent a `node`, `bun` or `deno` process is, the
 observer reads that process's command line on the computer and keeps only the
 npm package it runs, such as `@google/gemini-cli`. The command line itself is
 never stored or sent.
+
+When collection stops, the next start tells the server when and why, as
+far as the computer can tell: it was off or asleep, the observer was
+stopped, its background service ended or was removed (`service uninstall`
+says so before it goes), or it ended while the computer stayed on, as from
+Task Manager. Only the times and that reason are sent. A small record of
+the current run is kept in the data directory for this (`observer-run.json`).
 
 Individual categories can be narrowed further with `PHIGON_COLLECT_*`
 settings. A full description is in

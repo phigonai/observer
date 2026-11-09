@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { run, watchParentProcess } from "../src/cli.js";
+import { pendingGaps } from "../src/coverage-gaps.js";
 import { FileCredentialStore, type StoredMachineCredential } from "../src/credential-store.js";
 import { InstanceLock } from "../src/instance-lock.js";
 import { logFilePath } from "../src/observer-log.js";
@@ -450,6 +451,9 @@ test("service install refuses without pairing or consent, then installs, reports
 
     const removed = await invoke(["service", "uninstall"]);
     assert.match(removed.stdout, /^Background service removed: phigon-observer-[0-9a-f]{8}\.$/mu);
+    // The server is told the service was removed; unreachable here, so the
+    // report waits for the next run instead of holding up the removal.
+    assert.deepEqual((await pendingGaps(data)).map((gap) => gap.kind), ["service_removed"]);
     assert.match((await invoke(["service", "status"])).stdout, /^Background service: not installed$/mu);
     assert.match((await invoke(["service", "uninstall"])).stdout, /The background service was not installed\./u);
     await assert.rejects(stat(serviceSettingsPath(data)), { code: "ENOENT" });
