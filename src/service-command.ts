@@ -127,7 +127,7 @@ async function waitUntilStopped(dataDirectory: string, timeoutMs: number): Promi
 
 function restartNote(context: ServiceContext): string {
   return context.platform === "windows"
-    ? "It starts when you sign in, and again within a minute if it stops."
+    ? "It starts when you sign in, and again within seconds if it stops."
     : context.platform === "macos"
       ? "It starts when you sign in, and launchd starts it again if it stops."
       : "It starts when you sign in, and systemd restarts it if it fails.";

@@ -9,6 +9,7 @@ import {
   rememberMachineRemoved,
   removalConfirmed,
   removedAtStart,
+  removedRecheckIn,
 } from "../src/machine-removed.js";
 
 const machine = {
@@ -111,6 +112,27 @@ test("a removed computer starts again when the server takes its key, cannot be a
     assert.equal(await removedAtStart({ dataDirectory: directory, machine, controlPlaneUrl, recheckAfterMs: hour, fetcher: repaired.fetcher }), "start");
     assert.equal(await removedAtStart({ dataDirectory: join(directory, "missing"), machine, controlPlaneUrl, recheckAfterMs: hour, fetcher: repaired.fetcher }), "start");
     assert.equal(repaired.requests.length, 0);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("the next question to the server is counted from the confirmation, so a restart does not put it off", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-removed-recheck-"));
+  try {
+    // Nothing confirmed yet: ask now.
+    assert.equal(await removedRecheckIn(directory, hour), 0);
+    const confirmed = new Date("2026-11-03T09:00:00.000Z");
+    await rememberMachineRemoved(directory, machine, confirmed);
+    assert.equal(await removedRecheckIn(directory, hour, confirmed), 0);
+    assert.equal(await removedAtStart({
+      dataDirectory: directory, machine, controlPlaneUrl, recheckAfterMs: hour, now: () => confirmed, fetcher: answering(refused).fetcher,
+    }), "removed");
+    // Restarted at 09:50: the next question is at 10:00, not 10:50.
+    assert.equal(await removedRecheckIn(directory, hour, new Date("2026-11-03T09:50:00.000Z")), 10 * 60_000);
+    assert.equal(await removedRecheckIn(directory, hour, new Date("2026-11-03T10:30:00.000Z")), 0);
+    // A clock set back never makes it wait longer than the interval.
+    assert.equal(await removedRecheckIn(directory, hour, new Date("2026-11-03T07:00:00.000Z")), hour);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

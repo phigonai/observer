@@ -1487,28 +1487,87 @@ test("pairing again while the old key is refused restarts the observer instead o
   }
 });
 
-test("a removed computer's background service stops at once, without scanning or asking again", async () => {
+/**
+ * Calls `act` once a removed computer's Windows service is waiting for its
+ * next check: its run has ended and it gave up the lock. An `act` that fails,
+ * as a file the observer is reading at that moment can on Windows, is tried
+ * again on the next tick.
+ */
+function onceWaiting(directory: string, act: () => Promise<void> | void): { cancel: () => void; seen: () => boolean } {
+  let seen = false;
+  let busy = false;
+  const timer = setInterval(() => {
+    if (busy || seen) return;
+    busy = true;
+    void (async () => {
+      const record = JSON.parse(await readFile(join(directory, "observer-run.json"), "utf8").catch(() => "{}")) as { stoppedAt?: string };
+      if (record.stoppedAt !== undefined && !(await InstanceLock.inspect(directory)).running) {
+        await act();
+        seen = true;
+      }
+    })().catch(() => undefined).finally(() => { busy = false; });
+  }, 100);
+  return { cancel: () => clearInterval(timer), seen: () => seen };
+}
+
+async function confirmedRemovedService(directory: string) {
+  const machine = await saveRemovableMachine(directory, "http://127.0.0.1:9", "http://127.0.0.1:9");
+  await rememberMachineRemoved(directory, machine);
+  // The server confirmed the removal a moment ago.
+  const confirm = (async () => new Response(JSON.stringify({ error: { code: "invalid_credential" } }), { status: 401 })) as typeof fetch;
+  assert.equal(await removedAtStart({
+    dataDirectory: directory, machine, controlPlaneUrl: new URL("http://127.0.0.1:9"), recheckAfterMs: 0, fetcher: confirm,
+  }), "removed");
+  const settings = join(directory, "service-settings.json");
+  await writeFile(settings, JSON.stringify({ version: 1, environment: { PHIGON_UPDATE_CHECK: "false" } }), "utf8");
+  return { machine, settings };
+}
+
+test("a removed computer's background service starts nothing and asks nothing, and on Windows waits for the next check", { timeout: 60_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "phigon-cli-removed-service-"));
   try {
-    const machine = await saveRemovableMachine(directory, "http://127.0.0.1:9", "http://127.0.0.1:9");
-    await rememberMachineRemoved(directory, machine);
-    // The server confirmed the removal a moment ago.
-    const confirm = (async () => new Response(JSON.stringify({ error: { code: "invalid_credential" } }), { status: 401 })) as typeof fetch;
-    assert.equal(await removedAtStart({
-      dataDirectory: directory, machine, controlPlaneUrl: new URL("http://127.0.0.1:9"), recheckAfterMs: 0, fetcher: confirm,
-    }), "removed");
-    const settings = join(directory, "service-settings.json");
-    await writeFile(settings, JSON.stringify({ version: 1, environment: { PHIGON_UPDATE_CHECK: "false" } }), "utf8");
+    const { settings } = await confirmedRemovedService(directory);
     let stdout = "";
     let stderr = "";
-    const exitCode = await run(["run", "--service-settings", settings], {}, {
-      stdout: (value) => { stdout += value; },
-      stderr: (value) => { stderr += value; },
-    });
+    // On Windows, whose task starts the observer again within seconds, it
+    // waits without the lock instead of exiting; stopping it ends the wait.
+    const windows = process.platform === "win32";
+    const waiting = windows ? onceWaiting(directory, () => { process.emit("SIGTERM", "SIGTERM"); }) : undefined;
+    let exitCode: number;
+    try {
+      exitCode = await run(["run", "--service-settings", settings], {}, {
+        stdout: (value) => { stdout += value; },
+        stderr: (value) => { stderr += value; },
+      });
+    } finally {
+      waiting?.cancel();
+    }
+    if (windows) assert.ok(waiting?.seen(), "it waited without the lock instead of exiting at once");
     // systemd leaves a service that exits cleanly stopped.
     assert.equal(exitCode, 0);
     assert.equal(stderr, "", "asked within the hour, so nothing new to say");
     assert.doesNotMatch(stdout, /Connecting telemetry|Starting Phigon observer/u);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("pairing a removed Windows computer again ends its service's wait at once", { skip: process.platform !== "win32", timeout: 60_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "phigon-cli-removed-paired-"));
+  try {
+    const { machine, settings } = await confirmedRemovedService(directory);
+    const waiting = onceWaiting(directory, async () => {
+      await new FileCredentialStore(directory).save({ ...machine, machineId: "machine-paired-again" });
+    });
+    let exitCode: number;
+    try {
+      exitCode = await run(["run", "--service-settings", settings], {}, { stdout: () => undefined, stderr: () => undefined });
+    } finally {
+      waiting.cancel();
+    }
+    assert.ok(waiting.seen());
+    // The task starts the observer again within seconds, with the new pairing.
+    assert.equal(exitCode, 0);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

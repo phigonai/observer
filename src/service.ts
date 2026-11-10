@@ -132,11 +132,19 @@ function localTimestamp(date: Date): string {
 }
 
 /**
- * Task Scheduler XML. The task starts at sign-in and is retried every minute
- * (a running copy is left alone), so an observer that stops is started again
- * within a minute. conhost --headless keeps a console window from opening;
- * it does not pass on the exit code, so the minute trigger, not the failure
- * setting, is what restarts it.
+ * How many minute triggers the Windows task has, a few seconds apart. Task
+ * Scheduler repeats a trigger at most once a minute, so six of them, ten
+ * seconds apart, start an observer that was ended (from Task Manager, say)
+ * again within about ten seconds.
+ */
+export const windowsRestartTriggers = 6;
+
+/**
+ * Task Scheduler XML. The task starts at sign-in and is tried again every
+ * ten seconds (a running copy is left alone), so an observer that stops is
+ * started again within about ten seconds. conhost --headless keeps a console
+ * window from opening; it does not pass on the exit code, so the triggers,
+ * not the failure setting, are what restart it.
  */
 export function windowsTaskXml(context: ServiceContext): string {
   const [node, entry, ...rest] = serviceCommand(context);
@@ -144,6 +152,16 @@ export function windowsTaskXml(context: ServiceContext): string {
   const quote = (value: string) => /^[A-Za-z0-9_.:\\/-]+$/u.test(value) ? value : `"${value}"`;
   const argumentsText = ["--headless", `"${node}"`, `"${entry}"`, ...rest.map(quote)].join(" ");
   const user = xml(context.user);
+  const start = (context.now ?? (() => new Date()))().getTime();
+  const spacing = 60_000 / windowsRestartTriggers;
+  const restartTriggers = Array.from({ length: windowsRestartTriggers }, (_, index) => `    <TimeTrigger>
+      <Enabled>true</Enabled>
+      <StartBoundary>${localTimestamp(new Date(start + index * spacing))}</StartBoundary>
+      <Repetition>
+        <Interval>PT1M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </TimeTrigger>`).join("\n");
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -156,14 +174,7 @@ export function windowsTaskXml(context: ServiceContext): string {
       <Enabled>true</Enabled>
       <UserId>${user}</UserId>
     </LogonTrigger>
-    <TimeTrigger>
-      <Enabled>true</Enabled>
-      <StartBoundary>${localTimestamp((context.now ?? (() => new Date()))())}</StartBoundary>
-      <Repetition>
-        <Interval>PT1M</Interval>
-        <StopAtDurationEnd>false</StopAtDurationEnd>
-      </Repetition>
-    </TimeTrigger>
+${restartTriggers}
   </Triggers>
   <Principals>
     <Principal id="Author">
@@ -258,7 +269,11 @@ function serviceErrorsPath(context: ServiceContext): string {
   return posix.join(checkedPath(context.dataDirectory, "macos", "data directory"), logDirectoryName, serviceErrorsFileName);
 }
 
-/** A systemd user unit, restarted when it fails. */
+/**
+ * A systemd user unit, restarted when it fails: after 2 seconds, then
+ * longer each time up to a minute, so a crash loop stays cheap (systemd
+ * older than 254 ignores the steps and waits 2 seconds each time).
+ */
 export function systemdUserUnit(context: ServiceContext): string {
   const quoted = (value: string) =>
     `"${value.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"").replaceAll("%", "%%").replaceAll("$", "$$$$")}"`;
@@ -272,7 +287,9 @@ Type=simple
 ExecStart=${serviceCommand(context).map(quoted).join(" ")}
 WorkingDirectory=${checkedPath(context.dataDirectory, "linux", "data directory")}
 Restart=on-failure
-RestartSec=30
+RestartSec=2
+RestartSteps=5
+RestartMaxDelaySec=60
 UMask=0077
 TimeoutStopSec=20
 
@@ -546,10 +563,10 @@ export async function stopService(context: ServiceContext): Promise<boolean> {
   if (!(await serviceInstalled(context))) return false;
   const name = serviceName(context);
   if (context.platform === "windows") {
-    // Ending the task ends conhost; the observer notices and stops itself.
-    await context.run(windowsTool(context, "schtasks.exe"), ["/End", "/TN", name]);
-    // The minute trigger would start it again; keep it off until started.
+    // The triggers would start it again within seconds; turn them off
+    // first. Ending the task ends conhost; the observer notices and stops.
     await context.run(windowsTool(context, "schtasks.exe"), ["/Change", "/TN", name, "/DISABLE"]);
+    await context.run(windowsTool(context, "schtasks.exe"), ["/End", "/TN", name]);
   } else if (context.platform === "macos") {
     // KeepAlive would restart a stopped job; unloading stops it for good.
     await context.run("launchctl", ["bootout", `gui/${context.user}/${name}`]);
@@ -578,6 +595,8 @@ export async function uninstallService(context: ServiceContext): Promise<boolean
   const name = serviceName(context);
   if (installed) {
     if (context.platform === "windows") {
+      // Off first, so no trigger starts a copy the deleted task would leave running.
+      await context.run(windowsTool(context, "schtasks.exe"), ["/Change", "/TN", name, "/DISABLE"]);
       await context.run(windowsTool(context, "schtasks.exe"), ["/End", "/TN", name]);
       await required(context, windowsTool(context, "schtasks.exe"), ["/Delete", "/TN", name, "/F"], "removed");
     } else if (context.platform === "macos") {

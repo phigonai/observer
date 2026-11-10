@@ -179,9 +179,9 @@ records. It starts when the user signs in and again if it stops:
 
 | System | What is installed | Restart |
 | --- | --- | --- |
-| Windows | A Task Scheduler task, "Phigon Observer", that runs at sign-in without a window | Started again within a minute |
+| Windows | A Task Scheduler task, "Phigon Observer", that runs at sign-in without a window | Started again within about 10 seconds |
 | macOS | A LaunchAgent, `~/Library/LaunchAgents/com.phigon.observer.plist` | launchd keeps it running (`KeepAlive`) |
-| Linux | A systemd user unit, `~/.config/systemd/user/phigon-observer.service` | `Restart=on-failure` |
+| Linux | A systemd user unit, `~/.config/systemd/user/phigon-observer.service` | `Restart=on-failure`, after 2 seconds |
 
 - The service runs the same Node.js and observer that ran `service install`,
   with the same data directory. A Node.js from Homebrew runs through its

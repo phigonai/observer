@@ -23,6 +23,7 @@ import {
   stopService,
   systemdUserUnit,
   uninstallService,
+  windowsRestartTriggers,
   windowsTaskXml,
   writeServiceSettings,
   type CommandResult,
@@ -92,13 +93,19 @@ test("each data directory gets its own service name", () => {
   assert.equal(servicePlatform("freebsd"), undefined);
 });
 
-test("the Windows task runs at sign-in as this user, hidden, and is retried every minute", () => {
+test("the Windows task runs at sign-in as this user, hidden, and is tried again every ten seconds", () => {
   const xml = windowsTaskXml(context("windows", "C:\\Users\\Ada Lovelace"));
   assert.match(xml, /<LogonTrigger>\s*<Enabled>true<\/Enabled>\s*<UserId>S-1-5-21-1000-2000-3000-1001<\/UserId>/u);
   assert.match(xml, /<LogonType>InteractiveToken<\/LogonType>/u);
   assert.match(xml, /<RunLevel>LeastPrivilege<\/RunLevel>/u);
-  assert.match(xml, /<StartBoundary>2026-11-02T09:30:00<\/StartBoundary>/u);
-  assert.match(xml, /<Interval>PT1M<\/Interval>/u);
+  // Six minute triggers, ten seconds apart: an observer ended from Task
+  // Manager is started again within about ten seconds.
+  assert.equal(windowsRestartTriggers, 6);
+  assert.deepEqual([...xml.matchAll(/<StartBoundary>([^<]+)<\/StartBoundary>/gu)].map((match) => match[1]), [
+    "2026-11-02T09:30:00", "2026-11-02T09:30:10", "2026-11-02T09:30:20",
+    "2026-11-02T09:30:30", "2026-11-02T09:30:40", "2026-11-02T09:30:50",
+  ]);
+  assert.equal([...xml.matchAll(/<Interval>PT1M<\/Interval>/gu)].length, 6 + 1, "six triggers and the failure setting");
   assert.match(xml, /<MultipleInstancesPolicy>IgnoreNew<\/MultipleInstancesPolicy>/u);
   assert.match(xml, /<DisallowStartIfOnBatteries>false<\/DisallowStartIfOnBatteries>/u);
   assert.match(xml, /<StopIfGoingOnBatteries>false<\/StopIfGoingOnBatteries>/u);
@@ -140,6 +147,9 @@ test("the systemd user unit restarts on failure and quotes its command", () => {
     nodePath: "/opt/node$1/bin/node",
   }));
   assert.match(unit, /^Restart=on-failure$/mu);
+  // Back within 2 seconds, and a crash loop slows down to once a minute.
+  assert.match(unit, /^RestartSec=2$/mu);
+  assert.match(unit, /^RestartMaxDelaySec=60$/mu);
   assert.match(unit, /^WantedBy=default\.target$/mu);
   assert.match(unit, /^StartLimitIntervalSec=0$/mu);
   assert.match(
@@ -360,16 +370,16 @@ test("a Task Scheduler failure is one plain sentence and leaves no task file", {
   }
 });
 
-test("Windows stop disables the minute trigger until the task is started again", async () => {
+test("Windows stop and removal turn the triggers off before ending the task", async () => {
   const { calls, runner } = recorder();
   const service = context("windows", "C:\\Users\\Ada", { run: runner });
   assert.equal(await stopService(service), true);
   await startService(service);
   assert.equal(await uninstallService(service), true);
   assert.deepEqual(calls.map((call) => call.args.filter((value) => value.startsWith("/")).join(" ")), [
-    "/Query /TN", "/End /TN", "/Change /TN /DISABLE",
+    "/Query /TN", "/Change /TN /DISABLE", "/End /TN",
     "/Change /TN /ENABLE", "/Run /TN",
-    "/Query /TN", "/End /TN", "/Delete /TN /F",
+    "/Query /TN", "/Change /TN /DISABLE", "/End /TN", "/Delete /TN /F",
   ]);
 });
 

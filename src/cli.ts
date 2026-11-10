@@ -15,6 +15,7 @@ import {
   type GuardianIntervention,
   type ManagedActionName,
 } from "./action-policy.js";
+import { abortableDelay } from "./abortable-delay.js";
 import {
   GuardianDecisionUnavailableError,
   HTTPGuardianDecisionClient,
@@ -104,7 +105,7 @@ import {
 import { purgeDataDirectory, removeEmptyDataDirectory } from "./purge.js";
 import { hasByteHeadroom } from "./event-queue.js";
 import { InstanceLock, ObserverAlreadyRunningError, processIsAlive } from "./instance-lock.js";
-import { MachineRemovedError, machineRemovedMessage, rememberMachineRemoved, removedAtStart } from "./machine-removed.js";
+import { MachineRemovedError, machineRemovedMessage, rememberMachineRemoved, removedAtStart, removedRecheckIn } from "./machine-removed.js";
 import { clearEventSpool } from "./event-spool.js";
 import { GuardianDecisionJournal } from "./guardian-decision-journal.js";
 import {
@@ -650,7 +651,7 @@ export async function run(
         await removalLock.release();
       }
       // A background service left behind would start the unpaired observer
-      // again every minute, for good. Its collected activity is not touched.
+      // again and again, for good. Its collected activity is not touched.
       let serviceRemoved = false;
       try {
         serviceRemoved = await uninstallService(serviceContext(config, callerEnvironment, dependencies));
@@ -740,7 +741,7 @@ export async function run(
           credential.consentProfile !== "full"
         ) {
           // Consent caps the profile; refusing would only have a background
-          // service start again every minute, collecting nothing. Content
+          // service start again and again, collecting nothing. Content
           // settings are switched off with the full profile.
           config = loadConfig({
             ...observabilityEnvironment(command, flags, environment),
@@ -787,6 +788,27 @@ export async function run(
         });
         if (removed !== "start") {
           if (removed === "removed") output.stderr(`${machineRemovedMessage}\n`);
+          // On Windows the service's triggers start the observer again
+          // within seconds; waiting here until the next check keeps Node.js
+          // from starting over and over. It collects nothing meanwhile, so
+          // it gives up the lock and status and doctor say it is not running.
+          // Pairing again or stopping the service ends the wait at once.
+          if (serviceSettingsFile !== undefined && process.platform === "win32") {
+            clearInterval(gapReports);
+            await endRun(config.dataDirectory, stopReason).catch(() => undefined);
+            await instanceLock.release();
+            instanceLock = undefined;
+            const repaired = new AbortController();
+            const watch = watchPairing({ dataDirectory: config.dataDirectory, current: credential, onChange: () => repaired.abort() });
+            try {
+              await abortableDelay(
+                await removedRecheckIn(config.dataDirectory, removedRecheckMs),
+                AbortSignal.any([controller.signal, repaired.signal]),
+              );
+            } finally {
+              watch.stop();
+            }
+          }
           return removedExitCode(serviceSettingsFile !== undefined);
         }
         let effectivePolicy = intersectCollectionPolicy(
@@ -1757,8 +1779,8 @@ const removedRecheckMs = 60 * 60_000;
 /**
  * How `run` exits on a computer the workspace removed. A background service
  * exits cleanly: systemd and launchd then leave it stopped, and on Windows,
- * whose task starts it again anyway, the next start stops at once. A person
- * running it in a terminal sees a failure.
+ * whose task starts it again anyway, it first waits until the next check. A
+ * person running it in a terminal sees a failure.
  */
 function removedExitCode(service: boolean): number {
   return service ? 0 : 1;

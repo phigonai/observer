@@ -7,7 +7,7 @@ import { serverFetch } from "./server-fetch.js";
 
 /**
  * Remembers that the workspace no longer accepts this computer's key, so a
- * background service that starts the observer again (every minute on
+ * background service that starts the observer again (within seconds on
  * Windows, and at the next sign-in everywhere) stops at once instead of
  * scanning for agents and failing again. The service then exits cleanly,
  * which systemd (Restart=on-failure) and launchd (KeepAlive with
@@ -107,6 +107,18 @@ export async function removedAtStart(options: Readonly<{
   }
   await rm(path, { force: true });
   return "start";
+}
+
+/**
+ * How long until `removedAtStart` asks the server again, counted from the
+ * confirmation it keeps, so a restart in between does not put the question
+ * off. Zero when it would ask now; never more than `recheckAfterMs`.
+ */
+export async function removedRecheckIn(dataDirectory: string, recheckAfterMs: number, now: Date = new Date()): Promise<number> {
+  const removed = await readRemoved(join(dataDirectory, machineRemovedFileName)).catch(() => undefined);
+  const confirmedAt = removed?.confirmedAt === undefined ? Number.NaN : Date.parse(removed.confirmedAt);
+  if (!Number.isFinite(confirmedAt)) return 0;
+  return Math.min(recheckAfterMs, Math.max(0, confirmedAt + recheckAfterMs - now.getTime()));
 }
 
 /** True or false when the server says so; undefined when it cannot be asked. */

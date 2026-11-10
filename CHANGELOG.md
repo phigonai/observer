@@ -28,6 +28,17 @@ from the matching `vX.Y.Z` tag in this repository.
   `~/.cursor` folder the Cursor editor makes no longer counts as Cursor
   Agent.
 
+### Background service
+
+- On Windows the service starts the observer again within about 10 seconds
+  after it is ended (from Task Manager, say), instead of within a minute.
+  `update` or `service install` installs the new task. On Linux, systemd
+  starts it again after 2 seconds, then waits longer if it keeps failing.
+- Stopping or removing the Windows service turns its triggers off before
+  ending the task, so no new copy starts in between.
+- On a computer the workspace removed, the Windows service waits for the
+  hourly check instead of starting Node.js again and again.
+
 ### Collection gaps
 
 - The observer tells the company's server when collection stopped on the
