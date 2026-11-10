@@ -14,6 +14,9 @@ import {
   ActivityCollector,
   attributedRuntimeAgentID,
   historyRest,
+  historySyncBacklog,
+  historySyncHasRoom,
+  historySyncQueueHeadroom,
   mergeInventoryWithSourceIdentities,
   reportedGenericAgentIdentity,
   reportedProcessIdentity,
@@ -1532,6 +1535,21 @@ test("generic records without runtime evidence stay on source identity", async (
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("saved history waits while a backlog would hold live activity back", () => {
+  // An empty queue, and one at the backlog limit, take another batch.
+  assert.equal(historySyncHasRoom({ capacity: 8_192, depth: 0 }), true);
+  assert.equal(historySyncHasRoom({ capacity: 8_192, depth: historySyncBacklog }), true);
+  // Past it, history waits for delivery; live collection does not.
+  assert.equal(historySyncHasRoom({ capacity: 8_192, depth: historySyncBacklog + 1 }), false);
+  // A small queue takes history only with room for a whole batch.
+  assert.equal(historySyncHasRoom({ capacity: 1_024, depth: 0 }), true);
+  assert.equal(historySyncHasRoom({ capacity: 1_024, depth: 1 }), false);
+  assert.equal(
+    historySyncHasRoom({ capacity: historySyncBacklog + historySyncQueueHeadroom - 1, depth: historySyncBacklog }),
+    false,
+  );
 });
 
 test("a history import rests as long as each batch worked, at most a second", () => {

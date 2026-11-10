@@ -192,11 +192,15 @@ export function loadConfig(
         "cannot overflow the in-memory delivery queue.",
     );
   }
+  // Events wait for their acknowledgement for a round trip to the server,
+  // through Phigon's relay often a few hundred milliseconds: 64 held a
+  // computer catching up on saved history to about 200 events a second.
+  // gRPC flow control still holds sending back when the server is slower.
   const activityMaxInFlightEvents = parseBoundedPositiveInteger(
-    environment["PHIGON_ACTIVITY_MAX_IN_FLIGHT_EVENTS"] ?? "64",
+    environment["PHIGON_ACTIVITY_MAX_IN_FLIGHT_EVENTS"] ?? "512",
     "PHIGON_ACTIVITY_MAX_IN_FLIGHT_EVENTS",
     1,
-    256,
+    2_048,
   );
   const observabilityProfile = parseObservabilityProfile(
     environment["PHIGON_OBSERVABILITY_PROFILE"] ?? "metadata",

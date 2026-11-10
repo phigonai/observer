@@ -84,7 +84,13 @@ const liveCheckpointSaveIntervalMs = 5_000;
 // arrives or a watched folder reports a change.
 const defaultIdleAfterMs = 2 * 60_000;
 const defaultIdleScanIntervalMs = 5_000;
-export const historySyncQueueHeadroom = 1_024;
+// Room one history batch needs in the delivery queue; a batch reads at most
+// a 32nd as many records, since a record makes at most maxDraftsPerRecord.
+export const historySyncQueueHeadroom = 4_096;
+// Saved history waits while more events than this wait for delivery. Live
+// activity is queued after them, so a long backlog of history would hold
+// what agents are doing now back for minutes.
+export const historySyncBacklog = 2_048;
 const maxDraftsPerRecord = 32;
 
 const adapters: ReadonlyMap<string, VendorActivityAdapter> = new Map([
@@ -1531,6 +1537,16 @@ function normalizeAgentHint(value: string): string {
     .toLowerCase()
     .replace(/[^a-z0-9]+/gu, "-")
     .replace(/^-+|-+$/gu, "");
+}
+
+/**
+ * Whether saved history may add a batch to a delivery queue holding `depth`
+ * of `capacity` events: it needs room for a whole batch, and waits while a
+ * backlog would delay live activity.
+ */
+export function historySyncHasRoom(queue: { capacity: number; depth: number }): boolean {
+  return queue.depth <= historySyncBacklog &&
+    queue.capacity - queue.depth >= Math.min(queue.capacity, historySyncQueueHeadroom);
 }
 
 function clampObservedAt(value: Date, now: Date): Date {

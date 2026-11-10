@@ -30,7 +30,7 @@ test("loadConfig uses safe collection defaults", () => {
   assert.equal(config.discoveryIntervalMs, 10_000);
   assert.equal(config.activityRateLimitPerMinute, 1_200);
   assert.equal(config.activityQueueCapacity, 8_192);
-  assert.equal(config.activityMaxInFlightEvents, 64);
+  assert.equal(config.activityMaxInFlightEvents, 512);
   assert.equal(config.activityReplayOnFirstStart, false);
   assert.equal(config.activityInitialReplayBytes, 262_144);
   assert.equal(config.activityInitialReplaySessions, 1);
@@ -113,8 +113,8 @@ test("loadConfig validates observability throughput settings", () => {
     /must be greater than or equal to PHIGON_ACTIVITY_RATE_LIMIT_PER_MINUTE/,
   );
   assert.throws(
-    () => loadConfig({ PHIGON_ACTIVITY_MAX_IN_FLIGHT_EVENTS: "257" }),
-    /between 1 and 256/,
+    () => loadConfig({ PHIGON_ACTIVITY_MAX_IN_FLIGHT_EVENTS: "2049" }),
+    /between 1 and 2048/,
   );
   assert.throws(
     () => loadConfig({ PHIGON_ACTIVITY_INITIAL_REPLAY_BYTES: "4095" }),

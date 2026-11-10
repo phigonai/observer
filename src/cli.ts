@@ -24,7 +24,7 @@ import {
 import { AgentActionExecutor } from "./agent-action-executor.js";
 import {
   ActivityCollector,
-  historySyncQueueHeadroom,
+  historySyncHasRoom,
   mergeInventoryWithSourceIdentities,
   registeredAgentActivitySources,
 } from "./activity/collector.js";
@@ -1096,8 +1096,7 @@ export async function run(
             },
             canSyncHistory: () => {
               const queue = client.metrics().queue;
-              return hasByteHeadroom(queue) &&
-                queue.capacity - queue.depth >= Math.min(queue.capacity, historySyncQueueHeadroom);
+              return hasByteHeadroom(queue) && historySyncHasRoom(queue);
             },
             onDeliveryRefused: (error) => output.stderr(
               `Telemetry delivery is paused (${

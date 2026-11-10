@@ -2253,6 +2253,28 @@ test("structured custom tools derive terminal, filesystem, browser, and Git sign
   assert.ok(browser.some((draft) => draft.payload.case === "browser"));
 });
 
+test("a browser step without an address still carries the digest the server requires", () => {
+  const context = {
+    sessionId: "session-browser-click",
+    observedAt,
+    policy: metadataOnlyPolicy(),
+  };
+  const digests = ["browser_click", "browser_type", "browser_take_screenshot"].map((toolName) => {
+    const browser = toolDrafts(AgentKind.CLAUDE, context, {
+      toolName,
+      phase: ToolPhase.REQUESTED,
+      arguments: { element: "Deploy button", ref: "e12" },
+    }).find((draft) => draft.payload.case === "browser");
+    assert.equal(browser?.payload.case, "browser", toolName);
+    if (browser?.payload.case !== "browser") return "";
+    assert.equal(browser.payload.value.url, undefined);
+    assert.match(browser.payload.value.urlDigest, /^[0-9a-f]{64}$/u);
+    return browser.payload.value.urlDigest;
+  });
+  // Steps of one session share the digest; they name no address to tell apart.
+  assert.equal(new Set(digests).size, 1);
+});
+
 test("metadata categories fail closed before canonical evidence is emitted", () => {
   const config = loadContentConfig({
     PHIGON_COLLECT_FILE_METADATA: "false",

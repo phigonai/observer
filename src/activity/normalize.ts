@@ -385,7 +385,15 @@ function browserDraft(
   rawArguments: unknown,
 ): ActivityDraft {
   const rawURL = stringProperty(rawArguments, ["url", "href"]);
-  const identifier = context.policy.identifier(rawURL, "browserUrls");
+  // A click, typed text or screenshot names no address, and the server
+  // requires a digest: such steps share one per session, as files do.
+  const identifier =
+    rawURL === ""
+      ? {
+          digest: digest(`${context.sessionId}:browser`),
+          redacted: true,
+        }
+      : context.policy.identifier(rawURL, "browserUrls");
   const target = context.policy.content(
     stringProperty(rawArguments, [
       "target",
