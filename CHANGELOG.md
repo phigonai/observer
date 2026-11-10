@@ -4,7 +4,7 @@ All notable changes to `@phigon/observer` are listed here. Versions follow
 [Semantic Versioning](https://semver.org/). Each release is published to npm
 from the matching `vX.Y.Z` tag in this repository.
 
-## Unreleased
+## 8.13.0 (2026-11-10)
 
 ### Company computers
 
