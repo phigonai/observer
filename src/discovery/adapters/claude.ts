@@ -12,9 +12,12 @@ const spec: KnownAgentSpec = {
   executableNames: ["claude"],
   processNames: ["claude", "claude-code"],
   scriptPackages: ["@anthropic-ai/claude-code"],
+  // Claude Code's own files. ~/Library/Application Support/Claude belongs
+  // to the Claude desktop app, which is not Claude Code.
   configurationPaths: [
     "~/.claude",
-    "~/Library/Application Support/Claude",
+    "~/.claude.json",
+    "$CLAUDE_CONFIG_DIR",
   ],
   capabilities: [
     "activity",

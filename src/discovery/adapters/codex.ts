@@ -11,7 +11,8 @@ const spec: KnownAgentSpec = {
   displayName: "OpenAI Codex",
   executableNames: ["codex"],
   processNames: ["codex"],
-  configurationPaths: ["~/.codex"],
+  // CODEX_HOME moves Codex's folder from ~/.codex.
+  configurationPaths: ["~/.codex", "$CODEX_HOME"],
   capabilities: [
     "activity",
     "filesystem",

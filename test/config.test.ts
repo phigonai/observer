@@ -281,6 +281,26 @@ test("loadConfig reads Cline CLI sessions from its data directory", () => {
   );
 });
 
+test("loadConfig follows CODEX_HOME and CLAUDE_CONFIG_DIR and keeps the usual folders", () => {
+  const codexHome = join(tmpdir(), "work", "codex-home");
+  const claudeHome = join(tmpdir(), "work", "claude-home");
+  const moved = loadConfig({ CODEX_HOME: codexHome, CLAUDE_CONFIG_DIR: claudeHome }).activitySourceDirectories;
+  assert.deepEqual(moved.codex, [join(codexHome, "sessions"), join(homedir(), ".codex", "sessions")]);
+  assert.deepEqual(moved.claude, [
+    join(claudeHome, "projects"),
+    join(claudeHome, "sessions"),
+    join(homedir(), ".claude", "projects"),
+    join(homedir(), ".claude", "sessions"),
+  ]);
+  // The usual folder named again, or a relative path, changes nothing.
+  assert.deepEqual(loadConfig({ CODEX_HOME: join(homedir(), ".codex") }).activitySourceDirectories.codex,
+    [join(homedir(), ".codex", "sessions")]);
+  assert.deepEqual(loadConfig({ CLAUDE_CONFIG_DIR: "claude" }).activitySourceDirectories.claude,
+    [join(homedir(), ".claude", "projects"), join(homedir(), ".claude", "sessions")]);
+  // PHIGON_*_ACTIVITY_DIRS still wins.
+  assert.deepEqual(loadConfig({ CODEX_HOME: codexHome, PHIGON_CODEX_ACTIVITY_DIRS: "none" }).activitySourceDirectories.codex, []);
+});
+
 test("loadConfig reads Cursor agent transcripts from its projects directory", () => {
   assert.deepEqual(loadConfig({}).activitySourceDirectories.cursor, [
     join(homedir(), ".cursor", "projects"),

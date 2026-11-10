@@ -18,6 +18,16 @@ from the matching `vX.Y.Z` tag in this repository.
   enrollment code.
 - Uninstall codes (`phu_…`) are redacted like other Phigon keys.
 
+### Agents
+
+- Claude Code records are read from `CLAUDE_CONFIG_DIR` and Codex records
+  from `CODEX_HOME` when those are set, as well as from `~/.claude` and
+  `~/.codex`, and either folder shows the agent as installed. The background
+  service keeps both settings.
+- The Claude desktop app's folder no longer counts as Claude Code, and the
+  `~/.cursor` folder the Cursor editor makes no longer counts as Cursor
+  Agent.
+
 ### Collection gaps
 
 - The observer tells the company's server when collection stopped on the

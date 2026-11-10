@@ -56,7 +56,8 @@ const genericAgents: readonly KnownAgentSpec[] = [
     displayName: "Cursor Agent",
     executableNames: ["cursor-agent"],
     processNames: ["cursor-agent"],
-    configurationPaths: ["~/.cursor"],
+    // The Cursor editor makes ~/.cursor as well; only the CLI writes its config there.
+    configurationPaths: ["~/.cursor/cli-config.json"],
     capabilities: ["activity", "filesystem", "git", "terminal"],
   },
   {

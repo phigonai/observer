@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 export type ObserverLogLevel = "debug" | "info" | "warn" | "error";
 export const DEFAULT_CONTROL_PLANE_ORIGIN = "https://api.phigon.online";
@@ -255,14 +255,14 @@ export function loadConfig(
     activitySourceDirectories: Object.freeze({
       codex: parseDirectoryList(
         environment["PHIGON_CODEX_ACTIVITY_DIRS"],
-        [join(homedir(), ".codex", "sessions")],
+        agentHomes(environment["CODEX_HOME"], ".codex").map((home) => join(home, "sessions")),
       ),
       claude: parseDirectoryList(
         environment["PHIGON_CLAUDE_ACTIVITY_DIRS"],
-        [
-          join(homedir(), ".claude", "projects"),
-          join(homedir(), ".claude", "sessions"),
-        ],
+        agentHomes(environment["CLAUDE_CONFIG_DIR"], ".claude").flatMap((home) => [
+          join(home, "projects"),
+          join(home, "sessions"),
+        ]),
       ),
       hermes: parseDirectoryList(
         environment["PHIGON_HERMES_ACTIVITY_DIRS"],
@@ -682,6 +682,17 @@ function editorUserDirectory(
     product,
     "User",
   );
+}
+
+/**
+ * An agent's own folder: the one its setting names (CODEX_HOME for Codex,
+ * CLAUDE_CONFIG_DIR for Claude Code) first, then the usual one in the home
+ * folder, which keeps the records made before the setting.
+ */
+function agentHomes(setting: string | undefined, folder: string): readonly string[] {
+  const usual = join(homedir(), folder);
+  const chosen = setting?.trim();
+  return chosen && isAbsolute(chosen) && resolve(chosen) !== resolve(usual) ? [chosen, usual] : [usual];
 }
 
 function parseDirectoryList(

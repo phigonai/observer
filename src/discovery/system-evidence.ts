@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { constants } from "node:fs";
 import { access, readFile, readdir, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, delimiter, dirname, join, posix, resolve, win32 } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, posix, resolve, win32 } from "node:path";
 import { promisify } from "node:util";
 import type {
   ConfigurationEvidence,
@@ -300,7 +300,8 @@ export class SystemEvidenceProvider implements HostEvidenceProvider {
     const found: ConfigurationEvidence[] = [];
     try {
       for (const candidate of candidates) {
-        const expanded = expandHome(candidate);
+        const expanded = this.#expandSetting(candidate);
+        if (expanded === undefined) continue;
         try {
           await stat(expanded);
           found.push({ identifierDigest: digest(expanded) });
@@ -432,6 +433,19 @@ export class SystemEvidenceProvider implements HostEvidenceProvider {
         },
       );
     });
+  }
+
+  /**
+   * A configuration path: `~` is the home folder, and `$NAME` is the folder
+   * an agent's own setting names, such as $CODEX_HOME. A setting that is
+   * not set, or not an absolute path, names nothing.
+   */
+  #expandSetting(candidate: string): string | undefined {
+    const setting = /^\$([A-Z][A-Z0-9_]*)(?:[\\/](.*))?$/u.exec(candidate);
+    if (setting === null) return expandHome(candidate);
+    const folder = this.#environmentValue(setting[1]!)?.trim();
+    if (!folder || !isAbsolute(folder)) return undefined;
+    return setting[2] ? join(folder, setting[2]) : folder;
   }
 
   #environmentValue(name: string): string | undefined {

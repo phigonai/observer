@@ -290,6 +290,8 @@ const settingNames = new Set([
   "grpc_proxy", "no_grpc_proxy",
   "NODE_EXTRA_CA_CERTS",
   "XDG_CONFIG_HOME", "XDG_DATA_HOME", "FLATPAK_XDG_DATA_HOME", "GOOSE_PATH_ROOT",
+  // Where Claude Code and Codex keep their records when moved from the usual folder.
+  "CLAUDE_CONFIG_DIR", "CODEX_HOME",
 ]);
 
 /**

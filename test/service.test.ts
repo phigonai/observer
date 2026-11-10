@@ -166,6 +166,8 @@ test("service settings keep what the observer needs and never a secret", async (
     no_proxy: "internal.example",
     NODE_EXTRA_CA_CERTS: "/etc/ssl/company.pem",
     XDG_DATA_HOME: "/home/ada/.data",
+    CLAUDE_CONFIG_DIR: "/home/ada/work/claude",
+    CODEX_HOME: "/home/ada/work/codex",
     HOME: "/home/ada",
     AWS_SECRET_ACCESS_KEY: "do-not-copy",
     OPENAI_API_KEY: "do-not-copy",
@@ -179,6 +181,8 @@ test("service settings keep what the observer needs and never a secret", async (
     no_proxy: "internal.example",
     NODE_EXTRA_CA_CERTS: "/etc/ssl/company.pem",
     XDG_DATA_HOME: "/home/ada/.data",
+    CLAUDE_CONFIG_DIR: "/home/ada/work/claude",
+    CODEX_HOME: "/home/ada/work/codex",
   });
 
   const directory = await temporary("phigon-service-settings-");

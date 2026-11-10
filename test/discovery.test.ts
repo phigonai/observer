@@ -1142,3 +1142,53 @@ class FixtureEvidenceProvider implements HostEvidenceProvider {
     };
   }
 }
+
+test("the Claude desktop app's folder is not Claude Code, and the Cursor editor's is not Cursor Agent", async () => {
+  const found = async (configurations: ReadonlyMap<string, readonly ConfigurationEvidence[]>) =>
+    (await new DiscoveryEngine({
+      adapters: [claudeAdapter, genericAdapter],
+      evidenceFactory: () => new FixtureEvidenceProvider({ processes: { status: "ok", value: [] }, configurations }),
+      clock: () => observedAt,
+    }).discover("machine-fixture")).inventory.agents.map((agent) => agent.displayName).sort();
+
+  // Folders the Claude and Cursor desktop apps make on their own.
+  assert.deepEqual(await found(new Map([
+    ["~/Library/Application Support/Claude", [{ identifierDigest: "claude-desktop" }]],
+    ["~/.cursor", [{ identifierDigest: "cursor-editor" }]],
+  ])), []);
+  // Each agent's own files.
+  assert.deepEqual(await found(new Map([
+    ["~/.claude.json", [{ identifierDigest: "claude-code" }]],
+    ["~/.cursor/cli-config.json", [{ identifierDigest: "cursor-cli" }]],
+  ])), ["Claude Code", "Cursor Agent"]);
+});
+
+test("Claude Code and Codex are found by the folder their own setting names", async () => {
+  const moved = await mkdtemp(join(tmpdir(), "phigon-codex-home-"));
+  try {
+    const inspect = async (environment: NodeJS.ProcessEnv, candidate: string) => {
+      const result = await new SystemEvidenceProvider(process.platform, environment).inspectConfiguration([candidate]);
+      assert.equal(result.status, "ok");
+      return result.status === "ok" ? result.value.length : -1;
+    };
+    assert.equal(await inspect({ CODEX_HOME: moved }, "$CODEX_HOME"), 1);
+    await writeFile(join(moved, "config.toml"), "", "utf8");
+    assert.equal(await inspect({ CODEX_HOME: moved }, "$CODEX_HOME/config.toml"), 1);
+    // Not set, or not an absolute path: nothing to look at.
+    assert.equal(await inspect({}, "$CODEX_HOME"), 0);
+    assert.equal(await inspect({ CODEX_HOME: "relative/codex" }, "$CODEX_HOME"), 0);
+
+    const found = async (configurations: ReadonlyMap<string, readonly ConfigurationEvidence[]>) =>
+      (await new DiscoveryEngine({
+        adapters: [claudeAdapter, codexAdapter],
+        evidenceFactory: () => new FixtureEvidenceProvider({ processes: { status: "ok", value: [] }, configurations }),
+        clock: () => observedAt,
+      }).discover("machine-fixture")).inventory.agents.map((agent) => agent.displayName).sort();
+    assert.deepEqual(await found(new Map([
+      ["$CLAUDE_CONFIG_DIR", [{ identifierDigest: "claude-moved" }]],
+      ["$CODEX_HOME", [{ identifierDigest: "codex-moved" }]],
+    ])), ["Claude Code", "OpenAI Codex"]);
+  } finally {
+    await rm(moved, { recursive: true, force: true });
+  }
+});
