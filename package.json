@@ -55,9 +55,9 @@
     "registry": "https://registry.npmjs.org"
   },
   "dependencies": {
-    "@bufbuild/protobuf": "2.13.0",
-    "@grpc/grpc-js": "1.14.6",
-    "undici": "7.30.1"
+    "@bufbuild/protobuf": "2.16.0",
+    "@grpc/grpc-js": "1.14.7",
+    "undici": "8.12.3"
   },
   "overrides": {
     "minimatch@10.2.5": {
