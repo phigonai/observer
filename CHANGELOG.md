@@ -4,6 +4,26 @@ All notable changes to `@phigon/observer` are listed here. Versions follow
 [Semantic Versioning](https://semver.org/). Each release is published to npm
 from the matching `vX.Y.Z` tag in this repository.
 
+## 8.14.0 (2026-11-11)
+
+### Faster delivery
+
+- Keeps up to 512 events in flight instead of 64
+  (`PHIGON_ACTIVITY_MAX_IN_FLIGHT_EVENTS`, now up to 2,048). Each event
+  waits a round trip for its acknowledgement, a few hundred milliseconds
+  through Phigon's relay, so 64 held a computer catching up on saved history
+  to about 200 events a second.
+- Saved history waits while more than 2,048 events wait for delivery, so
+  what agents do now reaches the server within seconds during a first
+  upload instead of more than a minute later. A history pass reads up to 128
+  records when there is room.
+
+### Fixes
+
+- A browser step that names no address (a click, typed text or a
+  screenshot) carries a digest per session, so the server accepts it
+  instead of rejecting it and the observer dropping it.
+
 ## 8.13.0 (2026-11-10)
 
 ### Company computers
